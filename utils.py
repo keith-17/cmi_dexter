@@ -1,8 +1,9 @@
 import numpy as np
 import pandas as pd
 from scipy.fft import fft, fftfreq
-from sklearn.base import BaseEstimator
-from sklearn.base import TransformerMixin
+from sklearn.base import BaseEstimator, ClassifierMixin, clone, TransformerMixin
+from sklearn.metrics import accuracy_score
+from tqdm import tqdm
 
 def calculate_fft(array_values: np.ndarray) -> np.ndarray:
     """
@@ -107,7 +108,9 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
                  sampling_rate=100,
                  domain='acceleration',
                  dc_offset=2.0,
-                 band_edges=None
+                 band_edges=None,
+                 subject_df=None,
+                 disable_tqdm=True
                  ):
         if imu_sensor_list is None:
             imu_sensor_list = ['acc_x', 'acc_y', 'acc_z']
@@ -116,30 +119,35 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
         self.domain = domain
         self.dc_offset = dc_offset
         self.band_edges = band_edges
+        self.subject_df = subject_df
+        self.disable_tqdm = disable_tqdm
 
     def fit(self, X, y=None):
-        self.transform(X)
+        if self.domain == 'time' and self.band_edges is not None:
+            self.band_edges = None
         return self
 
     def transform(self, raw_data: pd.DataFrame) -> pd.DataFrame:
         sequence_list = []
-        for a_sequence in raw_data['sequence_id'].unique():
+        for a_sequence in tqdm(raw_data['sequence_id'].unique(), disable=self.disable_tqdm):
             single_sequence_df = raw_data[raw_data['sequence_id'] == a_sequence]
             imu_df = self.process_for_imu_values(single_sequence_df)
             if self.domain == 'time':
                 imu_features_df = self.extract_time_features(imu_df)
             else:
                 imu_features_df = self.extract_features_from_imu(imu_df, self.band_edges)
-            category_df = self.return_single_category_desc_record(raw_data)
-            temp_feat_df = imu_features_df.join(category_df)
+            category_df = self.return_single_category_desc_record(single_sequence_df)
+            temp_feat_df = pd.concat([imu_features_df.reset_index(drop=True),
+                                      category_df.reset_index(drop=True)], axis=1)
             sequence_list.append(temp_feat_df)
 
-        final_df = pd.concat(sequence_list).reset_index(drop=True)
+        final_df = pd.concat(sequence_list).set_index('sequence_id')
+        final_df = final_df.merge(self.subject_df, how='left', on='subject')
         sequence_list.clear()
         return final_df
 
     def return_single_category_desc_record(self, df: pd.DataFrame) -> pd.DataFrame:
-        return df.groupby('sequence_id')[['orientation', 'subject', 'gesture']].agg(lambda x: x.unique()[0]).reset_index()
+        return df.groupby('sequence_id')[['orientation', 'subject']].agg(lambda x: x.unique()[0]).reset_index()
 
     def process_for_imu_values(self, df: pd.DataFrame) -> pd.DataFrame:
         df = self.get_accelerometer_values(df)
@@ -167,7 +175,7 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
         return fft_df.mul(scale_factor, axis=0)
 
     @staticmethod
-    def convert_frame_to_fft(df: pd.DataFrame, sampling_rate: int, sample_points_N: int = None) -> pd.Series:
+    def convert_frame_to_fft(df: pd.DataFrame, sampling_rate: int, sample_points_N: int = None, **kwargs) -> pd.Series:
         sample_interval_T = 1 / sampling_rate
         if sample_points_N is None:
             sample_points_N = len(df)
@@ -242,3 +250,33 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
             features[f'{axis}_energy'] = np.sum(signal ** 2)
 
         return pd.DataFrame([features])
+
+
+class ManyToOneWrapper(BaseEstimator, ClassifierMixin):
+    def __init__(self, estimator):
+        self.estimator = estimator
+
+    def _get_tags(self):
+        return {'multioutput': True}
+
+    def fit(self, X, y):
+        # Slices y to get one label per sequence
+        y_seq = y.groupby('sequence_id', sort=False)['gesture'].first()
+        self.estimator_ = clone(self.estimator)
+        self.estimator_.fit(X, y_seq)
+        return self
+
+    def predict(self, X):
+        return self.estimator_.predict(X)
+
+    def score(self, X, y, sample_weight=None):
+        y_true_seq = y.groupby('sequence_id', sort=False)['gesture'].first()
+        y_pred = self.predict(X)
+
+        # Manual accuracy calculation
+        if sample_weight is not None:
+            # Handle weighted accuracy if needed
+            correct = (y_true_seq == y_pred).astype(int)
+            return np.average(correct, weights=sample_weight)
+        else:
+            return np.mean(y_true_seq == y_pred)
