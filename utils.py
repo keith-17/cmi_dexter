@@ -103,12 +103,14 @@ def extract_features(
 
 class ImuExtractor(BaseEstimator, TransformerMixin):
     def __init__(self,
-                 imu_sensor_list: list,
-                 sampling_rate: int,
-                 domain: str,
-                 dc_offset: float,
-                 band_edges: list
+                 imu_sensor_list=None, # Default values
+                 sampling_rate=100,
+                 domain='acceleration',
+                 dc_offset=2.0,
+                 band_edges=None
                  ):
+        if imu_sensor_list is None:
+            imu_sensor_list = ['acc_x', 'acc_y', 'acc_z']
         self.imu_sensor_list = imu_sensor_list
         self.sampling_rate = sampling_rate
         self.domain = domain
@@ -124,7 +126,10 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
         for a_sequence in raw_data['sequence_id'].unique():
             single_sequence_df = raw_data[raw_data['sequence_id'] == a_sequence]
             imu_df = self.process_for_imu_values(single_sequence_df)
-            imu_features_df = self.extract_features_from_imu(imu_df, self.band_edges)
+            if self.domain == 'time':
+                imu_features_df = self.extract_time_features(imu_df)
+            else:
+                imu_features_df = self.extract_features_from_imu(imu_df, self.band_edges)
             category_df = self.return_single_category_desc_record(raw_data)
             temp_feat_df = imu_features_df.join(category_df)
             sequence_list.append(temp_feat_df)
@@ -208,5 +213,32 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
                     features[f'{axis}_band_{low}_{high}_energy'] = np.sum(band_mags ** 2)
                     peak_idx_band = np.argmax(band_mags)
                     features[f'{axis}_band_{low}_{high}_peak_freq'] = band_freqs[peak_idx_band]
+
+        return pd.DataFrame([features])
+
+    @staticmethod
+    def extract_time_features(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Simple, explicit time-domain feature extraction.
+        Input: DataFrame with sensor columns (acc_x, acc_y, etc.)
+        Output: Single-row DataFrame with statistical features.
+        """
+        features = {}
+        for axis in df.columns:
+            signal = df[axis].values
+
+            # Basic Statistics
+            features[f'{axis}_mean'] = np.mean(signal)
+            features[f'{axis}_std'] = np.std(signal)
+            features[f'{axis}_min'] = np.min(signal)
+            features[f'{axis}_max'] = np.max(signal)
+            features[f'{axis}_rms'] = np.sqrt(np.mean(signal ** 2))
+
+            # Signal Characteristics
+            features[f'{axis}_peak_to_peak'] = np.ptp(signal)
+            features[f'{axis}_zero_crossings'] = np.where(np.diff(np.sign(signal)))[0].size
+
+            # Energy
+            features[f'{axis}_energy'] = np.sum(signal ** 2)
 
         return pd.DataFrame([features])
