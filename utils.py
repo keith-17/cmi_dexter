@@ -84,7 +84,8 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
                  band_edges: list = None,
                  subject_df: pd.DataFrame = None,
                  disable_tqdm: bool = True,
-                 no_category_data: bool = False
+                 category_data: bool = True,
+                 segmentation: str = None
                  ):
         self.imu_sensor_list = imu_sensor_list
         self.sampling_rate = sampling_rate
@@ -93,7 +94,8 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
         self.band_edges = band_edges
         self.subject_df = subject_df
         self.disable_tqdm = disable_tqdm
-        self.no_category_data = no_category_data
+        self.category_data = category_data
+        self.segmentation = segmentation
 
     def fit(self, X, y=None):
         if self.domain == 'time' and self.band_edges is not None:
@@ -111,37 +113,43 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
 
         for a_sequence in iterable:
             single_sequence_df = raw_data[raw_data['sequence_id'] == a_sequence]
-            singular_record_list = []
 
-            if self.imu_sensor_list:
-                imu_df = self.process_for_imu_values(single_sequence_df)
-                if self.domain == 'time':
-                    imu_features_df = self.extract_time_features(imu_df)
-                else:
-                    imu_features_df = self.extract_features_from_imu(imu_df, self.band_edges)
+            sequence_groups_list = self.split_segments(single_sequence_df, self.segmentation)
+            for segmented_sequence_df in sequence_groups_list:
+                singular_record_list = []
+                if self.imu_sensor_list:
+                    imu_df = self.process_for_imu_values(segmented_sequence_df)
+                    if self.domain == 'time':
+                        imu_features_df = self.extract_time_features(imu_df)
+                    else:
+                        imu_features_df = self.extract_features_from_imu(imu_df, self.band_edges)
 
-                imu_features_df = imu_features_df.reset_index(drop=True)
-                imu_features_df['sequence_id'] = a_sequence
-                singular_record_list.append(imu_features_df)
+                    imu_features_df = imu_features_df.reset_index(drop=True)
+                    imu_features_df['sequence_id'] = a_sequence
+                    singular_record_list.append(imu_features_df)
 
-            if not self.no_category_data:
-                category_df = self.return_single_category_desc_record(single_sequence_df)
+                category_df = self.return_single_category_desc_record(segmented_sequence_df, self.category_data)
                 singular_record_list.append(category_df)
 
-            singular_record_df = pd.concat(singular_record_list, axis=1)
-            singular_record_df = singular_record_df.loc[:, ~singular_record_df.columns.duplicated()]
-            sequence_list.append(singular_record_df)
+                singular_record_df = pd.concat(singular_record_list, axis=1)
+                singular_record_df = singular_record_df.loc[:, ~singular_record_df.columns.duplicated()]
+                sequence_list.append(singular_record_df)
 
         final_df = pd.concat(sequence_list, ignore_index=True)
 
         if self.subject_df is not None and 'subject' in final_df.columns:
             final_df = final_df.merge(self.subject_df, how='left', on='subject')
 
-        final_df = final_df.set_index('sequence_id')
+        final_df = final_df.set_index('sequence_id').fillna(0)
         return final_df
 
-    def return_single_category_desc_record(self, df: pd.DataFrame) -> pd.DataFrame:
-        return df.groupby('sequence_id')[['orientation', 'subject']].agg(lambda x: x.unique()[0]).reset_index()
+    def return_single_category_desc_record(self, df: pd.DataFrame, category_data_bool: bool
+                                           ) -> pd.DataFrame:
+        group_list = ['segment_id']
+        if category_data_bool:
+            group_list.append('orientation')
+            group_list.append('subject')
+        return df.groupby('sequence_id')[group_list].agg(lambda x: x.unique()[0]).reset_index()
 
     def process_for_imu_values(self, df: pd.DataFrame) -> pd.DataFrame:
         df = self.get_accelerometer_values(df)
@@ -245,6 +253,22 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
 
         return pd.DataFrame([features])
 
+    def split_segments(self, df: pd.DataFrame, split_by: str = None):
+        """Return list of segment dataframes"""
+        if split_by == 'phase':
+            groups = df.groupby('phase', sort=False)
+        elif split_by == 'behavior':
+            groups = df.groupby('behavior', sort=False)
+        elif split_by == 'both':
+            groups = df.groupby(['phase', 'behavior'], sort=False)
+        else:
+            return [df.assign(segment_id=0)]
+
+        segments = []
+        for i, (_, group) in enumerate(groups):
+            segments.append(group.assign(segment_id=i))
+        return segments
+
 
 class ManyToOneWrapper(BaseEstimator, ClassifierMixin):
     def __init__(self, estimator):
@@ -290,7 +314,7 @@ def tqdm_joblib(tqdm_object):
         parallel.BatchCompletionCallBack = old_callback
         tqdm_object.close()
 
-        
+
 def existing_cols(cols):
     def selector(X):
         return [c for c in cols if c in X.columns]
