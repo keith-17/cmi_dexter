@@ -87,7 +87,8 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
                  category_data: bool = True,
                  segmentation: str = None,
                  window: float = 2.0,
-                 step_sec: float = 1.0
+                 step_sec: float = 1.0,
+                 combine_axes: bool = False
                  ):
         self.imu_sensor_list = imu_sensor_list
         self.sampling_rate = sampling_rate
@@ -100,6 +101,7 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
         self.segmentation = segmentation
         self.window = window
         self.step_sec = step_sec
+        self.combine_axes = combine_axes
 
     def fit(self, X, y=None):
         if self.domain == 'time' and self.band_edges is not None:
@@ -129,7 +131,7 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
                     if self.domain == 'time':
                         imu_features_df = self.extract_time_features(imu_df)
                     else:
-                        imu_features_df = self.extract_features_from_imu(imu_df, self.band_edges)
+                        imu_features_df = self.extract_features_from_imu(imu_df, self.band_edges, self.combine_axes)
 
                     imu_features_df = imu_features_df.reset_index(drop=True)
                     imu_features_df['sequence_id'] = a_sequence
@@ -213,41 +215,55 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
         return pd.Series(single_axis_fft_values, index=single_axis_fft_columns, name='Frequency')
 
     @staticmethod
-    def extract_features_from_imu(fft_df: pd.DataFrame, band_edges: list = None) -> pd.DataFrame:
+    def extract_features_from_imu(fft_df: pd.DataFrame, band_edges: list = None,
+                                  combine_axes: bool = True) -> pd.DataFrame:
         if band_edges is None:
             band_edges = np.arange(0, 101, 10)
 
         features = {}
         freqs = fft_df.index.values
 
+        # Single axis features (always extract)
         for axis in fft_df.columns:
             mags = fft_df[axis].values
-
-            # Peak features
             peak_idx = np.argmax(mags)
             features[f'{axis}_peak_freq'] = freqs[peak_idx]
             features[f'{axis}_peak_mag'] = mags[peak_idx]
-
-            # Energy features
             features[f'{axis}_total_energy'] = np.sum(mags ** 2)
-            features[f'{axis}_mean'] = np.mean(mags)
-            features[f'{axis}_std'] = np.std(mags)
 
-            # Spectral centroid
-            if np.sum(mags) > 0:
-                features[f'{axis}_centroid'] = np.average(freqs, weights=mags)
-            else:
-                features[f'{axis}_centroid'] = 0
-
-            # Band features
             for low, high in zip(band_edges[:-1], band_edges[1:]):
                 mask = (freqs >= low) & (freqs < high)
                 if np.any(mask):
                     band_mags = mags[mask]
-                    band_freqs = freqs[mask]
                     features[f'{axis}_band_{low}_{high}_energy'] = np.sum(band_mags ** 2)
-                    peak_idx_band = np.argmax(band_mags)
-                    features[f'{axis}_band_{low}_{high}_peak_freq'] = band_freqs[peak_idx_band]
+
+        # Combined axes (if combine_axes=True and have at least 2 axes)
+        if combine_axes and len(fft_df.columns) >= 2:
+            # All axes together
+            if len(fft_df.columns) >= 2:
+                combined = np.sqrt(np.sum([fft_df[col].values ** 2 for col in fft_df.columns], axis=0))
+
+                peak_idx = np.argmax(combined)
+                features[f'all_peak_freq'] = freqs[peak_idx]
+                features[f'all_peak_mag'] = combined[peak_idx]
+                features[f'all_total_energy'] = np.sum(combined ** 2)
+
+                for low, high in zip(band_edges[:-1], band_edges[1:]):
+                    mask = (freqs >= low) & (freqs < high)
+                    if np.any(mask):
+                        band_mags = combined[mask]
+                        features[f'all_band_{low}_{high}_energy'] = np.sum(band_mags ** 2)
+
+            # Pairwise combinations
+            from itertools import combinations
+            for ax1, ax2 in combinations(fft_df.columns, 2):
+                pair_mags = np.sqrt(fft_df[ax1].values ** 2 + fft_df[ax2].values ** 2)
+                name = f'{ax1}_{ax2}'
+
+                peak_idx = np.argmax(pair_mags)
+                features[f'{name}_peak_freq'] = freqs[peak_idx]
+                features[f'{name}_peak_mag'] = pair_mags[peak_idx]
+                features[f'{name}_total_energy'] = np.sum(pair_mags ** 2)
 
         return pd.DataFrame([features])
 
