@@ -289,3 +289,9 @@ def tqdm_joblib(tqdm_object):
     finally:
         parallel.BatchCompletionCallBack = old_callback
         tqdm_object.close()
+
+        
+def existing_cols(cols):
+    def selector(X):
+        return [c for c in cols if c in X.columns]
+    return selector
