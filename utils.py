@@ -103,6 +103,7 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
     def transform(self, raw_data: pd.DataFrame) -> pd.DataFrame:
         sequence_list = []
         sequence_ids = raw_data['sequence_id'].unique()
+
         if self.disable_tqdm:
             iterable = sequence_ids
         else:
@@ -111,13 +112,16 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
         for a_sequence in iterable:
             single_sequence_df = raw_data[raw_data['sequence_id'] == a_sequence]
             singular_record_list = []
+
             if self.imu_sensor_list:
                 imu_df = self.process_for_imu_values(single_sequence_df)
                 if self.domain == 'time':
                     imu_features_df = self.extract_time_features(imu_df)
                 else:
                     imu_features_df = self.extract_features_from_imu(imu_df, self.band_edges)
-                imu_features_df.reset_index(drop=True, inplace=True)
+
+                imu_features_df = imu_features_df.reset_index(drop=True)
+                imu_features_df['sequence_id'] = a_sequence
                 singular_record_list.append(imu_features_df)
 
             if not self.no_category_data:
@@ -125,13 +129,15 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
                 singular_record_list.append(category_df)
 
             singular_record_df = pd.concat(singular_record_list, axis=1)
-            singular_record_list.clear()
+            singular_record_df = singular_record_df.loc[:, ~singular_record_df.columns.duplicated()]
             sequence_list.append(singular_record_df)
 
-        final_df = pd.concat(sequence_list).set_index('sequence_id')
-        if self.subject_df:
+        final_df = pd.concat(sequence_list, ignore_index=True)
+
+        if self.subject_df is not None and 'subject' in final_df.columns:
             final_df = final_df.merge(self.subject_df, how='left', on='subject')
-        sequence_list.clear()
+
+        final_df = final_df.set_index('sequence_id')
         return final_df
 
     def return_single_category_desc_record(self, df: pd.DataFrame) -> pd.DataFrame:
