@@ -85,7 +85,9 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
                  subject_df: pd.DataFrame = None,
                  disable_tqdm: bool = True,
                  category_data: bool = True,
-                 segmentation: str = None
+                 segmentation: str = None,
+                 window: float = 2.0,
+                 step_sec: float = 1.0
                  ):
         self.imu_sensor_list = imu_sensor_list
         self.sampling_rate = sampling_rate
@@ -96,6 +98,8 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
         self.disable_tqdm = disable_tqdm
         self.category_data = category_data
         self.segmentation = segmentation
+        self.window = window
+        self.step_sec = step_sec
 
     def fit(self, X, y=None):
         if self.domain == 'time' and self.band_edges is not None:
@@ -113,8 +117,11 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
 
         for a_sequence in iterable:
             single_sequence_df = raw_data[raw_data['sequence_id'] == a_sequence]
-
-            sequence_groups_list = self.split_segments(single_sequence_df, self.segmentation)
+            if self.segmentation == 'window':
+                sequence_groups_list = self.window_segments(single_sequence_df, self.window, self.step_sec,
+                                                            self.sampling_rate)
+            else:
+                sequence_groups_list = self.split_segments(single_sequence_df, self.segmentation)
             for segmented_sequence_df in sequence_groups_list:
                 singular_record_list = []
                 if self.imu_sensor_list:
@@ -142,6 +149,24 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
 
         final_df = final_df.set_index('sequence_id').fillna(0)
         return final_df
+
+    def window_segments(self, df: pd.DataFrame, window_sec: float, step_sec: float, sampling_rate: int) -> list:
+        """Split dataframe into windows based on sequence_counter"""
+        window_size = int(window_sec * sampling_rate)
+        step_size = int(step_sec * sampling_rate)
+
+        segments = []
+        max_counter = df['sequence_counter'].max()
+        start = 0
+
+        while start + window_size <= max_counter:
+            segment = df[(df['sequence_counter'] >= start) & (df['sequence_counter'] < start + window_size)].copy()
+            if not segment.empty:
+                segment['segment_id'] = start // step_size
+                segments.append(segment)
+            start += step_size
+
+        return segments if segments else [df.assign(segment_id=0)]
 
     def return_single_category_desc_record(self, df: pd.DataFrame, category_data_bool: bool
                                            ) -> pd.DataFrame:
