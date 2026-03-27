@@ -2,43 +2,16 @@ import numpy as np
 import pandas as pd
 from scipy.fft import fft, fftfreq
 from sklearn.base import BaseEstimator, ClassifierMixin, clone, TransformerMixin
-from sklearn.metrics import accuracy_score
-from tqdm import tqdm
+from joblib import parallel
+from contextlib import contextmanager
+from tqdm.auto import tqdm
+
 
 def calculate_fft(array_values: np.ndarray) -> np.ndarray:
-    """
-    Calculate the Fast Fourier Transform (FFT) of an array of values.
-
-    Parameters
-    ----------
-    array_values : numpy.ndarray
-        The array of values to transform.
-
-    Returns
-    -------
-    numpy.ndarray
-        The absolute values of the FFT of the input array, truncated to half the length of the input array.
-    """
     return abs(fft(array_values))[0:len(array_values) // 2]
 
+
 def convert_frame_to_fft(df: pd.DataFrame, sampling_rate: int, sample_points_N: int = None) -> pd.Series:
-    """
-    Convert a pandas DataFrame into a pandas Series containing the Fast Fourier Transform (FFT) of the DataFrame.
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        The DataFrame to transform.
-    sampling_rate : int
-        The sampling rate of the DataFrame.
-    sample_points_N : int, optional
-        The number of sample points to include in the FFT. If None, the number of sample points is equal to the length of the DataFrame.
-
-    Returns
-    -------
-    pandas.Series
-        A pandas Series containing the absolute values of the FFT of the input DataFrame, truncated to half the length of the input DataFrame.
-    """
     sample_interval_T = 1 / sampling_rate
     if sample_points_N is None:
         sample_points_N = len(df)
@@ -104,16 +77,15 @@ def extract_features(
 
 class ImuExtractor(BaseEstimator, TransformerMixin):
     def __init__(self,
-                 imu_sensor_list=None, # Default values
-                 sampling_rate=100,
-                 domain='acceleration',
-                 dc_offset=2.0,
-                 band_edges=None,
-                 subject_df=None,
-                 disable_tqdm=True
+                 imu_sensor_list: list = None, # Default values
+                 sampling_rate: int =100,
+                 domain: str = 'acceleration',
+                 dc_offset: float = 2.0,
+                 band_edges: list = None,
+                 subject_df: pd.DataFrame = None,
+                 disable_tqdm: bool = True,
+                 no_category_data: bool = False
                  ):
-        if imu_sensor_list is None:
-            imu_sensor_list = ['acc_x', 'acc_y', 'acc_z']
         self.imu_sensor_list = imu_sensor_list
         self.sampling_rate = sampling_rate
         self.domain = domain
@@ -121,6 +93,7 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
         self.band_edges = band_edges
         self.subject_df = subject_df
         self.disable_tqdm = disable_tqdm
+        self.no_category_data = no_category_data
 
     def fit(self, X, y=None):
         if self.domain == 'time' and self.band_edges is not None:
@@ -129,20 +102,35 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
 
     def transform(self, raw_data: pd.DataFrame) -> pd.DataFrame:
         sequence_list = []
-        for a_sequence in tqdm(raw_data['sequence_id'].unique(), disable=self.disable_tqdm):
+        sequence_ids = raw_data['sequence_id'].unique()
+        if self.disable_tqdm:
+            iterable = sequence_ids
+        else:
+            iterable = tqdm(sequence_ids, desc="ImuExtractor", leave=False)
+
+        for a_sequence in iterable:
             single_sequence_df = raw_data[raw_data['sequence_id'] == a_sequence]
-            imu_df = self.process_for_imu_values(single_sequence_df)
-            if self.domain == 'time':
-                imu_features_df = self.extract_time_features(imu_df)
-            else:
-                imu_features_df = self.extract_features_from_imu(imu_df, self.band_edges)
-            category_df = self.return_single_category_desc_record(single_sequence_df)
-            temp_feat_df = pd.concat([imu_features_df.reset_index(drop=True),
-                                      category_df.reset_index(drop=True)], axis=1)
-            sequence_list.append(temp_feat_df)
+            singular_record_list = []
+            if self.imu_sensor_list:
+                imu_df = self.process_for_imu_values(single_sequence_df)
+                if self.domain == 'time':
+                    imu_features_df = self.extract_time_features(imu_df)
+                else:
+                    imu_features_df = self.extract_features_from_imu(imu_df, self.band_edges)
+                imu_features_df.reset_index(drop=True, inplace=True)
+                singular_record_list.append(imu_features_df)
+
+            if not self.no_category_data:
+                category_df = self.return_single_category_desc_record(single_sequence_df)
+                singular_record_list.append(category_df)
+
+            singular_record_df = pd.concat(singular_record_list, axis=1)
+            singular_record_list.clear()
+            sequence_list.append(singular_record_df)
 
         final_df = pd.concat(sequence_list).set_index('sequence_id')
-        final_df = final_df.merge(self.subject_df, how='left', on='subject')
+        if self.subject_df:
+            final_df = final_df.merge(self.subject_df, how='left', on='subject')
         sequence_list.clear()
         return final_df
 
@@ -280,3 +268,18 @@ class ManyToOneWrapper(BaseEstimator, ClassifierMixin):
             return np.average(correct, weights=sample_weight)
         else:
             return np.mean(y_true_seq == y_pred)
+
+@contextmanager
+def tqdm_joblib(tqdm_object):
+    class TqdmBatchCompletionCallback(parallel.BatchCompletionCallBack):
+        def __call__(self, *args, **kwargs):
+            tqdm_object.update(n=self.batch_size)
+            return super().__call__(*args, **kwargs)
+
+    old_callback = parallel.BatchCompletionCallBack
+    parallel.BatchCompletionCallBack = TqdmBatchCompletionCallback
+    try:
+        yield tqdm_object
+    finally:
+        parallel.BatchCompletionCallBack = old_callback
+        tqdm_object.close()
