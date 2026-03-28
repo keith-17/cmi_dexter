@@ -462,7 +462,30 @@ def tqdm_joblib(tqdm_object):
         tqdm_object.close()
 
 
-def existing_cols(cols):
-    def selector(X):
-        return [c for c in cols if c in X.columns]
-    return selector
+class existing_cols:
+    def __init__(self, cols):
+        self.cols = cols
+
+    def __call__(self, X):
+        return [c for c in self.cols if c in X.columns]
+
+
+def attach_metadata(grid_search):
+    model = grid_search.best_estimator_
+
+    wrapped_clf = model.named_steps["classifier"]
+    rf = wrapped_clf.estimator_
+
+    feature_names = model.named_steps["preprocessor"].get_feature_names_out()
+
+    model.metadata_ = {
+        "best_score": float(grid_search.best_score_),
+        "best_params": grid_search.best_params_,
+    }
+
+    model.feature_importances_ = {
+        "feature_names": feature_names.tolist(),
+        "importances": rf.feature_importances_.tolist()
+    }
+
+    return model
