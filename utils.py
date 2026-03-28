@@ -5,7 +5,7 @@ from sklearn.base import BaseEstimator, ClassifierMixin, clone, TransformerMixin
 from joblib import parallel
 from contextlib import contextmanager
 from tqdm.auto import tqdm
-from sklearn.model_selection import BaseCrossValidator
+from scipy.ndimage import label, center_of_mass
 
 
 def calculate_fft(array_values: np.ndarray) -> np.ndarray:
@@ -416,7 +416,89 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
 
         return pd.DataFrame([features])
 
+    def extract_tof_features(self, segmented_sequence_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Main entry point for ToF processing.
+        Detects 5 sensors and extracts both Simple and Research features.
+        """
+        if segmented_sequence_df.empty:
+            return pd.DataFrame()
 
+        # 1. Identify unique sensors (e.g., 'tof_1', 'tof_2')
+        all_cols = segmented_sequence_df.columns
+        sensor_prefixes = sorted(list(set(['_'.join(c.split('_')[:-1])
+                                           for c in all_cols if '_v' in c])))
+
+        all_sensor_features = {}
+
+        for sensor_id in sensor_prefixes:
+            # 2. Get and Sort columns numerically (v0, v1 ... v63)
+            s_cols = [c for c in all_cols if c.startswith(f"{sensor_id}_v")]
+            s_cols = sorted(s_cols, key=lambda x: int(x.split('_v')[-1]))
+
+            if len(s_cols) != 64: continue
+
+            # 3. Prepare 3D array (Timesteps, 8, 8)
+            raw_values = segmented_sequence_df[s_cols].values
+            # Replace 0 or 4000 (out of range) with NaN for cleaner math
+            raw_values = np.where((raw_values <= 0) | (raw_values >= 4000), np.nan, raw_values)
+            frames = raw_values.reshape(-1, 8, 8)
+
+            # 4. Extract both styles
+            all_sensor_features.update(self._tof_simple_logic(frames, sensor_id))
+            all_sensor_features.update(self._tof_research_logic(frames, sensor_id))
+
+        return pd.DataFrame([all_sensor_features])
+
+    @staticmethod
+    def _tof_simple_logic(frames: np.ndarray, sensor_id: str) -> dict:
+        """Simple Version: Zone-based averages"""
+        # Collapse time to get the average 'depth image' for this segment
+        mean_frame = np.nanmean(frames, axis=0)
+        mean_frame = np.nan_to_num(mean_frame, nan=4000.0)
+
+        return {
+            f"{sensor_id}_simple_min": np.min(mean_frame),
+            f"{sensor_id}_simple_avg": np.mean(mean_frame),
+            f"{sensor_id}_center_avg": np.mean(mean_frame[2:6, 2:6]),  # Middle 4x4
+            f"{sensor_id}_top_avg": np.mean(mean_frame[:4, :]),  # Top half
+            f"{sensor_id}_bottom_avg": np.mean(mean_frame[4:, :]),  # Bottom half
+        }
+
+    @staticmethod
+    def _tof_research_logic(frames: np.ndarray, sensor_id: str) -> dict:
+        mean_frame = np.nanmean(frames, axis=0)
+        mean_frame = np.nan_to_num(mean_frame, nan=4000.0)
+
+        # Threshold: Only look at objects within 1.5 meters
+        mask = mean_frame < 1500
+        labeled, num_blobs = label(mask)
+
+        feat = {f"{sensor_id}_blob_area": 0, f"{sensor_id}_mass_r": 4, f"{sensor_id}_mass_c": 4}
+
+        if num_blobs > 0:
+            # Find largest blob (the hand)
+            counts = np.bincount(labeled.ravel())
+            counts[0] = 0
+            largest = counts.argmax()
+
+            # Centroid (Center of Mass)
+            weights = np.maximum(0, 1500 - mean_frame)
+            weights[labeled != largest] = 0
+            if weights.sum() > 0:
+                r, c = center_of_mass(weights)
+                feat[f"{sensor_id}_blob_area"] = np.sum(labeled == largest)
+                feat[f"{sensor_id}_mass_r"] = r
+                feat[f"{sensor_id}_mass_c"] = c
+
+        # Motion: Average change per pixel per frame
+        if frames.shape[0] > 1:
+            diffs = np.abs(np.diff(frames, axis=0))
+            feat[f"{sensor_id}_motion_intensity"] = np.nanmean(diffs)
+        else:
+            feat[f"{sensor_id}_motion_intensity"] = 0
+
+        return feat
 
 
 class ManyToOneWrapper(BaseEstimator, ClassifierMixin):
