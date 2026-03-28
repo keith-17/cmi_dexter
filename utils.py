@@ -420,27 +420,29 @@ class ManyToOneWrapper(BaseEstimator, ClassifierMixin):
         return self.estimator_.predict(X)
 
     def fit(self, X, y):
-        # Slices y to get one label per sequence
-        if self.extractor.segmentation is None:
-            y_seq = y.groupby('sequence_id', sort=False)['gesture'].first()
-        else:
-            y_seq = y.drop_duplicates(subset='sequence_id').set_index('sequence_id').reindex(X.index)
+        # X here is already transformed (one row per segment, indexed by sequence_id)
+        # y here is raw (many rows per sequence_id)
+        # We need to align y to X's index (one label per row in X)
+        gesture_map = (
+            y.drop_duplicates(subset='sequence_id')
+                .set_index('sequence_id')['gesture']
+        )
+        y_seq = X.index.map(gesture_map)
+
         self.estimator_ = clone(self.estimator)
         self.estimator_.fit(X, y_seq)
         return self
 
     def score(self, X, y, sample_weight=None):
-        if self.extractor.segmentation is None:
-            y_true_seq = y.groupby('sequence_id', sort=False)['gesture'].first()
-        else:
-            y_true_seq = y.drop_duplicates(subset='sequence_id').set_index('sequence_id').reindex(X.index)
+        gesture_map = (
+            y.drop_duplicates(subset='sequence_id')
+                .set_index('sequence_id')['gesture']
+        )
+        y_true_seq = X.index.map(gesture_map)
 
         y_pred = self.predict(X)
-        # print(X.shape, y.shape, y_pred.shape,type(y), type(y_pred))
 
-        # Manual accuracy calculation
         if sample_weight is not None:
-            # Handle weighted accuracy if needed
             correct = (y_true_seq == y_pred).astype(int)
             return np.average(correct, weights=sample_weight)
         else:
