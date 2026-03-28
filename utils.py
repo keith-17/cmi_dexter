@@ -5,6 +5,7 @@ from sklearn.base import BaseEstimator, ClassifierMixin, clone, TransformerMixin
 from joblib import parallel
 from contextlib import contextmanager
 from tqdm.auto import tqdm
+from sklearn.model_selection import BaseCrossValidator
 
 
 def calculate_fft(array_values: np.ndarray) -> np.ndarray:
@@ -78,8 +79,11 @@ def extract_features(
 class ImuExtractor(BaseEstimator, TransformerMixin):
     def __init__(self,
                  imu_sensor_list: list = None, # Default values
-                 sampling_rate: int =100,
-                 domain: str = 'acceleration',
+                 rotation_sensor_list: list = None,
+                 thermopile_sensor_list: list = None,
+                 sampling_rate: int = 100,
+                 imu_domain: str = 'acceleration',
+                 rotation_domain: str = 'acceleration',
                  dc_offset: float = 2.0,
                  band_edges: list = None,
                  subject_df: pd.DataFrame = None,
@@ -88,11 +92,13 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
                  segmentation: str = None,
                  window: float = 2.0,
                  step_sec: float = 1.0,
-                 combine_axes: bool = False
+                 combine_imu_axes: bool = False,
+                 combine_rot_axes: bool = False,
                  ):
         self.imu_sensor_list = imu_sensor_list
+        self.rotation_sensor_list = rotation_sensor_list
         self.sampling_rate = sampling_rate
-        self.domain = domain
+        self.imu_domain = imu_domain
         self.dc_offset = dc_offset
         self.band_edges = band_edges
         self.subject_df = subject_df
@@ -101,10 +107,14 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
         self.segmentation = segmentation
         self.window = window
         self.step_sec = step_sec
-        self.combine_axes = combine_axes
+        self.combine_imu_axes = combine_imu_axes
+        self.rotation_domain = rotation_domain
+        self.combine_rot_axes = combine_rot_axes
+        self.thermopile_sensor_list = thermopile_sensor_list
 
     def fit(self, X, y=None):
-        if self.domain == 'time' and self.band_edges is not None:
+        # print(X.shape, y.shape)
+        if self.imu_domain == 'time' and self.band_edges is not None:
             self.band_edges = None
         return self
 
@@ -124,18 +134,33 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
                                                             self.sampling_rate)
             else:
                 sequence_groups_list = self.split_segments(single_sequence_df, self.segmentation)
+
             for segmented_sequence_df in sequence_groups_list:
                 singular_record_list = []
                 if self.imu_sensor_list:
                     imu_df = self.process_for_imu_values(segmented_sequence_df)
-                    if self.domain == 'time':
+                    if self.imu_domain == 'time':
                         imu_features_df = self.extract_time_features(imu_df)
                     else:
-                        imu_features_df = self.extract_features_from_imu(imu_df, self.band_edges, self.combine_axes)
+                        imu_features_df = self.extract_features_from_imu(imu_df, self.band_edges, self.combine_imu_axes)
 
                     imu_features_df = imu_features_df.reset_index(drop=True)
                     imu_features_df['sequence_id'] = a_sequence
                     singular_record_list.append(imu_features_df)
+
+                if self.rotation_sensor_list:
+                    rot_df = segmented_sequence_df[self.rotation_sensor_list]
+                    if self.rotation_domain != 'time':
+                        rot_df = rot_df.apply(self.convert_frame_to_fft, axis=0, args=(self.sampling_rate,))
+                        rot_df = self.filter_signal(rot_df)
+                        rot_features_df = self.extract_rotation_features(rot_df, self.combine_rot_axes)
+                        singular_record_list.append(rot_features_df)
+
+                # After rotation features, add thermopile
+                if self.thermopile_sensor_list:
+                    thm_df = segmented_sequence_df[self.thermopile_sensor_list]
+                    thm_df = self.extract_thermopile_features(thm_df)
+                    singular_record_list.append(thm_df)
 
                 category_df = self.return_single_category_desc_record(segmented_sequence_df, self.category_data)
                 singular_record_list.append(category_df)
@@ -151,6 +176,21 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
 
         final_df = final_df.set_index('sequence_id').fillna(0)
         return final_df
+
+    @staticmethod
+    def extract_thermopile_features(thm_df: pd.DataFrame) -> pd.DataFrame:
+        """Extract simple stats from thermopile sensors"""
+        if thm_df.empty:
+            return pd.DataFrame()
+
+        features = {}
+        for col in thm_df.columns:
+            features[f'{col}_mean'] = thm_df[col].mean()
+            features[f'{col}_std'] = thm_df[col].std()
+            features[f'{col}_min'] = thm_df[col].min()
+            features[f'{col}_max'] = thm_df[col].max()
+
+        return pd.DataFrame([features])
 
     def window_segments(self, df: pd.DataFrame, window_sec: float, step_sec: float, sampling_rate: int) -> list:
         """Split dataframe into windows based on sequence_counter"""
@@ -180,9 +220,9 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
 
     def process_for_imu_values(self, df: pd.DataFrame) -> pd.DataFrame:
         df = self.get_accelerometer_values(df)
-        if self.domain != 'time':
+        if self.imu_domain != 'time':
             df = df.apply(self.convert_frame_to_fft, axis=0, args=(self.sampling_rate,))
-            df = self.apply_domain_scaling(df, df.index, self.domain)
+            df = self.apply_domain_scaling(df, df.index, self.imu_domain)
             df = self.filter_signal(df)
         return df
 
@@ -310,17 +350,78 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
             segments.append(group.assign(segment_id=i))
         return segments
 
+    def process_rotation_values(self, df: pd.DataFrame, domain: str) -> pd.DataFrame:
+        if domain != 'time':
+            rot_df = df.apply(self.convert_frame_to_fft, axis=0, args=(self.sampling_rate,))
+            rot_df = self.apply_domain_scaling(rot_df, rot_df.index, domain)
+            rot_df = self.filter_signal(rot_df)
+        else:
+            return df
+        return rot_df
+
+    @staticmethod
+    def extract_rotation_features(rot_df: pd.DataFrame, combine_axes: bool = False) -> pd.DataFrame:
+        """Extract simple stats from rotation quaternions"""
+        if rot_df.empty:
+            return pd.DataFrame()
+
+        features = {}
+
+        # Single axis features
+        for col in rot_df.columns:
+            features[f'{col}_mean'] = rot_df[col].mean()
+            features[f'{col}_std'] = rot_df[col].std()
+            features[f'{col}_min'] = rot_df[col].min()
+            features[f'{col}_max'] = rot_df[col].max()
+
+        # Combined magnitude (sqrt(w² + x² + y² + z²) = 1 for unit quaternions, but may vary)
+        if combine_axes and len(rot_df.columns) >= 2:
+            # Combined magnitude
+            combined = np.sqrt(np.sum([rot_df[col].values ** 2 for col in rot_df.columns], axis=0))
+            features['rot_magnitude_mean'] = np.mean(combined)
+            features['rot_magnitude_std'] = np.std(combined)
+            features['rot_magnitude_min'] = np.min(combined)
+            features['rot_magnitude_max'] = np.max(combined)
+
+            # Pairwise combinations
+            from itertools import combinations
+            for ax1, ax2 in combinations(rot_df.columns, 2):
+                pair = np.sqrt(rot_df[ax1].values ** 2 + rot_df[ax2].values ** 2)
+                features[f'{ax1}_{ax2}_mean'] = np.mean(pair)
+                features[f'{ax1}_{ax2}_std'] = np.std(pair)
+
+        return pd.DataFrame([features])
+
+    @staticmethod
+    def process_thermopile_values(df: pd.DataFrame) -> pd.DataFrame:
+        """Extract stats from thermopile sensors (no FFT)"""
+        thm_cols = ['thm_1', 'thm_2', 'thm_3', 'thm_4', 'thm_5']
+        thm_cols = [col for col in thm_cols if col in df.columns]
+
+        if not thm_cols:
+            return pd.DataFrame()
+
+        features = {}
+        for col in thm_cols:
+            features[f'{col}_mean'] = df[col].mean()
+            features[f'{col}_std'] = df[col].std()
+            features[f'{col}_min'] = df[col].min()
+            features[f'{col}_max'] = df[col].max()
+
+        return pd.DataFrame([features])
+
 
 class ManyToOneWrapper(BaseEstimator, ClassifierMixin):
-    def __init__(self, estimator):
+    def __init__(self, estimator, extractor):
         self.estimator = estimator
-
-    def _get_tags(self):
-        return {'multioutput': True}
+        self.extractor = extractor
 
     def fit(self, X, y):
         # Slices y to get one label per sequence
-        y_seq = y.groupby('sequence_id', sort=False)['gesture'].first()
+        if self.extractor.segmentation is None:
+            y_seq = y.groupby('sequence_id', sort=False)['gesture'].first()
+        else:
+            y_seq = y.drop_duplicates(subset='sequence_id').set_index('sequence_id').reindex(X.index)
         self.estimator_ = clone(self.estimator)
         self.estimator_.fit(X, y_seq)
         return self
@@ -329,8 +430,13 @@ class ManyToOneWrapper(BaseEstimator, ClassifierMixin):
         return self.estimator_.predict(X)
 
     def score(self, X, y, sample_weight=None):
-        y_true_seq = y.groupby('sequence_id', sort=False)['gesture'].first()
+        if self.extractor.segmentation is None:
+            y_true_seq = y.groupby('sequence_id', sort=False)['gesture'].first()
+        else:
+            y_true_seq = y.drop_duplicates(subset='sequence_id').set_index('sequence_id').reindex(X.index)
+
         y_pred = self.predict(X)
+        # print(X.shape, y.shape, y_pred.shape,type(y), type(y_pred))
 
         # Manual accuracy calculation
         if sample_weight is not None:
