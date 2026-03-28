@@ -94,6 +94,7 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
                  step_sec: float = 1.0,
                  combine_imu_axes: bool = False,
                  combine_rot_axes: bool = False,
+                 tof_sensor_list: list = None
                  ):
         self.imu_sensor_list = imu_sensor_list
         self.rotation_sensor_list = rotation_sensor_list
@@ -111,6 +112,7 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
         self.rotation_domain = rotation_domain
         self.combine_rot_axes = combine_rot_axes
         self.thermopile_sensor_list = thermopile_sensor_list
+        self.tof_sensor_list = tof_sensor_list
 
     def fit(self, X, y=None):
         # print(X.shape, y.shape)
@@ -161,6 +163,10 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
                     thm_df = segmented_sequence_df[self.thermopile_sensor_list]
                     thm_df = self.extract_thermopile_features(thm_df)
                     singular_record_list.append(thm_df)
+
+                if self.tof_sensor_list:
+                    tof_df = self.extract_tof_features(segmented_sequence_df)
+                    singular_record_list.append(tof_df)
 
                 category_df = self.return_single_category_desc_record(segmented_sequence_df, self.category_data)
                 singular_record_list.append(category_df)
@@ -411,6 +417,8 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
         return pd.DataFrame([features])
 
 
+
+
 class ManyToOneWrapper(BaseEstimator, ClassifierMixin):
     def __init__(self, estimator, extractor):
         self.estimator = estimator
@@ -491,3 +499,45 @@ def attach_metadata(grid_search):
     }
 
     return model
+
+
+def sample_balanced_split(df, train_pct=0.20, test_pct=0.05, random_state=42):
+    total_sequences = df['sequence_id'].nunique()
+    n_gestures = df['gesture'].nunique()
+    n_subjects = df['subject'].nunique()
+
+    train_target = int(total_sequences * train_pct)
+    test_target  = int(total_sequences * test_pct)
+
+    train_seqs_per_cell = train_target // (n_subjects * n_gestures)
+    test_seqs_per_cell  = test_target  // (n_subjects * n_gestures)
+
+    min_pct = n_subjects * n_gestures / total_sequences
+
+    if train_seqs_per_cell == 0 or test_seqs_per_cell == 0:
+        raise ValueError(
+            f"Percentage too small. "
+            f"Min viable pct for this data: {min_pct:.1%}"
+        )
+
+    train_ids, test_ids = [], []
+
+    for _, group in df.groupby(['subject', 'gesture']):
+        unique_seqs = group['sequence_id'].drop_duplicates().sample(frac=1, random_state=random_state)
+
+        n_train = min(train_seqs_per_cell, len(unique_seqs))
+        n_test  = min(test_seqs_per_cell,  len(unique_seqs) - n_train)
+
+        train_ids.extend(unique_seqs.iloc[:n_train].tolist())
+        test_ids.extend( unique_seqs.iloc[n_train:n_train + n_test].tolist())
+
+    train_df = df[df['sequence_id'].isin(train_ids)]
+    test_df = df[df['sequence_id'].isin(test_ids)]
+
+    assert len(set(train_ids) & set(test_ids)) == 0, "Overlap detected!"
+
+    print(f"Train: {train_df['sequence_id'].nunique()} seqs | {100*train_df['sequence_id'].nunique()/total_sequences:.1f}%")
+    print(f"Test:  {test_df['sequence_id'].nunique()} seqs  | {100*test_df['sequence_id'].nunique()/total_sequences:.1f}%")
+
+    return train_df, test_df
+
