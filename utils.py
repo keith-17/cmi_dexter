@@ -416,6 +416,9 @@ class ManyToOneWrapper(BaseEstimator, ClassifierMixin):
         self.estimator = estimator
         self.extractor = extractor
 
+    def predict(self, X):
+        return self.estimator_.predict(X)
+
     def fit(self, X, y):
         # Slices y to get one label per sequence
         if self.extractor.segmentation is None:
@@ -425,9 +428,6 @@ class ManyToOneWrapper(BaseEstimator, ClassifierMixin):
         self.estimator_ = clone(self.estimator)
         self.estimator_.fit(X, y_seq)
         return self
-
-    def predict(self, X):
-        return self.estimator_.predict(X)
 
     def score(self, X, y, sample_weight=None):
         if self.extractor.segmentation is None:
