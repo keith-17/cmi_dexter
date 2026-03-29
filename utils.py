@@ -6,6 +6,7 @@ from joblib import parallel
 from contextlib import contextmanager
 from tqdm.auto import tqdm
 from scipy.ndimage import label, center_of_mass
+from sklearn.preprocessing import LabelEncoder
 
 
 def calculate_fft(array_values: np.ndarray) -> np.ndarray:
@@ -502,41 +503,82 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
 
 
 class ManyToOneWrapper(BaseEstimator, ClassifierMixin):
-    def __init__(self, estimator, extractor):
+    def __init__(self, estimator, extractor, mode=None):
         self.estimator = estimator
         self.extractor = extractor
+        self.mode = mode
 
-    def predict(self, X):
-        return self.estimator_.predict(X)
+    def _collapse_y_to_sequence(self, X, y):
+        # build one label per sequence_id
+        gesture_map = (
+            y.drop_duplicates(subset='sequence_id')
+             .set_index('sequence_id')['gesture']
+        )
+
+        y_seq = pd.Series(X.index.map(gesture_map), index=X.index, name='gesture')
+
+        if y_seq.isna().any():
+            missing_ids = y_seq[y_seq.isna()].index.unique().tolist()
+            raise ValueError(
+                f"Missing gesture labels after aligning to X.index. "
+                f"Example missing sequence_id values: {missing_ids[:10]}"
+            )
+
+        if len(y_seq) == 0:
+            raise ValueError("y_seq is empty after collapsing to sequence level.")
+
+        return y_seq
 
     def fit(self, X, y):
-        # X here is already transformed (one row per segment, indexed by sequence_id)
-        # y here is raw (many rows per sequence_id)
-        # We need to align y to X's index (one label per row in X)
         gesture_map = (
             y.drop_duplicates(subset='sequence_id')
                 .set_index('sequence_id')['gesture']
         )
-        y_seq = X.index.map(gesture_map)
 
-        self.estimator_ = clone(self.estimator)
-        self.estimator_.fit(X, y_seq)
+        y_seq = X.index.to_series().map(gesture_map)
+
+        # 🚨 DROP BAD ALIGNMENTS
+        valid_mask = y_seq.notna()
+        X = X.loc[valid_mask]
+        y_seq = y_seq.loc[valid_mask]
+
+        if len(y_seq) == 0:
+            raise ValueError("No valid labels after alignment — check sequence_id mismatch.")
+
+        if self.mode == 'xgboost':
+            self.label_encoder_ = LabelEncoder()
+            y_enc = self.label_encoder_.fit_transform(y_seq)
+
+            if len(np.unique(y_enc)) == 0:
+                raise ValueError("No classes in this fold")
+
+            self.estimator_ = clone(self.estimator)
+            self.estimator_.fit(X, y_enc)
+
+        else:
+            self.estimator_ = clone(self.estimator)
+            self.estimator_.fit(X, y_seq)
+
         return self
 
-    def score(self, X, y, sample_weight=None):
-        gesture_map = (
-            y.drop_duplicates(subset='sequence_id')
-                .set_index('sequence_id')['gesture']
-        )
-        y_true_seq = X.index.map(gesture_map)
+    def predict(self, X):
+        preds = self.estimator_.predict(X)
+        if self.mode == 'xgboost':
+            preds = self.label_encoder_.inverse_transform(preds.astype(int))
+        return preds
 
+    def predict_proba(self, X):
+        return self.estimator_.predict_proba(X)
+
+    def score(self, X, y, sample_weight=None):
+        y_true = self._collapse_y_to_sequence(X, y).to_numpy()
         y_pred = self.predict(X)
 
         if sample_weight is not None:
-            correct = (y_true_seq == y_pred).astype(int)
+            correct = (y_true == y_pred).astype(int)
             return np.average(correct, weights=sample_weight)
-        else:
-            return np.mean(y_true_seq == y_pred)
+
+        return np.mean(y_true == y_pred)
 
 @contextmanager
 def tqdm_joblib(tqdm_object):
