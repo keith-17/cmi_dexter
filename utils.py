@@ -467,7 +467,7 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
             f"{sensor_id}_bottom_avg": np.mean(mean_frame[4:, :]),
         }
 
-       
+
     @staticmethod
     def tof_research_logic(frames: np.ndarray, sensor_id: str) -> dict:
         mean_frame = np.nanmean(frames, axis=0)
@@ -509,7 +509,7 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
 
 
 class ManyToOneWrapper(BaseEstimator, ClassifierMixin):
-    def __init__(self, estimator, extractor, mode=None):
+    def __init__(self, estimator, extractor, mode=None, **kwargs):
         self.estimator = estimator
         self.extractor = extractor
         self.mode = mode
