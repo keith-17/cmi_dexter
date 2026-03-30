@@ -509,19 +509,20 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
 
 
 class ManyToOneWrapper(BaseEstimator, ClassifierMixin):
-    def __init__(self, estimator, extractor, mode=None, **kwargs):
+    def __init__(self, estimator, extractor, mode=None, target: str = 'gesture', **kwargs):
         self.estimator = estimator
         self.extractor = extractor
         self.mode = mode
+        self.target = target
 
     def _collapse_y_to_sequence(self, X, y):
         # build one label per sequence_id
         gesture_map = (
             y.drop_duplicates(subset='sequence_id')
-             .set_index('sequence_id')['gesture']
+             .set_index('sequence_id')[self.target]
         )
 
-        y_seq = pd.Series(X.index.map(gesture_map), index=X.index, name='gesture')
+        y_seq = pd.Series(X.index.map(gesture_map), index=X.index, name=self.target)
 
         if y_seq.isna().any():
             missing_ids = y_seq[y_seq.isna()].index.unique().tolist()
@@ -538,7 +539,7 @@ class ManyToOneWrapper(BaseEstimator, ClassifierMixin):
     def fit(self, X, y):
         gesture_map = (
             y.drop_duplicates(subset='sequence_id')
-                .set_index('sequence_id')['gesture']
+                .set_index('sequence_id')[self.target]
         )
 
         y_seq = X.index.to_series().map(gesture_map)
