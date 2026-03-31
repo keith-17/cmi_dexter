@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from tqdm.auto import tqdm
 from scipy.ndimage import label, center_of_mass
 from sklearn.preprocessing import LabelEncoder
+from sklearn.decomposition import PCA
 
 
 def calculate_fft(array_values: np.ndarray) -> np.ndarray:
@@ -672,3 +673,22 @@ def sample_balanced_split(df, train_pct=0.20, test_pct=0.05, random_state=42):
 
     return train_df, test_df
 
+
+class IndexPreservingPCA(BaseEstimator, TransformerMixin):
+    def __init__(self, n_components=None):
+        self.n_components = n_components
+        self.pca = PCA(n_components=n_components)
+
+    def fit(self, X, y=None):
+        self.pca.fit(X)
+        return self
+
+    def transform(self, X):
+        # Transform to numpy array
+        X_transformed = self.pca.transform(X)
+        # Return as DataFrame with same index
+        return pd.DataFrame(X_transformed, index=X.index)
+
+    def fit_transform(self, X, y=None):
+        self.fit(X)
+        return self.transform(X)
