@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from scipy.fft import fft, fftfreq
+
 from sklearn.base import BaseEstimator, ClassifierMixin, clone, TransformerMixin
 from joblib import parallel
 from contextlib import contextmanager
@@ -8,6 +8,8 @@ from tqdm.auto import tqdm
 from scipy.ndimage import label, center_of_mass
 from sklearn.preprocessing import LabelEncoder
 from sklearn.decomposition import PCA
+from scipy.fft import fft, fftfreq, ifft
+from pathlib import Path
 
 
 def calculate_fft(array_values: np.ndarray) -> np.ndarray:
@@ -230,11 +232,17 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
 
     def process_for_imu_values(self, df: pd.DataFrame) -> pd.DataFrame:
         df = self.get_accelerometer_values(df)
-        if self.imu_domain != 'time':
-            df = df.apply(self.convert_frame_to_fft, axis=0, args=(self.sampling_rate,))
-            df = self.apply_domain_scaling(df, df.index, self.imu_domain)
-            df = self.filter_signal(df)
-        return df
+        if self.imu_domain == 'time':
+            return df
+        elif self.imu_domain == 'acceleration':
+            df = df.apply(self.preprocess_time_signal, axis=0)
+            return df.apply(self.convert_frame_to_fft, axis=0, args=(self.sampling_rate,))
+        elif self.imu_domain in ['velocity', 'displacement']:
+            complex_fft = df.apply(self._fft_complex, axis=0)
+            scaled_fft = self._scale_frequency_domain(complex_fft, self.imu_domain)
+            return self._ifft_to_time(scaled_fft, len(df))
+        else:
+            raise ValueError(f"Unknown imu_domain: {self.imu_domain}")
 
     def get_accelerometer_values(self, sensor_values: pd.DataFrame) -> pd.DataFrame:
         return sensor_values[self.imu_sensor_list]
@@ -253,6 +261,14 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
             return fft_df
         return fft_df.mul(scale_factor, axis=0)
 
+    def preprocess_time_signal(self, signal: pd.Series) -> pd.Series:
+        signal = signal.astype(float).copy()
+        signal = signal - signal.mean()
+        signal = signal.rolling(window=3, center=True, min_periods=1).mean()
+        window = np.hanning(len(signal))
+        signal = signal * window
+        return pd.Series(signal, index=signal.index, name=signal.name)
+
     @staticmethod
     def convert_frame_to_fft(df: pd.DataFrame, sampling_rate: int, sample_points_N: int = None, **kwargs) -> pd.Series:
         sample_interval_T = 1 / sampling_rate
@@ -263,6 +279,39 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
         single_axis_fft_values = abs(fft(array_values))[0:sample_points_N // 2]
         single_axis_fft_columns = fftfreq(sample_points_N, sample_interval_T)[0:sample_points_N // 2]
         return pd.Series(single_axis_fft_values, index=single_axis_fft_columns, name='Frequency')
+
+    def _fft_complex(self, series: pd.Series) -> np.ndarray:
+        """Return complex FFT (preserves phase information)."""
+        return fft(series.values)
+
+    def _scale_frequency_domain(self, fft_complex: pd.DataFrame, domain: str) -> pd.DataFrame:
+        """Scale complex FFT for integration/differentiation."""
+        n = len(fft_complex.index)
+        freqs = fftfreq(n, 1 / self.sampling_rate)
+        freqs = np.where(freqs == 0, 1e-6, freqs)  # Avoid division by zero
+
+        if domain == 'velocity':
+            # V = A / (j * 2πf)
+            scale = 1 / (2j * np.pi * freqs)
+        elif domain == 'displacement':
+            # D = A / (-(2πf)²)
+            scale = 1 / (-(2 * np.pi * freqs) ** 2)
+        else:
+            scale = 1
+
+        # Apply scaling to each column
+        scaled = fft_complex.copy()
+        for col in fft_complex.columns:
+            scaled[col] = fft_complex[col].values * scale
+        return scaled
+
+    def _ifft_to_time(self, scaled_fft: pd.DataFrame, original_length: int) -> pd.DataFrame:
+        """Convert scaled FFT back to time domain."""
+        result = {}
+        for col in scaled_fft.columns:
+            time_signal = np.real(ifft(scaled_fft[col].values))[:original_length]
+            result[col] = time_signal
+        return pd.DataFrame(result, index=range(original_length))
 
     @staticmethod
     def extract_features_from_imu(fft_df: pd.DataFrame, band_edges: list = None,
@@ -692,3 +741,30 @@ class IndexPreservingPCA(BaseEstimator, TransformerMixin):
     def fit_transform(self, X, y=None):
         self.fit(X)
         return self.transform(X)
+
+
+def find_data_root(local_dir='data', kaggle_root='/kaggle/input'):
+    local_path = Path(local_dir)
+    required = [
+        'train.csv',
+        'test.csv',
+        'train_demographics.csv',
+        'test_demographics.csv'
+    ]
+
+    if local_path.exists() and all((local_path / f).exists() for f in required):
+        print(f'Using local data folder: {local_path.resolve()}')
+        return local_path
+
+    kaggle_root = Path(kaggle_root)
+    if kaggle_root.exists():
+        for csv_path in kaggle_root.rglob('train.csv'):
+            candidate = csv_path.parent
+            if all((candidate / f).exists() for f in required):
+                print(f'Using Kaggle data folder: {candidate}')
+                return candidate
+
+    raise FileNotFoundError(
+        'Could not find the dataset locally or in /kaggle/input. '
+        'Place the CSV files in ./data/ or attach the Kaggle dataset.'
+    )
