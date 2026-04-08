@@ -10,6 +10,8 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.decomposition import PCA
 from scipy.fft import fft, fftfreq, ifft
 from pathlib import Path
+from scipy import ndimage
+import pywt
 
 
 def calculate_fft(array_values: np.ndarray) -> np.ndarray:
@@ -474,8 +476,10 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
             return pd.DataFrame()
 
         all_cols = segmented_sequence_df.columns
-        sensor_prefixes = sorted(list(set(['_'.join(c.split('_')[:-1])
-                                           for c in all_cols if '_v' in c])))
+        sensor_prefixes = sorted(list(set([
+            '_'.join(c.split('_')[:-1])
+            for c in all_cols if '_v' in c
+        ])))
 
         all_sensor_features = {}
 
@@ -490,11 +494,300 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
             raw_values = np.where((raw_values <= 0) | (raw_values >= 4000), np.nan, raw_values)
             frames = raw_values.reshape(-1, 8, 8)
 
-            if self.tof_mode == 'research':
+            if self.tof_mode == 'blob':
                 all_sensor_features.update(self.tof_research_logic(frames, sensor_id))
-            else:
+
+            elif self.tof_mode == 'baseline':
                 all_sensor_features.update(self.tof_simple_logic(frames, sensor_id))
+
+            elif self.tof_mode == 'spatial':
+                all_sensor_features.update(self.tof_spatial_logic(frames, sensor_id))
+
+            elif self.tof_mode == 'edge':
+                all_sensor_features.update(self.tof_edge_logic(frames, sensor_id))
+
+            elif self.tof_mode == 'fft2':
+                all_sensor_features.update(self.tof_fft2_logic(frames, sensor_id))
+
+            elif self.tof_mode == 'svd':
+                all_sensor_features.update(self.tof_svd_logic(frames, sensor_id))
+
+            elif self.tof_mode == 'wavelet':
+                all_sensor_features.update(self.tof_wavelet_logic(frames, sensor_id))
+
+            else:
+                raise ValueError(f"Unknown tof_mode: {self.tof_mode}")
+
         return pd.DataFrame([all_sensor_features])
+
+    @staticmethod
+    def tof_spatial_logic(frames: np.ndarray, sensor_id: str) -> dict:
+        frame_features = []
+
+        for frame in frames:
+            valid_mask = np.isfinite(frame)
+            valid_ratio = np.mean(valid_mask)
+
+            if valid_ratio == 0:
+                frame_features.append({
+                    'min': 4000.0,
+                    'mean': 4000.0,
+                    'std': 0.0,
+                    'center_mean': 4000.0,
+                    'top_mean': 4000.0,
+                    'bottom_mean': 4000.0,
+                    'left_mean': 4000.0,
+                    'right_mean': 4000.0,
+                    'q1_mean': 4000.0,
+                    'q2_mean': 4000.0,
+                    'q3_mean': 4000.0,
+                    'q4_mean': 4000.0,
+                    'row_com': 4.0,
+                    'col_com': 4.0,
+                    'valid_ratio': 0.0,
+                    'lr_asym': 0.0,
+                    'tb_asym': 0.0,
+                })
+                continue
+
+            filled = np.nan_to_num(frame, nan=4000.0)
+
+            weights = np.maximum(0, 4000.0 - filled)
+            if weights.sum() > 0:
+                row_com, col_com = center_of_mass(weights)
+            else:
+                row_com, col_com = 4.0, 4.0
+
+            top_mean = np.mean(filled[:4, :])
+            bottom_mean = np.mean(filled[4:, :])
+            left_mean = np.mean(filled[:, :4])
+            right_mean = np.mean(filled[:, 4:])
+
+            frame_features.append({
+                'min': np.min(filled),
+                'mean': np.mean(filled),
+                'std': np.std(filled),
+                'center_mean': np.mean(filled[2:6, 2:6]),
+                'top_mean': top_mean,
+                'bottom_mean': bottom_mean,
+                'left_mean': left_mean,
+                'right_mean': right_mean,
+                'q1_mean': np.mean(filled[:4, :4]),
+                'q2_mean': np.mean(filled[:4, 4:]),
+                'q3_mean': np.mean(filled[4:, :4]),
+                'q4_mean': np.mean(filled[4:, 4:]),
+                'row_com': row_com,
+                'col_com': col_com,
+                'valid_ratio': valid_ratio,
+                'lr_asym': left_mean - right_mean,
+                'tb_asym': top_mean - bottom_mean,
+            })
+
+        feat_df = pd.DataFrame(frame_features)
+
+        out = {}
+        for col in feat_df.columns:
+            out[f"{sensor_id}_{col}_mean"] = feat_df[col].mean()
+            out[f"{sensor_id}_{col}_std"] = feat_df[col].std()
+            out[f"{sensor_id}_{col}_min"] = feat_df[col].min()
+            out[f"{sensor_id}_{col}_max"] = feat_df[col].max()
+
+        return out
+
+    @staticmethod
+    def tof_edge_logic(frames: np.ndarray, sensor_id: str) -> dict:
+        frame_features = []
+
+        for frame in frames:
+            if np.all(~np.isfinite(frame)):
+                frame_features.append({
+                    'grad_mean': 0.0,
+                    'grad_std': 0.0,
+                    'grad_max': 0.0,
+                    'sobel_x_energy': 0.0,
+                    'sobel_y_energy': 0.0,
+                    'edge_density': 0.0,
+                })
+                continue
+
+            filled = np.nan_to_num(frame, nan=4000.0)
+
+            sobel_x = ndimage.sobel(filled, axis=1, mode='nearest')
+            sobel_y = ndimage.sobel(filled, axis=0, mode='nearest')
+            grad_mag = np.sqrt(sobel_x ** 2 + sobel_y ** 2)
+
+            thresh = np.mean(grad_mag) + np.std(grad_mag)
+            edge_density = np.mean(grad_mag > thresh)
+
+            frame_features.append({
+                'grad_mean': np.mean(grad_mag),
+                'grad_std': np.std(grad_mag),
+                'grad_max': np.max(grad_mag),
+                'sobel_x_energy': np.sum(sobel_x ** 2),
+                'sobel_y_energy': np.sum(sobel_y ** 2),
+                'edge_density': edge_density,
+            })
+
+        feat_df = pd.DataFrame(frame_features)
+
+        out = {}
+        for col in feat_df.columns:
+            out[f"{sensor_id}_{col}_mean"] = feat_df[col].mean()
+            out[f"{sensor_id}_{col}_std"] = feat_df[col].std()
+            out[f"{sensor_id}_{col}_min"] = feat_df[col].min()
+            out[f"{sensor_id}_{col}_max"] = feat_df[col].max()
+
+        return out
+
+    @staticmethod
+    def tof_fft2_logic(frames: np.ndarray, sensor_id: str) -> dict:
+        frame_features = []
+
+        for frame in frames:
+            if np.all(~np.isfinite(frame)):
+                frame_features.append({
+                    'fft_total_energy': 0.0,
+                    'fft_low_energy': 0.0,
+                    'fft_high_energy': 0.0,
+                    'fft_low_high_ratio': 0.0,
+                    'fft_dc': 0.0,
+                })
+                continue
+
+            filled = np.nan_to_num(frame, nan=4000.0)
+            centered = filled - np.mean(filled)
+
+            fft2 = np.fft.fft2(centered)
+            fft2_shift = np.fft.fftshift(fft2)
+            mag = np.abs(fft2_shift)
+
+            total_energy = np.sum(mag ** 2)
+
+            center_block = mag[3:5, 3:5]
+            low_energy = np.sum(center_block ** 2)
+            high_energy = total_energy - low_energy
+
+            ratio = low_energy / high_energy if high_energy > 0 else 0.0
+
+            frame_features.append({
+                'fft_total_energy': total_energy,
+                'fft_low_energy': low_energy,
+                'fft_high_energy': high_energy,
+                'fft_low_high_ratio': ratio,
+                'fft_dc': mag[4, 4],
+            })
+
+        feat_df = pd.DataFrame(frame_features)
+
+        out = {}
+        for col in feat_df.columns:
+            out[f"{sensor_id}_{col}_mean"] = feat_df[col].mean()
+            out[f"{sensor_id}_{col}_std"] = feat_df[col].std()
+            out[f"{sensor_id}_{col}_min"] = feat_df[col].min()
+            out[f"{sensor_id}_{col}_max"] = feat_df[col].max()
+
+        return out
+
+    @staticmethod
+    def tof_svd_logic(frames: np.ndarray, sensor_id: str) -> dict:
+        frame_features = []
+
+        for frame in frames:
+            if np.all(~np.isfinite(frame)):
+                frame_features.append({
+                    'sv1': 0.0,
+                    'sv2': 0.0,
+                    'sv3': 0.0,
+                    'sv1_ratio': 0.0,
+                    'sv12_ratio': 0.0,
+                    'rank_energy_2': 0.0,
+                })
+                continue
+
+            filled = np.nan_to_num(frame, nan=4000.0)
+            centered = filled - np.mean(filled)
+
+            _, s, _ = np.linalg.svd(centered, full_matrices=False)
+
+            total_sv = np.sum(s)
+            total_sv_sq = np.sum(s ** 2)
+
+            sv1 = s[0] if len(s) > 0 else 0.0
+            sv2 = s[1] if len(s) > 1 else 0.0
+            sv3 = s[2] if len(s) > 2 else 0.0
+
+            sv1_ratio = sv1 / total_sv if total_sv > 0 else 0.0
+            sv12_ratio = (sv1 + sv2) / total_sv if total_sv > 0 else 0.0
+            rank_energy_2 = np.sum(s[:2] ** 2) / total_sv_sq if total_sv_sq > 0 else 0.0
+
+            frame_features.append({
+                'sv1': sv1,
+                'sv2': sv2,
+                'sv3': sv3,
+                'sv1_ratio': sv1_ratio,
+                'sv12_ratio': sv12_ratio,
+                'rank_energy_2': rank_energy_2,
+            })
+
+        feat_df = pd.DataFrame(frame_features)
+
+        out = {}
+        for col in feat_df.columns:
+            out[f"{sensor_id}_{col}_mean"] = feat_df[col].mean()
+            out[f"{sensor_id}_{col}_std"] = feat_df[col].std()
+            out[f"{sensor_id}_{col}_min"] = feat_df[col].min()
+            out[f"{sensor_id}_{col}_max"] = feat_df[col].max()
+
+        return out
+
+    @staticmethod
+    def tof_wavelet_logic(frames: np.ndarray, sensor_id: str, wavelet: str = 'haar') -> dict:
+        frame_features = []
+
+        for frame in frames:
+            if np.all(~np.isfinite(frame)):
+                frame_features.append({
+                    'approx_energy': 0.0,
+                    'horiz_energy': 0.0,
+                    'vert_energy': 0.0,
+                    'diag_energy': 0.0,
+                    'detail_total_energy': 0.0,
+                    'approx_detail_ratio': 0.0,
+                })
+                continue
+
+            filled = np.nan_to_num(frame, nan=4000.0)
+            centered = filled - np.mean(filled)
+
+            cA, (cH, cV, cD) = pywt.dwt2(centered, wavelet)
+
+            approx_energy = np.sum(cA ** 2)
+            horiz_energy = np.sum(cH ** 2)
+            vert_energy = np.sum(cV ** 2)
+            diag_energy = np.sum(cD ** 2)
+
+            detail_total = horiz_energy + vert_energy + diag_energy
+            ratio = approx_energy / detail_total if detail_total > 0 else 0.0
+
+            frame_features.append({
+                'approx_energy': approx_energy,
+                'horiz_energy': horiz_energy,
+                'vert_energy': vert_energy,
+                'diag_energy': diag_energy,
+                'detail_total_energy': detail_total,
+                'approx_detail_ratio': ratio,
+            })
+
+        feat_df = pd.DataFrame(frame_features)
+
+        out = {}
+        for col in feat_df.columns:
+            out[f"{sensor_id}_{col}_mean"] = feat_df[col].mean()
+            out[f"{sensor_id}_{col}_std"] = feat_df[col].std()
+            out[f"{sensor_id}_{col}_min"] = feat_df[col].min()
+            out[f"{sensor_id}_{col}_max"] = feat_df[col].max()
+
+        return out
 
     @staticmethod
     def tof_simple_logic(frames: np.ndarray, sensor_id: str) -> dict:
