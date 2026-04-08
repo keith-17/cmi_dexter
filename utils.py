@@ -11,6 +11,8 @@ from scipy.fft import fft, fftfreq, ifft
 from pathlib import Path
 from scipy import ndimage
 import pywt
+import warnings
+warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 
 def calculate_fft(array_values: np.ndarray) -> np.ndarray:
