@@ -89,7 +89,7 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
                  thermopile_sensor_list: list = None,
                  sampling_rate: int = 100,
                  imu_domain: str = 'acceleration',
-                 rotation_domain: str = 'acceleration',
+                 rotation_domain: str = 'motion',
                  dc_offset: float = 2.0,
                  band_edges: list = None,
                  subject_df: pd.DataFrame = None,
@@ -101,7 +101,8 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
                  combine_imu_axes: bool = False,
                  combine_rot_axes: bool = False,
                  tof_sensor_list: list = None,
-                 tof_mode: str = None
+                 tof_mode: str = 'baseline',
+                 thermopile_mode: str = 'baseline'
                  ):
         self.imu_sensor_list = imu_sensor_list
         self.rotation_sensor_list = rotation_sensor_list
@@ -121,6 +122,7 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
         self.thermopile_sensor_list = thermopile_sensor_list
         self.tof_sensor_list = tof_sensor_list
         self.tof_mode = tof_mode
+        self.thermopile_mode = thermopile_mode
 
     def fit(self, X, y=None):
         # print(X.shape, y.shape)
@@ -160,11 +162,9 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
 
                 if self.rotation_sensor_list:
                     rot_df = segmented_sequence_df[self.rotation_sensor_list]
-                    if self.rotation_domain != 'time':
-                        rot_df = rot_df.apply(self.convert_frame_to_fft, axis=0, args=(self.sampling_rate,))
-                        rot_df = self.filter_signal(rot_df)
-                        rot_features_df = self.extract_rotation_features(rot_df, self.combine_rot_axes)
-                        singular_record_list.append(rot_features_df)
+                    rot_df = self.process_rotation_values(rot_df, self.rotation_domain)
+                    rot_features_df = self.extract_rotation_features(rot_df, self.combine_rot_axes)
+                    singular_record_list.append(rot_features_df)
 
                 # After rotation features, add thermopile
                 if self.thermopile_sensor_list:
@@ -191,18 +191,250 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
         final_df = final_df.set_index('sequence_id').fillna(0)
         return final_df
 
+    def process_rotation_values(self, df: pd.DataFrame, domain: str) -> pd.DataFrame:
+        euler_df = self.quaternion_to_euler(df)
+        euler_df = self.unwrap_angles(euler_df)
+
+        if domain == 'orientation':
+            return euler_df
+
+        elif domain == 'motion':
+            motion_df = euler_df.diff().fillna(0)
+            return motion_df
+
+        elif domain == 'frequency':
+            motion_df = euler_df.diff().fillna(0)
+            fft_df = motion_df.apply(self.convert_frame_to_fft, axis=0, args=(self.sampling_rate,))
+            fft_df = self.filter_signal(fft_df)
+            return fft_df
+
+        else:
+            raise ValueError(f"Unknown rotation_domain: {domain}")
+
     @staticmethod
-    def extract_thermopile_features(thm_df: pd.DataFrame) -> pd.DataFrame:
-        """Extract simple stats from thermopile sensors"""
+    def quaternion_to_euler(df: pd.DataFrame) -> pd.DataFrame:
+        q = df.astype(float).copy()
+
+        w = q.iloc[:, 0].values
+        x = q.iloc[:, 1].values
+        y = q.iloc[:, 2].values
+        z = q.iloc[:, 3].values
+
+        t0 = 2.0 * (w * x + y * z)
+        t1 = 1.0 - 2.0 * (x * x + y * y)
+        roll = np.arctan2(t0, t1)
+
+        t2 = 2.0 * (w * y - z * x)
+        t2 = np.clip(t2, -1.0, 1.0)
+        pitch = np.arcsin(t2)
+
+        t3 = 2.0 * (w * z + x * y)
+        t4 = 1.0 - 2.0 * (y * y + z * z)
+        yaw = np.arctan2(t3, t4)
+
+        return pd.DataFrame({
+            'rot_roll': roll,
+            'rot_pitch': pitch,
+            'rot_yaw': yaw,
+        }, index=df.index)
+
+    def extract_rotation_features(self, rot_df: pd.DataFrame, combine_axes: bool = False) -> pd.DataFrame:
+        if rot_df.empty:
+            return pd.DataFrame()
+
+        if self.rotation_domain in ['orientation', 'motion']:
+            return self.extract_rotation_time_features(rot_df, combine_axes)
+        elif self.rotation_domain == 'frequency':
+            return self.extract_rotation_frequency_features(rot_df, combine_axes)
+        else:
+            raise ValueError(f"Unknown rotation_domain: {self.rotation_domain}")
+
+    @staticmethod
+    def extract_rotation_time_features(rot_df: pd.DataFrame, combine_axes: bool = False) -> pd.DataFrame:
+        features = {}
+
+        for col in rot_df.columns:
+            values = rot_df[col].values
+
+            features[f'{col}_mean'] = np.mean(values)
+            features[f'{col}_std'] = np.std(values)
+            features[f'{col}_min'] = np.min(values)
+            features[f'{col}_max'] = np.max(values)
+            features[f'{col}_rms'] = np.sqrt(np.mean(values ** 2))
+            features[f'{col}_energy'] = np.sum(values ** 2)
+            features[f'{col}_abs_mean'] = np.mean(np.abs(values))
+            features[f'{col}_peak_to_peak'] = np.ptp(values)
+            features[f'{col}_zero_crossings'] = np.where(np.diff(np.sign(values)))[0].size
+
+        if combine_axes and len(rot_df.columns) >= 2:
+            combined = np.sqrt(np.sum([rot_df[col].values ** 2 for col in rot_df.columns], axis=0))
+
+            features['rot_magnitude_mean'] = np.mean(combined)
+            features['rot_magnitude_std'] = np.std(combined)
+            features['rot_magnitude_min'] = np.min(combined)
+            features['rot_magnitude_max'] = np.max(combined)
+            features['rot_magnitude_rms'] = np.sqrt(np.mean(combined ** 2))
+            features['rot_magnitude_energy'] = np.sum(combined ** 2)
+            features['rot_magnitude_abs_mean'] = np.mean(np.abs(combined))
+            features['rot_magnitude_peak_to_peak'] = np.ptp(combined)
+
+        return pd.DataFrame([features])
+
+    @staticmethod
+    def unwrap_angles(df: pd.DataFrame) -> pd.DataFrame:
+        return pd.DataFrame(
+            {col: np.unwrap(df[col].values) for col in df.columns},
+            index=df.index
+        )
+
+    def extract_rotation_frequency_features(self, rot_df: pd.DataFrame, combine_axes: bool = False) -> pd.DataFrame:
+        features = {}
+        freqs = rot_df.index.values
+
+        if self.band_edges is None:
+            max_freq = float(np.nanmax(freqs)) if len(freqs) > 0 else 0.0
+            band_edges = np.arange(0, max_freq + 10, 10)
+            if len(band_edges) < 2:
+                band_edges = np.array([0, max_freq + 1])
+        else:
+            band_edges = np.asarray(self.band_edges)
+
+        for col in rot_df.columns:
+            mags = rot_df[col].values
+            peak_idx = np.argmax(mags)
+
+            features[f'{col}_peak_freq'] = freqs[peak_idx]
+            features[f'{col}_peak_mag'] = mags[peak_idx]
+            features[f'{col}_total_energy'] = np.sum(mags ** 2)
+            features[f'{col}_mean'] = np.mean(mags)
+            features[f'{col}_std'] = np.std(mags)
+
+            for low, high in zip(band_edges[:-1], band_edges[1:]):
+                mask = (freqs >= low) & (freqs < high)
+                if np.any(mask):
+                    features[f'{col}_band_{low}_{high}_energy'] = np.sum(mags[mask] ** 2)
+
+        if combine_axes and len(rot_df.columns) >= 2:
+            combined = np.sqrt(np.sum([rot_df[col].values ** 2 for col in rot_df.columns], axis=0))
+            peak_idx = np.argmax(combined)
+
+            features['rot_all_peak_freq'] = freqs[peak_idx]
+            features['rot_all_peak_mag'] = combined[peak_idx]
+            features['rot_all_total_energy'] = np.sum(combined ** 2)
+            features['rot_all_mean'] = np.mean(combined)
+            features['rot_all_std'] = np.std(combined)
+
+            for low, high in zip(band_edges[:-1], band_edges[1:]):
+                mask = (freqs >= low) & (freqs < high)
+                if np.any(mask):
+                    features[f'rot_all_band_{low}_{high}_energy'] = np.sum(combined[mask] ** 2)
+
+        return pd.DataFrame([features])
+
+    def filter_signal(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df.loc[0:self.dc_offset] = 0
+        return df
+
+    def extract_thermopile_features(self, thm_df: pd.DataFrame) -> pd.DataFrame:
         if thm_df.empty:
             return pd.DataFrame()
 
-        features = {}
+        if self.thermopile_mode == 'baseline':
+            return self.extract_thermopile_baseline(thm_df)
+        elif self.thermopile_mode == 'spatial':
+            return self.extract_thermopile_spatial(thm_df)
+        else:
+            raise ValueError(f"Unknown thermopile_mode: {self.thermopile_mode}")
+
+    @staticmethod
+    def extract_thermopile_baseline(thm_df: pd.DataFrame) -> pd.DataFrame:
+        values = thm_df.astype(float).values.flatten()
+        values = values[np.isfinite(values)]
+
+        if len(values) == 0:
+            return pd.DataFrame([{
+                'thm_all_mean': 0.0,
+                'thm_all_std': 0.0,
+                'thm_all_min': 0.0,
+                'thm_all_max': 0.0,
+            }])
+
+        return pd.DataFrame([{
+            'thm_all_mean': np.mean(values),
+            'thm_all_std': np.std(values),
+            'thm_all_min': np.min(values),
+            'thm_all_max': np.max(values),
+        }])
+
+    @staticmethod
+    def extract_thermopile_spatial(thm_df: pd.DataFrame) -> pd.DataFrame:
+        thm_df = thm_df.astype(float)
+
+        sensor_means = thm_df.mean(axis=0)
+        sensor_stds = thm_df.std(axis=0)
+
+        all_values = thm_df.values.flatten()
+        all_values = all_values[np.isfinite(all_values)]
+
+        if len(all_values) == 0:
+            return pd.DataFrame([{
+                'thm_all_mean': 0.0,
+                'thm_all_std': 0.0,
+                'thm_all_min': 0.0,
+                'thm_all_max': 0.0,
+                'thm_spatial_range': 0.0,
+                'thm_hottest_sensor_idx': -1,
+                'thm_coolest_sensor_idx': -1,
+                'thm_left_right_diff': 0.0,
+                'thm_center_edge_diff': 0.0,
+                'thm_adjacent_diff_mean': 0.0,
+                'thm_adjacent_diff_max': 0.0,
+                'thm_sensor_mean_std': 0.0,
+            }])
+
+        sensor_mean_vals = sensor_means.values
+        hottest_idx = int(np.argmax(sensor_mean_vals))
+        coolest_idx = int(np.argmin(sensor_mean_vals))
+
+        adjacent_diffs = np.abs(np.diff(sensor_mean_vals))
+
+        # assumes thm_3 is roughly central and others are more peripheral
+        center_val = sensor_means.iloc[len(sensor_means) // 2]
+        edge_vals = sensor_means.drop(sensor_means.index[len(sensor_means) // 2]).values
+
+        # simple left/right split based on sensor order
+        left_mean = np.mean(sensor_mean_vals[:len(sensor_mean_vals) // 2])
+        right_mean = np.mean(sensor_mean_vals[len(sensor_mean_vals) // 2:])
+
+        features = {
+            'thm_all_mean': np.mean(all_values),
+            'thm_all_std': np.std(all_values),
+            'thm_all_min': np.min(all_values),
+            'thm_all_max': np.max(all_values),
+
+            'thm_spatial_range': np.max(sensor_mean_vals) - np.min(sensor_mean_vals),
+            'thm_hottest_sensor_idx': hottest_idx,
+            'thm_coolest_sensor_idx': coolest_idx,
+
+            'thm_left_right_diff': left_mean - right_mean,
+            'thm_center_edge_diff': center_val - np.mean(edge_vals),
+
+            'thm_adjacent_diff_mean': np.mean(adjacent_diffs) if len(adjacent_diffs) > 0 else 0.0,
+            'thm_adjacent_diff_max': np.max(adjacent_diffs) if len(adjacent_diffs) > 0 else 0.0,
+
+            'thm_sensor_mean_std': np.std(sensor_mean_vals),
+        }
+
+        # optional: per-sensor temporal stability
         for col in thm_df.columns:
-            features[f'{col}_mean'] = thm_df[col].mean()
-            features[f'{col}_std'] = thm_df[col].std()
-            features[f'{col}_min'] = thm_df[col].min()
-            features[f'{col}_max'] = thm_df[col].max()
+            values = thm_df[col].values
+            diffs = np.diff(values) if len(values) > 1 else np.array([0.0])
+
+            features[f'{col}_mean'] = np.mean(values)
+            features[f'{col}_std'] = np.std(values)
+            features[f'{col}_diff_mean'] = np.mean(diffs)
+            features[f'{col}_diff_std'] = np.std(diffs)
 
         return pd.DataFrame([features])
 
@@ -410,48 +642,6 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
         for i, (_, group) in enumerate(groups):
             segments.append(group.assign(segment_id=i))
         return segments
-
-    def process_rotation_values(self, df: pd.DataFrame, domain: str) -> pd.DataFrame:
-        if domain != 'time':
-            rot_df = df.apply(self.convert_frame_to_fft, axis=0, args=(self.sampling_rate,))
-            rot_df = self.apply_domain_scaling(rot_df, rot_df.index, domain)
-            rot_df = self.filter_signal(rot_df)
-        else:
-            return df
-        return rot_df
-
-    @staticmethod
-    def extract_rotation_features(rot_df: pd.DataFrame, combine_axes: bool = False) -> pd.DataFrame:
-        """Extract simple stats from rotation quaternions"""
-        if rot_df.empty:
-            return pd.DataFrame()
-
-        features = {}
-
-        # Single axis features
-        for col in rot_df.columns:
-            features[f'{col}_mean'] = rot_df[col].mean()
-            features[f'{col}_std'] = rot_df[col].std()
-            features[f'{col}_min'] = rot_df[col].min()
-            features[f'{col}_max'] = rot_df[col].max()
-
-        # Combined magnitude (sqrt(w² + x² + y² + z²) = 1 for unit quaternions, but may vary)
-        if combine_axes and len(rot_df.columns) >= 2:
-            # Combined magnitude
-            combined = np.sqrt(np.sum([rot_df[col].values ** 2 for col in rot_df.columns], axis=0))
-            features['rot_magnitude_mean'] = np.mean(combined)
-            features['rot_magnitude_std'] = np.std(combined)
-            features['rot_magnitude_min'] = np.min(combined)
-            features['rot_magnitude_max'] = np.max(combined)
-
-            # Pairwise combinations
-            from itertools import combinations
-            for ax1, ax2 in combinations(rot_df.columns, 2):
-                pair = np.sqrt(rot_df[ax1].values ** 2 + rot_df[ax2].values ** 2)
-                features[f'{ax1}_{ax2}_mean'] = np.mean(pair)
-                features[f'{ax1}_{ax2}_std'] = np.std(pair)
-
-        return pd.DataFrame([features])
 
     @staticmethod
     def process_thermopile_values(df: pd.DataFrame) -> pd.DataFrame:
