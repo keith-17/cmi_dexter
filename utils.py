@@ -13,6 +13,11 @@ from scipy import ndimage
 import pywt
 import warnings
 warnings.filterwarnings('ignore', category=RuntimeWarning)
+from tensorflow import keras
+from tensorflow.keras import layers
+from sklearn.utils.validation import check_is_fitted
+from sklearn.utils.class_weight import compute_class_weight
+import tensorflow as tf
 
 
 def calculate_fft(array_values: np.ndarray) -> np.ndarray:
@@ -1252,3 +1257,376 @@ def find_data_root(local_dir='data', kaggle_root='/kaggle/input'):
         'Could not find the dataset locally or in /kaggle/input. '
         'Place the CSV files in ./data/ or attach the Kaggle dataset.'
     )
+
+
+class SequencePadder(BaseEstimator, TransformerMixin):
+    """
+    Convert a row-level feature table back into sequence tensors.
+
+    Expected input:
+        - pandas DataFrame
+        - index = sequence_id
+        - rows already in timestep order within each sequence
+          (your ImuExtractor currently preserves this when windowing)
+
+    Output:
+        {
+            "X": np.ndarray of shape (n_sequences, maxlen, n_features),
+            "sequence_ids": np.ndarray of shape (n_sequences,),
+            "lengths": np.ndarray of shape (n_sequences,)
+        }
+    """
+    def __init__(self, maxlen=None, padding_value=0.0, dtype=np.float32):
+        self.maxlen = maxlen
+        self.padding_value = padding_value
+        self.dtype = dtype
+
+    def fit(self, X, y=None):
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError(
+                "SequencePadder expects a pandas DataFrame. "
+                "Make sure your preprocessor uses .set_output(transform='pandas')."
+            )
+
+        if X.index.name != 'sequence_id':
+            # not fatal, but helps catch pipeline mistakes
+            pass
+
+        lengths = X.groupby(level=0, sort=False).size().to_numpy()
+
+        if len(lengths) == 0:
+            raise ValueError("SequencePadder received an empty DataFrame.")
+
+        self.n_features_in_ = X.shape[1]
+        self.maxlen_ = int(self.maxlen) if self.maxlen is not None else int(lengths.max())
+        self.feature_names_in_ = list(X.columns)
+        return self
+
+    def transform(self, X):
+        check_is_fitted(self, ["n_features_in_", "maxlen_"])
+
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError(
+                "SequencePadder expects a pandas DataFrame. "
+                "Make sure your preprocessor uses .set_output(transform='pandas')."
+            )
+
+        grouped = list(X.groupby(level=0, sort=False))
+
+        if len(grouped) == 0:
+            return {
+                "X": np.empty((0, self.maxlen_, self.n_features_in_), dtype=self.dtype),
+                "sequence_ids": np.array([], dtype=object),
+                "lengths": np.array([], dtype=int),
+            }
+
+        n_sequences = len(grouped)
+        X_pad = np.full(
+            (n_sequences, self.maxlen_, self.n_features_in_),
+            fill_value=self.padding_value,
+            dtype=self.dtype,
+        )
+
+        sequence_ids = []
+        lengths = []
+
+        for i, (seq_id, grp) in enumerate(grouped):
+            arr = grp.to_numpy(dtype=self.dtype, copy=True)
+            seq_len = min(len(arr), self.maxlen_)
+
+            X_pad[i, :seq_len, :] = arr[:seq_len]
+            sequence_ids.append(seq_id)
+            lengths.append(len(arr))
+
+        return {
+            "X": X_pad,
+            "sequence_ids": np.asarray(sequence_ids, dtype=object),
+            "lengths": np.asarray(lengths, dtype=int),
+        }
+
+
+class KerasRNNClassifier(BaseEstimator, ClassifierMixin):
+    """
+    sklearn-compatible Keras classifier for sequence tensors.
+
+    Expected X:
+        - either raw 3D ndarray (n_samples, timesteps, n_features)
+        - or dict output from SequencePadder with key 'X'
+    """
+    def __init__(
+        self,
+        rnn_type='lstm',
+        rnn_units=(64,),
+        dense_units=(),
+        dropout=0.0,
+        recurrent_dropout=0.0,
+        dense_dropout=0.0,
+        learning_rate=1e-3,
+        batch_size=32,
+        epochs=30,
+        validation_split=0.1,
+        patience=5,
+        l2_reg=0.0,
+        bidirectional=False,
+        class_weight_mode=None,   # None or 'balanced'
+        verbose=0,
+        random_state=42,
+        mask_value=0.0,
+    ):
+        self.rnn_type = rnn_type
+        self.rnn_units = rnn_units
+        self.dense_units = dense_units
+        self.dropout = dropout
+        self.recurrent_dropout = recurrent_dropout
+        self.dense_dropout = dense_dropout
+        self.learning_rate = learning_rate
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.validation_split = validation_split
+        self.patience = patience
+        self.l2_reg = l2_reg
+        self.bidirectional = bidirectional
+        self.class_weight_mode = class_weight_mode
+        self.verbose = verbose
+        self.random_state = random_state
+        self.mask_value = mask_value
+
+    def _extract_array(self, X):
+        if isinstance(X, dict):
+            return X["X"]
+        return X
+
+    def _get_rnn_layer(self):
+        rnn_type = str(self.rnn_type).lower()
+        if rnn_type == 'lstm':
+            return layers.LSTM
+        if rnn_type == 'gru':
+            return layers.GRU
+        if rnn_type in ('rnn', 'simplernn', 'simple_rnn'):
+            return layers.SimpleRNN
+        raise ValueError(f"Unknown rnn_type: {self.rnn_type}")
+
+    def _build_model(self, input_shape, n_classes):
+        tf.keras.backend.clear_session()
+        tf.keras.utils.set_random_seed(self.random_state)
+
+        reg = keras.regularizers.l2(self.l2_reg) if self.l2_reg and self.l2_reg > 0 else None
+        RNNLayer = self._get_rnn_layer()
+
+        inputs = keras.Input(shape=input_shape)
+        x = layers.Masking(mask_value=self.mask_value)(inputs)
+
+        units_list = list(self.rnn_units) if isinstance(self.rnn_units, (list, tuple)) else [self.rnn_units]
+        for i, units in enumerate(units_list):
+            return_sequences = i < (len(units_list) - 1)
+            layer = RNNLayer(
+                units=units,
+                return_sequences=return_sequences,
+                dropout=self.dropout,
+                recurrent_dropout=self.recurrent_dropout,
+                kernel_regularizer=reg,
+                recurrent_regularizer=reg,
+            )
+            if self.bidirectional:
+                x = layers.Bidirectional(layer)(x)
+            else:
+                x = layer(x)
+
+        dense_list = list(self.dense_units) if isinstance(self.dense_units, (list, tuple)) else [self.dense_units]
+        dense_list = [u for u in dense_list if u not in (None, 0)]
+
+        for units in dense_list:
+            x = layers.Dense(units, activation='relu', kernel_regularizer=reg)(x)
+            if self.dense_dropout and self.dense_dropout > 0:
+                x = layers.Dropout(self.dense_dropout)(x)
+
+        outputs = layers.Dense(n_classes, activation='softmax')(x)
+
+        model = keras.Model(inputs=inputs, outputs=outputs)
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=self.learning_rate),
+            loss='sparse_categorical_crossentropy',
+            metrics=['accuracy'],
+        )
+        return model
+
+    def fit(self, X, y):
+        X_arr = self._extract_array(X)
+
+        if X_arr.ndim != 3:
+            raise ValueError(
+                f"KerasRNNClassifier expected 3D input, got shape {X_arr.shape}. "
+                "Make sure SequencePadder is in the pipeline before the classifier."
+            )
+
+        self.label_encoder_ = LabelEncoder()
+        y_enc = self.label_encoder_.fit_transform(pd.Series(y))
+        self.classes_ = self.label_encoder_.classes_
+
+        n_classes = len(self.classes_)
+        if n_classes < 2:
+            raise ValueError("Need at least 2 classes in this fold.")
+
+        self.model_ = self._build_model(
+            input_shape=(X_arr.shape[1], X_arr.shape[2]),
+            n_classes=n_classes,
+        )
+
+        callbacks = [
+            keras.callbacks.EarlyStopping(
+                monitor='val_loss',
+                patience=self.patience,
+                restore_best_weights=True,
+            )
+        ]
+
+        class_weight = None
+        if self.class_weight_mode == 'balanced':
+            classes = np.unique(y_enc)
+            weights = compute_class_weight(class_weight='balanced', classes=classes, y=y_enc)
+            class_weight = {int(c): float(w) for c, w in zip(classes, weights)}
+
+        self.history_ = self.model_.fit(
+            X_arr,
+            y_enc,
+            batch_size=self.batch_size,
+            epochs=self.epochs,
+            validation_split=self.validation_split,
+            callbacks=callbacks,
+            class_weight=class_weight,
+            verbose=self.verbose,
+            shuffle=True,
+        )
+        return self
+
+    def predict_proba(self, X):
+        check_is_fitted(self, ["model_", "label_encoder_"])
+        X_arr = self._extract_array(X)
+        proba = self.model_.predict(X_arr, verbose=0)
+        return proba
+
+    def predict(self, X):
+        proba = self.predict_proba(X)
+        pred_idx = np.argmax(proba, axis=1)
+        return self.label_encoder_.inverse_transform(pred_idx)
+
+    def score(self, X, y):
+        y_pred = self.predict(X)
+        y_true = np.asarray(y)
+        return np.mean(y_true == y_pred)
+
+
+class ManyToOneWrapperRNN(BaseEstimator, ClassifierMixin):
+    def __init__(self, estimator, extractor, mode=None, target: str = 'gesture', **kwargs):
+        self.estimator = estimator
+        self.extractor = extractor
+        self.mode = mode
+        self.target = target
+
+    def _extract_sequence_ids(self, X):
+        # SequencePadder output
+        if isinstance(X, dict):
+            if "sequence_ids" not in X:
+                raise ValueError("Sequence input dict must contain 'sequence_ids'.")
+            return pd.Index(X["sequence_ids"], name="sequence_id")
+
+        # Old 2D dataframe path
+        if isinstance(X, pd.DataFrame):
+            return pd.Index(X.index, name="sequence_id")
+
+        raise TypeError(
+            "Unsupported X type in ManyToOneWrapper. "
+            "Expected pandas DataFrame or dict output from SequencePadder."
+        )
+
+    def _extract_model_input(self, X):
+        if isinstance(X, dict):
+            return X
+        return X
+
+    def _collapse_y_to_sequence(self, X, y):
+        seq_ids = self._extract_sequence_ids(X)
+
+        target_map = (
+            y.drop_duplicates(subset='sequence_id')
+             .set_index('sequence_id')[self.target]
+        )
+
+        y_seq = pd.Series(seq_ids.map(target_map), index=np.arange(len(seq_ids)), name=self.target)
+
+        if y_seq.isna().any():
+            missing_ids = seq_ids[y_seq.isna()].tolist()
+            raise ValueError(
+                "Missing labels after aligning to sequence ids. "
+                f"Example missing sequence_id values: {missing_ids[:10]}"
+            )
+
+        if len(y_seq) == 0:
+            raise ValueError("y_seq is empty after collapsing to sequence level.")
+
+        return y_seq
+
+    def fit(self, X, y):
+        y_seq = self._collapse_y_to_sequence(X, y)
+        X_model = self._extract_model_input(X)
+
+        if self.mode == 'xgboost':
+            self.label_encoder_ = LabelEncoder()
+            y_enc = self.label_encoder_.fit_transform(y_seq)
+
+            if len(np.unique(y_enc)) == 0:
+                raise ValueError("No classes in this fold.")
+
+            self.estimator_ = clone(self.estimator)
+            self.estimator_.fit(X_model, y_enc)
+        else:
+            self.estimator_ = clone(self.estimator)
+            self.estimator_.fit(X_model, y_seq)
+
+        return self
+
+    def predict(self, X):
+        X_model = self._extract_model_input(X)
+        preds = self.estimator_.predict(X_model)
+
+        if self.mode == 'xgboost':
+            preds = self.label_encoder_.inverse_transform(np.asarray(preds).astype(int))
+
+        return preds
+
+    def predict_proba(self, X):
+        X_model = self._extract_model_input(X)
+        return self.estimator_.predict_proba(X_model)
+
+    def score(self, X, y, sample_weight=None):
+        y_true = self._collapse_y_to_sequence(X, y).to_numpy()
+        y_pred = self.predict(X)
+
+        if sample_weight is not None:
+            correct = (y_true == y_pred).astype(int)
+            return np.average(correct, weights=sample_weight)
+
+        return np.mean(y_true == y_pred)
+
+
+def attach_metadata(grid_search):
+    model = grid_search.best_estimator_
+
+    wrapped_clf = model.named_steps["classifier"]
+    est = wrapped_clf.estimator_
+
+    model.metadata_ = {
+        "best_score": float(grid_search.best_score_),
+        "best_params": grid_search.best_params_,
+    }
+
+    if hasattr(model.named_steps["preprocessor"], "get_feature_names_out"):
+        model.metadata_["feature_names"] = model.named_steps["preprocessor"].get_feature_names_out().tolist()
+
+    if hasattr(est, "feature_importances_"):
+        model.feature_importances_ = {
+            "feature_names": model.named_steps["preprocessor"].get_feature_names_out().tolist(),
+            "importances": est.feature_importances_.tolist()
+        }
+
+    return model
