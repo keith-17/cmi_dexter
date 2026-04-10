@@ -1358,9 +1358,9 @@ class RawSequenceExtractor(BaseEstimator, TransformerMixin):
         q = df.astype(float).copy()
         w, x, y, z = q.iloc[:, 0], q.iloc[:, 1], q.iloc[:, 2], q.iloc[:, 3]
 
-        roll = np.arctan2(2 * (w * x + y * z), 1 - 2 * (x**2 + y**2))
+        roll = np.arctan2(2 * (w * x + y * z), 1 - 2 * (x ** 2 + y ** 2))
         pitch = np.arcsin(np.clip(2 * (w * y - z * x), -1, 1))
-        yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y**2 + z**2))
+        yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y ** 2 + z ** 2))
 
         euler = pd.DataFrame({
             "rot_roll": roll.values,
@@ -1368,19 +1368,20 @@ class RawSequenceExtractor(BaseEstimator, TransformerMixin):
             "rot_yaw": yaw.values,
         }, index=df.index)
 
-        # unwrap within each sequence
-        euler = euler.groupby(seq_ids.values, sort=False).transform(
-            lambda g: pd.DataFrame(
-                {col: np.unwrap(g[col].values) for col in g.columns},
-                index=g.index
-            )
-        )
+        # FIX: unwrap per-sequence using groupby on the DataFrame directly,
+        # then apply column-wise (each group is a DataFrame, not a Series)
+        groups = seq_ids.values
+        unwrapped = euler.copy()
+        for seq_id, idx in euler.groupby(groups).groups.items():
+            for col in euler.columns:
+                unwrapped.loc[idx, col] = np.unwrap(euler.loc[idx, col].values)
+        euler = unwrapped
 
         if self.rotation_mode == "euler":
             return euler
 
         elif self.rotation_mode == "delta_euler":
-            return euler.groupby(seq_ids.values, sort=False).transform(
+            return euler.groupby(groups, sort=False).transform(
                 lambda g: g.diff().fillna(0.0)
             )
 
