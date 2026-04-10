@@ -17,6 +17,7 @@ from tensorflow import keras
 from tensorflow.keras import layers
 from sklearn.utils.validation import check_is_fitted
 from sklearn.utils.class_weight import compute_class_weight
+import tensorflow as tf
 
 
 def calculate_fft(array_values: np.ndarray) -> np.ndarray:
