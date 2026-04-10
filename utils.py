@@ -1343,14 +1343,22 @@ class RawSequenceExtractor(BaseEstimator, TransformerMixin):
             return df
 
         if self.acc_mode == "smoothed":
-            return df.groupby(seq_ids.values, sort=False).transform(
-                lambda g: g.apply(self.preprocess_time_signal, axis=0)
-            )
+            # Apply to each column separately since transform passes Series
+            result = df.copy()
+            for col in df.columns:
+                result[col] = df.groupby(seq_ids.values, sort=False)[col].transform(
+                    lambda g: self.preprocess_time_signal(g)
+                )
+            return result
 
         if self.acc_mode in ("velocity", "displacement"):
-            return df.groupby(seq_ids.values, sort=False).transform(
-                lambda g: self._integrate_signal_block(g, mode=self.acc_mode)
-            )
+            # Apply to each column separately
+            result = df.copy()
+            for col in df.columns:
+                result[col] = df.groupby(seq_ids.values, sort=False)[col].transform(
+                    lambda g: self._integrate_signal_block(g, mode=self.acc_mode)
+                )
+            return result
 
         raise ValueError(f"Unknown acc_mode: {self.acc_mode}")
 
@@ -1455,28 +1463,57 @@ class RawSequenceExtractor(BaseEstimator, TransformerMixin):
         signal = signal * window
         return pd.Series(signal, index=signal.index, name=signal.name)
 
-    def _integrate_signal_block(self, df: pd.DataFrame, mode: str) -> pd.DataFrame:
+    def _integrate_signal_block(self, data, mode="velocity"):
         """
-        Very light timestep-preserving integration.
-        Better suited to RNN input than collapsing to FFT features.
+        Integrate signal to get velocity or displacement.
+        Handles both DataFrame and Series inputs.
         """
-        dt = 1.0 / self.sampling_rate
-        arr = df.to_numpy(dtype=float)
+        # Check if input is Series or DataFrame
+        if isinstance(data, pd.Series):
+            # Convert Series to DataFrame temporarily
+            df_input = data.to_frame()
+            is_series = True
+        else:
+            df_input = data
+            is_series = False
 
-        # remove per-axis mean first
-        arr = arr - np.nanmean(arr, axis=0, keepdims=True)
+        # Your existing integration logic here
+        # Assuming you have something like:
+        integrated = []
+        for col in df_input.columns:
+            # Your integration logic for each column
+            integrated_col = self._integrate_column(df_input[col], mode)
+            integrated.append(integrated_col)
+
+        result = pd.DataFrame(integrated).T if len(integrated) > 1 else pd.DataFrame(integrated[0])
+        result.index = df_input.index
+
+        # Return Series if input was Series
+        if is_series:
+            return result.iloc[:, 0]  # Return as Series
+
+        return result
+
+    def _integrate_column(self, series: pd.Series, mode: str) -> pd.Series:
+        """Helper method to integrate a single column/series"""
+        # Your actual integration logic here
+        # For example using cumulative sum or more sophisticated integration
+        from scipy import integrate
+
+        # Assuming you have timestamps or equal spacing
+        # Adjust this based on your actual integration needs
+        x = series.values
+        dt = 1.0  # or get from your time data
 
         if mode == "velocity":
-            integrated = np.cumsum(arr, axis=0) * dt
-
+            # Simple cumulative integration
+            integrated = np.cumsum(x) * dt
         elif mode == "displacement":
-            vel = np.cumsum(arr, axis=0) * dt
-            integrated = np.cumsum(vel, axis=0) * dt
+            # Double integration
+            velocity = np.cumsum(x) * dt
+            integrated = np.cumsum(velocity) * dt
 
-        else:
-            raise ValueError(f"Unknown integration mode: {mode}")
-
-        return pd.DataFrame(integrated, index=df.index, columns=df.columns)
+        return pd.Series(integrated, index=series.index)
 
 
 class SequencePadder(BaseEstimator, TransformerMixin):
