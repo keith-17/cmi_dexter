@@ -1742,3 +1742,180 @@ class ManyToOneWrapperRNN(BaseEstimator, ClassifierMixin):
 
         y_pred = self.predict(X)
         return np.mean(np.asarray(y_pred) == np.asarray(y_seq))
+
+
+def tcn_residual_block(x, filters, kernel_size, dilation_rate, dropout_rate, reg):
+    """Single TCN residual block with two dilated causal convolutions."""
+    residual = x
+
+    # First dilated causal conv
+    x = layers.Conv1D(
+        filters, kernel_size,
+        padding='causal',
+        dilation_rate=dilation_rate,
+        activation='relu',
+        kernel_regularizer=reg
+    )(x)
+    x = layers.LayerNormalization()(x)
+    x = layers.SpatialDropout1D(dropout_rate)(x)
+
+    # Second dilated causal conv
+    x = layers.Conv1D(
+        filters, kernel_size,
+        padding='causal',
+        dilation_rate=dilation_rate,
+        activation='relu',
+        kernel_regularizer=reg
+    )(x)
+    x = layers.LayerNormalization()(x)
+    x = layers.SpatialDropout1D(dropout_rate)(x)
+
+    # 1x1 conv on residual if channel dimensions differ
+    if residual.shape[-1] != filters:
+        residual = layers.Conv1D(filters, 1, kernel_regularizer=reg)(residual)
+
+    return layers.Add()([x, residual])
+
+
+class KerasTCNClassifier(BaseEstimator, ClassifierMixin):
+    """
+    Temporal Convolutional Network classifier.
+    Drop-in replacement for KerasRNNClassifier — accepts the same
+    dict input from SequencePadder and works inside ManyToOneWrapperRNN.
+
+    Key hyperparameters
+    -------------------
+    nb_filters   : number of conv filters per block (constant across all blocks)
+    kernel_size  : width of each causal conv kernel
+    nb_stacks    : number of times to repeat the full dilation cycle
+    dilations    : tuple of dilation rates per stack, e.g. (1, 2, 4, 8)
+                   receptive field = nb_stacks * sum(dilations) * kernel_size
+    use_skip_connections : pool skip outputs from every block before the head
+    """
+
+    def __init__(
+            self,
+            nb_filters=64,
+            kernel_size=3,
+            nb_stacks=1,
+            dilations=(1, 2, 4, 8),
+            use_skip_connections=True,
+            dropout=0.2,
+            dense_units=(64,),
+            learning_rate=1e-3,
+            batch_size=16,
+            epochs=150,
+            patience=20,
+            class_weight_mode='balanced',
+            verbose=0,
+            random_state=42,
+            mask_value=-999.0,
+    ):
+        self.nb_filters = nb_filters
+        self.kernel_size = kernel_size
+        self.nb_stacks = nb_stacks
+        self.dilations = dilations
+        self.use_skip_connections = use_skip_connections
+        self.dropout = dropout
+        self.dense_units = dense_units
+        self.learning_rate = learning_rate
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.patience = patience
+        self.class_weight_mode = class_weight_mode
+        self.verbose = verbose
+        self.random_state = random_state
+        self.mask_value = mask_value
+
+    def _extract_array(self, X):
+        return X['X'] if isinstance(X, dict) else X
+
+    def _build_model(self, input_shape, n_classes):
+        reg = keras.regularizers.l2(1e-4)
+        inputs = keras.Input(shape=input_shape)
+
+        # Zero out padded positions using a Lambda layer
+        mask_value = self.mask_value
+        x = layers.Lambda(
+            lambda t: t * tf.cast(
+                tf.reduce_any(t != mask_value, axis=-1, keepdims=True),
+                tf.float32
+            )
+        )(inputs)
+
+        skip_outputs = []
+
+        for _ in range(self.nb_stacks):
+            for dilation in self.dilations:
+                x = tcn_residual_block(
+                    x,
+                    filters=self.nb_filters,
+                    kernel_size=self.kernel_size,
+                    dilation_rate=dilation,
+                    dropout_rate=self.dropout,
+                    reg=reg
+                )
+                if self.use_skip_connections:
+                    skip_outputs.append(x)
+
+        if self.use_skip_connections and len(skip_outputs) > 1:
+            x = layers.Add()(skip_outputs)
+
+        x = layers.GlobalAveragePooling1D()(x)
+
+        for units in list(self.dense_units):
+            x = layers.Dense(units, activation='relu', kernel_regularizer=reg)(x)
+            x = layers.Dropout(self.dropout)(x)
+
+        outputs = layers.Dense(n_classes, activation='softmax')(x)
+
+        model = keras.Model(inputs, outputs)
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=self.learning_rate),
+            loss='sparse_categorical_crossentropy',
+            metrics=['accuracy'],
+        )
+        return model
+
+    def fit(self, X, y):
+        X_arr = self._extract_array(X)
+        self.label_encoder_ = LabelEncoder()
+        y_enc = self.label_encoder_.fit_transform(pd.Series(y))
+        self.classes_ = self.label_encoder_.classes_
+
+        tf.random.set_seed(self.random_state)
+        np.random.seed(self.random_state)
+
+        self.model_ = self._build_model((X_arr.shape[1], X_arr.shape[2]), len(self.classes_))
+
+        callbacks = [keras.callbacks.EarlyStopping(
+            monitor='val_loss', patience=self.patience, restore_best_weights=True
+        )]
+
+        class_weight = None
+        if self.class_weight_mode == 'balanced':
+            weights = compute_class_weight('balanced', classes=np.unique(y_enc), y=y_enc)
+            class_weight = dict(enumerate(weights))
+
+        self.history_ = self.model_.fit(
+            X_arr, y_enc,
+            batch_size=self.batch_size,
+            epochs=self.epochs,
+            validation_split=0.15,
+            callbacks=callbacks,
+            class_weight=class_weight,
+            verbose=self.verbose,
+            shuffle=True,
+        )
+        return self
+
+    def predict(self, X):
+        proba = self.predict_proba(X)
+        return self.label_encoder_.inverse_transform(np.argmax(proba, axis=1))
+
+    def predict_proba(self, X):
+        X_arr = self._extract_array(X)
+        return self.model_.predict(X_arr, verbose=0)
+
+    def score(self, X, y):
+        return np.mean(self.predict(X) == np.asarray(y))
