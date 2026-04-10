@@ -1630,3 +1630,70 @@ def attach_metadata(grid_search):
         }
 
     return model
+
+
+class RawSequenceExtractor(BaseEstimator, TransformerMixin):
+    def __init__(
+        self,
+        acc_cols=None,
+        rot_cols=None,           # quaternion columns [w, x, y, z]
+        rotation_mode='euler',   # 'euler', 'quaternion', 'delta_euler'
+        thm_cols=None,
+        tof_cols=None,
+        subject_df=None,
+    ):
+        self.acc_cols = acc_cols
+        self.rot_cols = rot_cols
+        self.rotation_mode = rotation_mode
+        self.thm_cols = thm_cols
+        self.tof_cols = tof_cols
+        self.subject_df = subject_df
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        output_parts = []
+
+        # --- Accelerometer: pass through raw ---
+        if self.acc_cols:
+            output_parts.append(X[self.acc_cols].copy())
+
+        # --- Rotation: convert quaternion per-row ---
+        if self.rot_cols:
+            rot_out = self._convert_rotation(X[self.rot_cols])
+            output_parts.append(rot_out)
+
+        # --- Thermopile: pass through ---
+        if self.thm_cols:
+            output_parts.append(X[self.thm_cols].copy())
+
+        result = pd.concat(output_parts, axis=1)
+        result.index = X['sequence_id']   # SequencePadder groups by this
+        return result
+
+    def _convert_rotation(self, df: pd.DataFrame) -> pd.DataFrame:
+        q = df.astype(float)
+        w, x, y, z = q.iloc[:,0], q.iloc[:,1], q.iloc[:,2], q.iloc[:,3]
+
+        # Quaternion → Euler (roll, pitch, yaw) per row
+        roll  = np.arctan2(2*(w*x + y*z), 1 - 2*(x**2 + y**2))
+        pitch = np.arcsin( np.clip(2*(w*y - z*x), -1, 1) )
+        yaw   = np.arctan2(2*(w*z + x*y), 1 - 2*(y**2 + z**2))
+
+        euler = pd.DataFrame({
+            'rot_roll': roll.values,
+            'rot_pitch': pitch.values,
+            'rot_yaw': yaw.values,
+        }, index=df.index)
+
+        if self.rotation_mode == 'euler':
+            return euler
+        elif self.rotation_mode == 'delta_euler':
+            # Difference between consecutive timesteps — captures motion
+            return euler.groupby(X['sequence_id']).transform(lambda g: g.diff().fillna(0))
+        elif self.rotation_mode == 'quaternion':
+            # Pass raw quaternion values (already normalised)
+            return df.rename(columns=dict(zip(df.columns, ['rot_w','rot_x','rot_y','rot_z'])))
+        else:
+            raise ValueError(f"Unknown rotation_mode: {self.rotation_mode}")
