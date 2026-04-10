@@ -1260,29 +1260,39 @@ def find_data_root(local_dir='data', kaggle_root='/kaggle/input'):
 
 class RawSequenceExtractor(BaseEstimator, TransformerMixin):
     """
-    Replacement for your old RawSequenceExtractor.
-    Outputs raw time-series data (one row per timestep) ready for RNN.
+    Temporal-safe sequence extractor for RNNs.
+    Keeps one row per timestep and only applies transforms
+    that preserve sequence structure.
     """
     def __init__(
         self,
         acc_cols=None,
         rot_cols=None,
-        rotation_mode="delta_euler",   # "euler", "delta_euler", "quaternion"
         thm_cols=None,
-        tof_cols=None,                 # list of all 320 tof_?_v? columns (auto-detected if None)
-        tof_mode="raw",                # "raw" (recommended for RNN) or "baseline"
-        mask_invalid=-999.0,           # value for invalid ToF readings
+        tof_cols=None,
+
+        acc_mode="raw",              # raw, time, smoothed, velocity, displacement
+        rotation_mode="delta_euler", # quaternion, euler, delta_euler
+        thm_mode="raw",              # raw, delta, centered
+        tof_mode="raw",              # raw, baseline, delta, centered
+
+        sampling_rate=100,
+        mask_invalid=-999.0,
     ):
         self.acc_cols = acc_cols
         self.rot_cols = rot_cols
-        self.rotation_mode = rotation_mode
         self.thm_cols = thm_cols
         self.tof_cols = tof_cols
+
+        self.acc_mode = acc_mode
+        self.rotation_mode = rotation_mode
+        self.thm_mode = thm_mode
         self.tof_mode = tof_mode
+
+        self.sampling_rate = sampling_rate
         self.mask_invalid = mask_invalid
 
     def fit(self, X, y=None):
-        # Auto-detect ToF columns if not provided
         if self.tof_cols is None:
             self.tof_cols_ = [c for c in X.columns if c.startswith("tof_") and "_v" in c]
         else:
@@ -1291,42 +1301,58 @@ class RawSequenceExtractor(BaseEstimator, TransformerMixin):
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         parts = []
+        seq_ids = X["sequence_id"]
 
-        # === 1. Accelerometer (raw) ===
+        # === 1. Accelerometer ===
         if self.acc_cols:
-            parts.append(X[self.acc_cols].copy())
+            acc_df = X[self.acc_cols].copy().astype(float)
+            acc_df = self._process_accelerometer(acc_df, seq_ids)
+            parts.append(acc_df)
 
-        # === 2. Rotation (quaternion → euler / delta_euler) ===
+        # === 2. Rotation ===
         if self.rot_cols:
-            rot_df = self._process_rotation(X[self.rot_cols], X["sequence_id"])
+            rot_df = self._process_rotation(X[self.rot_cols].copy(), seq_ids)
             parts.append(rot_df)
 
-        # === 3. Thermopile (raw) ===
+        # === 3. Thermopile ===
         if self.thm_cols:
-            parts.append(X[self.thm_cols].copy())
+            thm_df = X[self.thm_cols].copy().astype(float)
+            thm_df = self._process_thermopile(thm_df, seq_ids)
+            parts.append(thm_df)
 
-        # === 4. Time-of-Flight (raw or light preprocessing) ===
+        # === 4. Time-of-Flight ===
         if self.tof_cols_:
-            tof_df = X[self.tof_cols_].copy()
-            tof_df = tof_df.replace(-1.0, self.mask_invalid)   # mark invalids
-            if self.tof_mode == "baseline":
-                # very light per-sensor mean/std (optional)
-                for sensor in range(1, 6):
-                    s_cols = [c for c in tof_df.columns if f"tof_{sensor}_" in c]
-                    if s_cols:
-                        tof_df[f"tof{sensor}_mean"] = tof_df[s_cols].mean(axis=1)
-                        tof_df[f"tof{sensor}_std"] = tof_df[s_cols].std(axis=1)
+            tof_df = X[self.tof_cols_].copy().astype(float)
+
+            # mark invalids consistently
+            tof_df = tof_df.replace(-1.0, self.mask_invalid)
+            tof_df = tof_df.mask((tof_df <= 0) | (tof_df >= 4000), self.mask_invalid)
+
+            tof_df = self._process_tof(tof_df, seq_ids)
             parts.append(tof_df)
 
-        # Concatenate everything
-        result = pd.concat(parts, axis=1)
+        result = pd.concat(parts, axis=1).fillna(0.0)
 
-        # Set index to sequence_id so SequencePadder can group correctly
+        # preserve grouping for SequencePadder
         result.index = X["sequence_id"].values
-
-        # Ensure column names are clean
         result.columns = [str(c) for c in result.columns]
         return result
+
+    def _process_accelerometer(self, df: pd.DataFrame, seq_ids: pd.Series) -> pd.DataFrame:
+        if self.acc_mode == "raw":
+            return df
+
+        if self.acc_mode == "smoothed":
+            return df.groupby(seq_ids.values, sort=False).transform(
+                lambda g: g.apply(self.preprocess_time_signal, axis=0)
+            )
+
+        if self.acc_mode in ("velocity", "displacement"):
+            return df.groupby(seq_ids.values, sort=False).transform(
+                lambda g: self._integrate_signal_block(g, mode=self.acc_mode)
+            )
+
+        raise ValueError(f"Unknown acc_mode: {self.acc_mode}")
 
     def _process_rotation(self, df: pd.DataFrame, seq_ids: pd.Series) -> pd.DataFrame:
         q = df.astype(float).copy()
@@ -1342,17 +1368,116 @@ class RawSequenceExtractor(BaseEstimator, TransformerMixin):
             "rot_yaw": yaw.values,
         }, index=df.index)
 
+        # unwrap within each sequence
+        euler = euler.groupby(seq_ids.values, sort=False).transform(
+            lambda g: pd.DataFrame(
+                {col: np.unwrap(g[col].values) for col in g.columns},
+                index=g.index
+            )
+        )
+
         if self.rotation_mode == "euler":
             return euler
+
         elif self.rotation_mode == "delta_euler":
-            # Delta per sequence (critical!)
-            return euler.groupby(seq_ids.values).transform(lambda g: g.diff().fillna(0))
+            return euler.groupby(seq_ids.values, sort=False).transform(
+                lambda g: g.diff().fillna(0.0)
+            )
+
         elif self.rotation_mode == "quaternion":
             return df.rename(columns=dict(zip(df.columns, ["rot_w", "rot_x", "rot_y", "rot_z"])))
+
         raise ValueError(f"Unknown rotation_mode: {self.rotation_mode}")
 
+    def _process_thermopile(self, df: pd.DataFrame, seq_ids: pd.Series) -> pd.DataFrame:
+        if self.thm_mode == "raw":
+            return df
 
-# ====================== IMPROVED PADDER ======================
+        if self.thm_mode == "delta":
+            return df.groupby(seq_ids.values, sort=False).transform(
+                lambda g: g.diff().fillna(0.0)
+            )
+
+        if self.thm_mode == "centered":
+            return df.sub(df.mean(axis=1), axis=0)
+
+        if self.thm_mode == "average":
+            # Calculate mean across all 5 thermopile sensors
+            averaged = df.mean(axis=1)  # Single column
+            return pd.DataFrame(averaged, columns=['thm_average'])
+
+        raise ValueError(f"Unknown thm_mode: {self.thm_mode}")
+
+    def _process_tof(self, df: pd.DataFrame, seq_ids: pd.Series) -> pd.DataFrame:
+        # keep masked values as mask_invalid after transforms
+        invalid_mask = df.eq(self.mask_invalid)
+
+        if self.tof_mode == "raw":
+            out = df
+
+        elif self.tof_mode == "delta":
+            temp = df.mask(invalid_mask, np.nan)
+            out = temp.groupby(seq_ids.values, sort=False).transform(
+                lambda g: g.diff().fillna(0.0)
+            )
+            out = out.fillna(self.mask_invalid)
+
+        elif self.tof_mode == "centered":
+            temp = df.mask(invalid_mask, np.nan)
+            row_means = temp.mean(axis=1)
+            out = temp.sub(row_means, axis=0).fillna(self.mask_invalid)
+
+        elif self.tof_mode == "baseline":
+            temp = df.mask(invalid_mask, np.nan)
+            out = temp.copy()
+
+            # add light per-timestep summaries per tof sensor
+            for sensor in range(1, 6):
+                s_cols = [c for c in temp.columns if c.startswith(f"tof_{sensor}_") and "_v" in c]
+                if s_cols:
+                    out[f"tof{sensor}_mean"] = temp[s_cols].mean(axis=1)
+                    out[f"tof{sensor}_std"] = temp[s_cols].std(axis=1)
+                    out[f"tof{sensor}_min"] = temp[s_cols].min(axis=1)
+
+            out = out.fillna(self.mask_invalid)
+
+        else:
+            raise ValueError(f"Unknown tof_mode: {self.tof_mode}")
+
+        return out
+
+    def preprocess_time_signal(self, signal: pd.Series) -> pd.Series:
+        signal = signal.astype(float).copy()
+        signal = signal - signal.mean()
+        signal = signal.rolling(window=3, center=True, min_periods=1).mean()
+        window = np.hanning(len(signal))
+        signal = signal * window
+        return pd.Series(signal, index=signal.index, name=signal.name)
+
+    def _integrate_signal_block(self, df: pd.DataFrame, mode: str) -> pd.DataFrame:
+        """
+        Very light timestep-preserving integration.
+        Better suited to RNN input than collapsing to FFT features.
+        """
+        dt = 1.0 / self.sampling_rate
+        arr = df.to_numpy(dtype=float)
+
+        # remove per-axis mean first
+        arr = arr - np.nanmean(arr, axis=0, keepdims=True)
+
+        if mode == "velocity":
+            integrated = np.cumsum(arr, axis=0) * dt
+
+        elif mode == "displacement":
+            vel = np.cumsum(arr, axis=0) * dt
+            integrated = np.cumsum(vel, axis=0) * dt
+
+        else:
+            raise ValueError(f"Unknown integration mode: {mode}")
+
+        return pd.DataFrame(integrated, index=df.index, columns=df.columns)
+
+
 class SequencePadder(BaseEstimator, TransformerMixin):
     """
     Turns the per-timestep DataFrame into 3D tensors for RNN.
@@ -1398,7 +1523,6 @@ class SequencePadder(BaseEstimator, TransformerMixin):
         }
 
 
-# ====================== ENHANCED RNN CLASSIFIER ======================
 class KerasRNNClassifier(BaseEstimator, ClassifierMixin):
     def __init__(
         self,
@@ -1513,46 +1637,52 @@ class ManyToOneWrapperRNN(BaseEstimator, ClassifierMixin):
         self.estimator = estimator
         self.target = target
 
-    def _collapse_y(self, X, y):
-        """Convert sequence_ids to Series and handle label mapping correctly."""
-        # Get sequence IDs from X (could be dict from SequencePadder or DataFrame)
+    def _get_sequence_ids(self, X):
         if isinstance(X, dict):
             seq_ids = X["sequence_ids"]
         else:
             seq_ids = X.index
 
-        # Convert to pandas Series if it's a numpy array
         if not isinstance(seq_ids, pd.Series):
-            seq_ids = pd.Series(seq_ids, name='sequence_id')
+            seq_ids = pd.Series(seq_ids, name="sequence_id")
 
-        # IMPORTANT: y is a DataFrame with 'sequence_id' and target columns
-        # Create mapping from sequence_id to label
-        target_map = y.drop_duplicates('sequence_id').set_index('sequence_id')[self.target]
+        return seq_ids.reset_index(drop=True)
 
-        # Map and ensure we have a valid Series
+    def _collapse_y(self, seq_ids, y):
+        target_map = (
+            y.drop_duplicates("sequence_id")
+             .set_index("sequence_id")[self.target]
+        )
+
         y_seq = seq_ids.map(target_map)
-
-        # Check for missing values
-        if y_seq.isna().any():
-            missing_seq_ids = seq_ids[y_seq.isna()].tolist()
-            print(f"Warning: Missing labels for {len(missing_seq_ids)} sequences")
-            # Drop missing values
-            valid_mask = ~y_seq.isna()
-            return y_seq[valid_mask]
-
         return y_seq
 
+    def _filter_X(self, X, valid_mask):
+        valid_mask = np.asarray(valid_mask)
+
+        if isinstance(X, dict):
+            return {
+                "X": X["X"][valid_mask],
+                "sequence_ids": np.asarray(X["sequence_ids"])[valid_mask],
+                "lengths": np.asarray(X["lengths"])[valid_mask],
+            }
+        else:
+            return X.loc[valid_mask]
+
     def fit(self, X, y):
-        y_seq = self._collapse_y(X, y)
+        seq_ids = self._get_sequence_ids(X)
+        y_seq = self._collapse_y(seq_ids, y)
 
-        # CRITICAL: Remove any NaN labels
-        if hasattr(y_seq, 'isna') and y_seq.isna().any():
-            print(f"Dropping {y_seq.isna().sum()} NaN labels")
-            valid_mask = ~y_seq.isna()
-            # Also need to filter X - but this is tricky with dict input
-            # For now, let's just check
+        valid_mask = ~y_seq.isna().to_numpy()
 
-        # Clone and fit
+        if not valid_mask.all():
+            print(f"Dropping {(~valid_mask).sum()} sequences with missing labels")
+            X = self._filter_X(X, valid_mask)
+            y_seq = y_seq.loc[valid_mask].reset_index(drop=True)
+
+        if len(y_seq) == 0:
+            raise ValueError("No valid sequence labels after alignment.")
+
         self.estimator_ = clone(self.estimator)
         self.estimator_.fit(X, y_seq)
         return self
@@ -1562,3 +1692,15 @@ class ManyToOneWrapperRNN(BaseEstimator, ClassifierMixin):
 
     def predict_proba(self, X):
         return self.estimator_.predict_proba(X)
+
+    def score(self, X, y):
+        seq_ids = self._get_sequence_ids(X)
+        y_seq = self._collapse_y(seq_ids, y)
+
+        valid_mask = ~y_seq.isna().to_numpy()
+        if not valid_mask.all():
+            X = self._filter_X(X, valid_mask)
+            y_seq = y_seq.loc[valid_mask].reset_index(drop=True)
+
+        y_pred = self.predict(X)
+        return np.mean(np.asarray(y_pred) == np.asarray(y_seq))
