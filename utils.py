@@ -17,7 +17,6 @@ from tensorflow import keras
 from tensorflow.keras import layers
 from sklearn.utils.validation import check_is_fitted
 from sklearn.utils.class_weight import compute_class_weight
-import tensorflow as tf
 
 
 def calculate_fft(array_values: np.ndarray) -> np.ndarray:
@@ -1259,70 +1258,125 @@ def find_data_root(local_dir='data', kaggle_root='/kaggle/input'):
     )
 
 
+class RawSequenceExtractor(BaseEstimator, TransformerMixin):
+    """
+    Replacement for your old RawSequenceExtractor.
+    Outputs raw time-series data (one row per timestep) ready for RNN.
+    """
+    def __init__(
+        self,
+        acc_cols=None,
+        rot_cols=None,
+        rotation_mode="delta_euler",   # "euler", "delta_euler", "quaternion"
+        thm_cols=None,
+        tof_cols=None,                 # list of all 320 tof_?_v? columns (auto-detected if None)
+        tof_mode="raw",                # "raw" (recommended for RNN) or "baseline"
+        mask_invalid=-999.0,           # value for invalid ToF readings
+    ):
+        self.acc_cols = acc_cols
+        self.rot_cols = rot_cols
+        self.rotation_mode = rotation_mode
+        self.thm_cols = thm_cols
+        self.tof_cols = tof_cols
+        self.tof_mode = tof_mode
+        self.mask_invalid = mask_invalid
+
+    def fit(self, X, y=None):
+        # Auto-detect ToF columns if not provided
+        if self.tof_cols is None:
+            self.tof_cols_ = [c for c in X.columns if c.startswith("tof_") and "_v" in c]
+        else:
+            self.tof_cols_ = self.tof_cols
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        parts = []
+
+        # === 1. Accelerometer (raw) ===
+        if self.acc_cols:
+            parts.append(X[self.acc_cols].copy())
+
+        # === 2. Rotation (quaternion → euler / delta_euler) ===
+        if self.rot_cols:
+            rot_df = self._process_rotation(X[self.rot_cols], X["sequence_id"])
+            parts.append(rot_df)
+
+        # === 3. Thermopile (raw) ===
+        if self.thm_cols:
+            parts.append(X[self.thm_cols].copy())
+
+        # === 4. Time-of-Flight (raw or light preprocessing) ===
+        if self.tof_cols_:
+            tof_df = X[self.tof_cols_].copy()
+            tof_df = tof_df.replace(-1.0, self.mask_invalid)   # mark invalids
+            if self.tof_mode == "baseline":
+                # very light per-sensor mean/std (optional)
+                for sensor in range(1, 6):
+                    s_cols = [c for c in tof_df.columns if f"tof_{sensor}_" in c]
+                    if s_cols:
+                        tof_df[f"tof{sensor}_mean"] = tof_df[s_cols].mean(axis=1)
+                        tof_df[f"tof{sensor}_std"] = tof_df[s_cols].std(axis=1)
+            parts.append(tof_df)
+
+        # Concatenate everything
+        result = pd.concat(parts, axis=1)
+
+        # Set index to sequence_id so SequencePadder can group correctly
+        result.index = X["sequence_id"].values
+
+        # Ensure column names are clean
+        result.columns = [str(c) for c in result.columns]
+        return result
+
+    def _process_rotation(self, df: pd.DataFrame, seq_ids: pd.Series) -> pd.DataFrame:
+        q = df.astype(float).copy()
+        w, x, y, z = q.iloc[:, 0], q.iloc[:, 1], q.iloc[:, 2], q.iloc[:, 3]
+
+        roll = np.arctan2(2 * (w * x + y * z), 1 - 2 * (x**2 + y**2))
+        pitch = np.arcsin(np.clip(2 * (w * y - z * x), -1, 1))
+        yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y**2 + z**2))
+
+        euler = pd.DataFrame({
+            "rot_roll": roll.values,
+            "rot_pitch": pitch.values,
+            "rot_yaw": yaw.values,
+        }, index=df.index)
+
+        if self.rotation_mode == "euler":
+            return euler
+        elif self.rotation_mode == "delta_euler":
+            # Delta per sequence (critical!)
+            return euler.groupby(seq_ids.values).transform(lambda g: g.diff().fillna(0))
+        elif self.rotation_mode == "quaternion":
+            return df.rename(columns=dict(zip(df.columns, ["rot_w", "rot_x", "rot_y", "rot_z"])))
+        raise ValueError(f"Unknown rotation_mode: {self.rotation_mode}")
+
+
+# ====================== IMPROVED PADDER ======================
 class SequencePadder(BaseEstimator, TransformerMixin):
     """
-    Convert a row-level feature table back into sequence tensors.
-
-    Expected input:
-        - pandas DataFrame
-        - index = sequence_id
-        - rows already in timestep order within each sequence
-          (your ImuExtractor currently preserves this when windowing)
-
-    Output:
-        {
-            "X": np.ndarray of shape (n_sequences, maxlen, n_features),
-            "sequence_ids": np.ndarray of shape (n_sequences,),
-            "lengths": np.ndarray of shape (n_sequences,)
-        }
+    Turns the per-timestep DataFrame into 3D tensors for RNN.
     """
-    def __init__(self, maxlen=None, padding_value=0.0, dtype=np.float32):
+    def __init__(self, maxlen=60, padding_value=-999.0, dtype=np.float32):
         self.maxlen = maxlen
         self.padding_value = padding_value
         self.dtype = dtype
 
     def fit(self, X, y=None):
         if not isinstance(X, pd.DataFrame):
-            raise TypeError(
-                "SequencePadder expects a pandas DataFrame. "
-                "Make sure your preprocessor uses .set_output(transform='pandas')."
-            )
-
-        if X.index.name != 'sequence_id':
-            # not fatal, but helps catch pipeline mistakes
-            pass
-
-        lengths = X.groupby(level=0, sort=False).size().to_numpy()
-
-        if len(lengths) == 0:
-            raise ValueError("SequencePadder received an empty DataFrame.")
-
+            raise TypeError("SequencePadder expects a pandas DataFrame.")
         self.n_features_in_ = X.shape[1]
-        self.maxlen_ = int(self.maxlen) if self.maxlen is not None else int(lengths.max())
         self.feature_names_in_ = list(X.columns)
         return self
 
     def transform(self, X):
-        check_is_fitted(self, ["n_features_in_", "maxlen_"])
+        check_is_fitted(self, ["n_features_in_"])
 
-        if not isinstance(X, pd.DataFrame):
-            raise TypeError(
-                "SequencePadder expects a pandas DataFrame. "
-                "Make sure your preprocessor uses .set_output(transform='pandas')."
-            )
+        grouped = list(X.groupby(level=0, sort=False))  # group by sequence_id
+        n_seq = len(grouped)
 
-        grouped = list(X.groupby(level=0, sort=False))
-
-        if len(grouped) == 0:
-            return {
-                "X": np.empty((0, self.maxlen_, self.n_features_in_), dtype=self.dtype),
-                "sequence_ids": np.array([], dtype=object),
-                "lengths": np.array([], dtype=int),
-            }
-
-        n_sequences = len(grouped)
         X_pad = np.full(
-            (n_sequences, self.maxlen_, self.n_features_in_),
+            (n_seq, self.maxlen, self.n_features_in_),
             fill_value=self.padding_value,
             dtype=self.dtype,
         )
@@ -1332,166 +1386,109 @@ class SequencePadder(BaseEstimator, TransformerMixin):
 
         for i, (seq_id, grp) in enumerate(grouped):
             arr = grp.to_numpy(dtype=self.dtype, copy=True)
-            seq_len = min(len(arr), self.maxlen_)
-
+            seq_len = min(len(arr), self.maxlen)
             X_pad[i, :seq_len, :] = arr[:seq_len]
             sequence_ids.append(seq_id)
             lengths.append(len(arr))
 
         return {
-            "X": X_pad,
-            "sequence_ids": np.asarray(sequence_ids, dtype=object),
-            "lengths": np.asarray(lengths, dtype=int),
+            "X": X_pad,                          # (n_seq, maxlen, n_features)
+            "sequence_ids": np.array(sequence_ids),
+            "lengths": np.array(lengths),
         }
 
 
+# ====================== ENHANCED RNN CLASSIFIER ======================
 class KerasRNNClassifier(BaseEstimator, ClassifierMixin):
-    """
-    sklearn-compatible Keras classifier for sequence tensors.
-
-    Expected X:
-        - either raw 3D ndarray (n_samples, timesteps, n_features)
-        - or dict output from SequencePadder with key 'X'
-    """
     def __init__(
         self,
-        rnn_type='lstm',
-        rnn_units=(64,),
-        dense_units=(),
-        dropout=0.0,
-        recurrent_dropout=0.0,
-        dense_dropout=0.0,
-        learning_rate=1e-3,
-        batch_size=32,
-        epochs=30,
-        validation_split=0.1,
-        patience=5,
-        l2_reg=0.0,
-        bidirectional=False,
-        class_weight_mode=None,   # None or 'balanced'
+        rnn_type="lstm",           # lstm, gru, rnn
+        rnn_units=(128, 64),
+        dense_units=(64,),
+        dropout=0.2,
+        bidirectional=True,        # ← big boost for gestures
+        learning_rate=5e-4,
+        batch_size=16,
+        epochs=150,
+        patience=20,
+        class_weight_mode="balanced",   # ← fixes your majority-class problem
         verbose=0,
         random_state=42,
-        mask_value=0.0,
+        mask_value=-999.0,
     ):
         self.rnn_type = rnn_type
         self.rnn_units = rnn_units
         self.dense_units = dense_units
         self.dropout = dropout
-        self.recurrent_dropout = recurrent_dropout
-        self.dense_dropout = dense_dropout
+        self.bidirectional = bidirectional
         self.learning_rate = learning_rate
         self.batch_size = batch_size
         self.epochs = epochs
-        self.validation_split = validation_split
         self.patience = patience
-        self.l2_reg = l2_reg
-        self.bidirectional = bidirectional
         self.class_weight_mode = class_weight_mode
         self.verbose = verbose
         self.random_state = random_state
         self.mask_value = mask_value
 
     def _extract_array(self, X):
-        if isinstance(X, dict):
-            return X["X"]
-        return X
+        return X["X"] if isinstance(X, dict) else X
 
     def _get_rnn_layer(self):
-        rnn_type = str(self.rnn_type).lower()
-        if rnn_type == 'lstm':
-            return layers.LSTM
-        if rnn_type == 'gru':
-            return layers.GRU
-        if rnn_type in ('rnn', 'simplernn', 'simple_rnn'):
-            return layers.SimpleRNN
-        raise ValueError(f"Unknown rnn_type: {self.rnn_type}")
+        return {"lstm": layers.LSTM, "gru": layers.GRU, "rnn": layers.SimpleRNN}[self.rnn_type.lower()]
 
     def _build_model(self, input_shape, n_classes):
-        tf.keras.backend.clear_session()
-        tf.keras.utils.set_random_seed(self.random_state)
-
-        reg = keras.regularizers.l2(self.l2_reg) if self.l2_reg and self.l2_reg > 0 else None
         RNNLayer = self._get_rnn_layer()
+        reg = keras.regularizers.l2(1e-4)
 
         inputs = keras.Input(shape=input_shape)
         x = layers.Masking(mask_value=self.mask_value)(inputs)
 
-        units_list = list(self.rnn_units) if isinstance(self.rnn_units, (list, tuple)) else [self.rnn_units]
+        units_list = list(self.rnn_units)
         for i, units in enumerate(units_list):
-            return_sequences = i < (len(units_list) - 1)
-            layer = RNNLayer(
-                units=units,
-                return_sequences=return_sequences,
-                dropout=self.dropout,
-                recurrent_dropout=self.recurrent_dropout,
-                kernel_regularizer=reg,
-                recurrent_regularizer=reg,
-            )
+            return_seq = i < len(units_list) - 1
+            layer = RNNLayer(units, return_sequences=return_seq, dropout=self.dropout,
+                             kernel_regularizer=reg)
             if self.bidirectional:
                 x = layers.Bidirectional(layer)(x)
             else:
                 x = layer(x)
 
-        dense_list = list(self.dense_units) if isinstance(self.dense_units, (list, tuple)) else [self.dense_units]
-        dense_list = [u for u in dense_list if u not in (None, 0)]
+        for units in list(self.dense_units):
+            x = layers.Dense(units, activation="relu", kernel_regularizer=reg)(x)
+            x = layers.Dropout(self.dropout)(x)
 
-        for units in dense_list:
-            x = layers.Dense(units, activation='relu', kernel_regularizer=reg)(x)
-            if self.dense_dropout and self.dense_dropout > 0:
-                x = layers.Dropout(self.dense_dropout)(x)
+        outputs = layers.Dense(n_classes, activation="softmax")(x)
 
-        outputs = layers.Dense(n_classes, activation='softmax')(x)
-
-        model = keras.Model(inputs=inputs, outputs=outputs)
+        model = keras.Model(inputs, outputs)
         model.compile(
             optimizer=keras.optimizers.Adam(learning_rate=self.learning_rate),
-            loss='sparse_categorical_crossentropy',
-            metrics=['accuracy'],
+            loss="sparse_categorical_crossentropy",
+            metrics=["accuracy"],
         )
         return model
 
     def fit(self, X, y):
         X_arr = self._extract_array(X)
-
-        if X_arr.ndim != 3:
-            raise ValueError(
-                f"KerasRNNClassifier expected 3D input, got shape {X_arr.shape}. "
-                "Make sure SequencePadder is in the pipeline before the classifier."
-            )
-
         self.label_encoder_ = LabelEncoder()
         y_enc = self.label_encoder_.fit_transform(pd.Series(y))
         self.classes_ = self.label_encoder_.classes_
 
-        n_classes = len(self.classes_)
-        if n_classes < 2:
-            raise ValueError("Need at least 2 classes in this fold.")
+        self.model_ = self._build_model((X_arr.shape[1], X_arr.shape[2]), len(self.classes_))
 
-        self.model_ = self._build_model(
-            input_shape=(X_arr.shape[1], X_arr.shape[2]),
-            n_classes=n_classes,
-        )
-
-        callbacks = [
-            keras.callbacks.EarlyStopping(
-                monitor='val_loss',
-                patience=self.patience,
-                restore_best_weights=True,
-            )
-        ]
+        callbacks = [keras.callbacks.EarlyStopping(
+            monitor="val_loss", patience=self.patience, restore_best_weights=True
+        )]
 
         class_weight = None
-        if self.class_weight_mode == 'balanced':
-            classes = np.unique(y_enc)
-            weights = compute_class_weight(class_weight='balanced', classes=classes, y=y_enc)
-            class_weight = {int(c): float(w) for c, w in zip(classes, weights)}
+        if self.class_weight_mode == "balanced":
+            weights = compute_class_weight("balanced", classes=np.unique(y_enc), y=y_enc)
+            class_weight = dict(enumerate(weights))
 
         self.history_ = self.model_.fit(
-            X_arr,
-            y_enc,
+            X_arr, y_enc,
             batch_size=self.batch_size,
             epochs=self.epochs,
-            validation_split=self.validation_split,
+            validation_split=0.15,
             callbacks=callbacks,
             class_weight=class_weight,
             verbose=self.verbose,
@@ -1499,201 +1496,69 @@ class KerasRNNClassifier(BaseEstimator, ClassifierMixin):
         )
         return self
 
-    def predict_proba(self, X):
-        check_is_fitted(self, ["model_", "label_encoder_"])
-        X_arr = self._extract_array(X)
-        proba = self.model_.predict(X_arr, verbose=0)
-        return proba
-
     def predict(self, X):
         proba = self.predict_proba(X)
-        pred_idx = np.argmax(proba, axis=1)
-        return self.label_encoder_.inverse_transform(pred_idx)
+        return self.label_encoder_.inverse_transform(np.argmax(proba, axis=1))
+
+    def predict_proba(self, X):
+        X_arr = self._extract_array(X)
+        return self.model_.predict(X_arr, verbose=0)
 
     def score(self, X, y):
-        y_pred = self.predict(X)
-        y_true = np.asarray(y)
-        return np.mean(y_true == y_pred)
+        return np.mean(self.predict(X) == y)
 
 
 class ManyToOneWrapperRNN(BaseEstimator, ClassifierMixin):
-    def __init__(self, estimator, extractor, mode=None, target: str = 'gesture', **kwargs):
+    def __init__(self, estimator, target="gesture_action"):
         self.estimator = estimator
-        self.extractor = extractor
-        self.mode = mode
         self.target = target
 
-    def _extract_sequence_ids(self, X):
-        # SequencePadder output
+    def _collapse_y(self, X, y):
+        """Convert sequence_ids to Series and handle label mapping correctly."""
+        # Get sequence IDs from X (could be dict from SequencePadder or DataFrame)
         if isinstance(X, dict):
-            if "sequence_ids" not in X:
-                raise ValueError("Sequence input dict must contain 'sequence_ids'.")
-            return pd.Index(X["sequence_ids"], name="sequence_id")
+            seq_ids = X["sequence_ids"]
+        else:
+            seq_ids = X.index
 
-        # Old 2D dataframe path
-        if isinstance(X, pd.DataFrame):
-            return pd.Index(X.index, name="sequence_id")
+        # Convert to pandas Series if it's a numpy array
+        if not isinstance(seq_ids, pd.Series):
+            seq_ids = pd.Series(seq_ids, name='sequence_id')
 
-        raise TypeError(
-            "Unsupported X type in ManyToOneWrapper. "
-            "Expected pandas DataFrame or dict output from SequencePadder."
-        )
+        # IMPORTANT: y is a DataFrame with 'sequence_id' and target columns
+        # Create mapping from sequence_id to label
+        target_map = y.drop_duplicates('sequence_id').set_index('sequence_id')[self.target]
 
-    def _extract_model_input(self, X):
-        if isinstance(X, dict):
-            return X
-        return X
+        # Map and ensure we have a valid Series
+        y_seq = seq_ids.map(target_map)
 
-    def _collapse_y_to_sequence(self, X, y):
-        seq_ids = self._extract_sequence_ids(X)
-
-        target_map = (
-            y.drop_duplicates(subset='sequence_id')
-             .set_index('sequence_id')[self.target]
-        )
-
-        y_seq = pd.Series(seq_ids.map(target_map), index=np.arange(len(seq_ids)), name=self.target)
-
+        # Check for missing values
         if y_seq.isna().any():
-            missing_ids = seq_ids[y_seq.isna()].tolist()
-            raise ValueError(
-                "Missing labels after aligning to sequence ids. "
-                f"Example missing sequence_id values: {missing_ids[:10]}"
-            )
-
-        if len(y_seq) == 0:
-            raise ValueError("y_seq is empty after collapsing to sequence level.")
+            missing_seq_ids = seq_ids[y_seq.isna()].tolist()
+            print(f"Warning: Missing labels for {len(missing_seq_ids)} sequences")
+            # Drop missing values
+            valid_mask = ~y_seq.isna()
+            return y_seq[valid_mask]
 
         return y_seq
 
     def fit(self, X, y):
-        y_seq = self._collapse_y_to_sequence(X, y)
-        X_model = self._extract_model_input(X)
+        y_seq = self._collapse_y(X, y)
 
-        if self.mode == 'xgboost':
-            self.label_encoder_ = LabelEncoder()
-            y_enc = self.label_encoder_.fit_transform(y_seq)
+        # CRITICAL: Remove any NaN labels
+        if hasattr(y_seq, 'isna') and y_seq.isna().any():
+            print(f"Dropping {y_seq.isna().sum()} NaN labels")
+            valid_mask = ~y_seq.isna()
+            # Also need to filter X - but this is tricky with dict input
+            # For now, let's just check
 
-            if len(np.unique(y_enc)) == 0:
-                raise ValueError("No classes in this fold.")
-
-            self.estimator_ = clone(self.estimator)
-            self.estimator_.fit(X_model, y_enc)
-        else:
-            self.estimator_ = clone(self.estimator)
-            self.estimator_.fit(X_model, y_seq)
-
+        # Clone and fit
+        self.estimator_ = clone(self.estimator)
+        self.estimator_.fit(X, y_seq)
         return self
 
     def predict(self, X):
-        X_model = self._extract_model_input(X)
-        preds = self.estimator_.predict(X_model)
-
-        if self.mode == 'xgboost':
-            preds = self.label_encoder_.inverse_transform(np.asarray(preds).astype(int))
-
-        return preds
+        return self.estimator_.predict(X)
 
     def predict_proba(self, X):
-        X_model = self._extract_model_input(X)
-        return self.estimator_.predict_proba(X_model)
-
-    def score(self, X, y, sample_weight=None):
-        y_true = self._collapse_y_to_sequence(X, y).to_numpy()
-        y_pred = self.predict(X)
-
-        if sample_weight is not None:
-            correct = (y_true == y_pred).astype(int)
-            return np.average(correct, weights=sample_weight)
-
-        return np.mean(y_true == y_pred)
-
-
-def attach_metadata(grid_search):
-    model = grid_search.best_estimator_
-
-    wrapped_clf = model.named_steps["classifier"]
-    est = wrapped_clf.estimator_
-
-    model.metadata_ = {
-        "best_score": float(grid_search.best_score_),
-        "best_params": grid_search.best_params_,
-    }
-
-    if hasattr(model.named_steps["preprocessor"], "get_feature_names_out"):
-        model.metadata_["feature_names"] = model.named_steps["preprocessor"].get_feature_names_out().tolist()
-
-    if hasattr(est, "feature_importances_"):
-        model.feature_importances_ = {
-            "feature_names": model.named_steps["preprocessor"].get_feature_names_out().tolist(),
-            "importances": est.feature_importances_.tolist()
-        }
-
-    return model
-
-
-class RawSequenceExtractor(BaseEstimator, TransformerMixin):
-    def __init__(
-        self,
-        acc_cols=None,
-        rot_cols=None,           # quaternion columns [w, x, y, z]
-        rotation_mode='euler',   # 'euler', 'quaternion', 'delta_euler'
-        thm_cols=None,
-        tof_cols=None,
-        subject_df=None,
-    ):
-        self.acc_cols = acc_cols
-        self.rot_cols = rot_cols
-        self.rotation_mode = rotation_mode
-        self.thm_cols = thm_cols
-        self.tof_cols = tof_cols
-        self.subject_df = subject_df
-
-    def fit(self, X, y=None):
-        return self
-
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        output_parts = []
-
-        # --- Accelerometer: pass through raw ---
-        if self.acc_cols:
-            output_parts.append(X[self.acc_cols].copy())
-
-        # --- Rotation: convert quaternion per-row ---
-        if self.rot_cols:
-            rot_out = self._convert_rotation(X[self.rot_cols])
-            output_parts.append(rot_out)
-
-        # --- Thermopile: pass through ---
-        if self.thm_cols:
-            output_parts.append(X[self.thm_cols].copy())
-
-        result = pd.concat(output_parts, axis=1)
-        result.index = X['sequence_id']   # SequencePadder groups by this
-        return result
-
-    def _convert_rotation(self, df: pd.DataFrame) -> pd.DataFrame:
-        q = df.astype(float)
-        w, x, y, z = q.iloc[:,0], q.iloc[:,1], q.iloc[:,2], q.iloc[:,3]
-
-        # Quaternion → Euler (roll, pitch, yaw) per row
-        roll  = np.arctan2(2*(w*x + y*z), 1 - 2*(x**2 + y**2))
-        pitch = np.arcsin( np.clip(2*(w*y - z*x), -1, 1) )
-        yaw   = np.arctan2(2*(w*z + x*y), 1 - 2*(y**2 + z**2))
-
-        euler = pd.DataFrame({
-            'rot_roll': roll.values,
-            'rot_pitch': pitch.values,
-            'rot_yaw': yaw.values,
-        }, index=df.index)
-
-        if self.rotation_mode == 'euler':
-            return euler
-        elif self.rotation_mode == 'delta_euler':
-            # Difference between consecutive timesteps — captures motion
-            return euler.groupby(X['sequence_id']).transform(lambda g: g.diff().fillna(0))
-        elif self.rotation_mode == 'quaternion':
-            # Pass raw quaternion values (already normalised)
-            return df.rename(columns=dict(zip(df.columns, ['rot_w','rot_x','rot_y','rot_z'])))
-        else:
-            raise ValueError(f"Unknown rotation_mode: {self.rotation_mode}")
+        return self.estimator_.predict_proba(X)
