@@ -1920,3 +1920,86 @@ class KerasTCNClassifier(BaseEstimator, ClassifierMixin):
 
     def score(self, X, y):
         return np.mean(self.predict(X) == np.asarray(y))
+
+
+class Keras1DCNNClassifier(BaseEstimator, ClassifierMixin):
+    """Sklearn-compatible wrapper around a Keras 1-D CNN classifier.
+
+    Expects 2-D feature input (n_samples, n_features). Internally reshapes to
+    (n_samples, n_features, 1) so that Conv1D treats each feature as a
+    timestep with one channel. For proper temporal modelling, replace
+    ImuExtractor with one that returns (n_samples, timesteps, channels) and
+    adjust the Input shape accordingly.
+    """
+
+    def __init__(
+        self,
+        filters=32,
+        kernel_size=3,
+        dropout=0.3,
+        learning_rate=0.001,
+        epochs=30,
+        batch_size=32,
+        verbose=0
+    ):
+        self.filters       = filters
+        self.kernel_size   = kernel_size
+        self.dropout       = dropout
+        self.learning_rate = learning_rate
+        self.epochs        = epochs
+        self.batch_size    = batch_size
+        self.verbose       = verbose
+
+    def _build_model(self, n_features, n_classes):
+        model = keras.Sequential([
+            layers.Input(shape=(n_features, 1)),
+            layers.Conv1D(self.filters, self.kernel_size, activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.Conv1D(self.filters * 2, self.kernel_size, activation='relu', padding='same'),
+            layers.BatchNormalization(),
+            layers.GlobalAveragePooling1D(),
+            layers.Dense(128, activation='relu'),
+            layers.Dropout(self.dropout),
+            layers.Dense(64, activation='relu'),
+            layers.Dense(n_classes, activation='softmax'),
+        ])
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=self.learning_rate),
+            loss='sparse_categorical_crossentropy',
+            metrics=['accuracy']
+        )
+        return model
+
+    def fit(self, X, y):
+        if hasattr(X, 'values'):
+            X = X.values
+        self.le_ = LabelEncoder()
+        y_enc = self.le_.fit_transform(y)
+        self.classes_ = self.le_.classes_
+        n_features = X.shape[1]
+        n_classes  = len(self.classes_)
+        X_3d = X.reshape(X.shape[0], n_features, 1)
+        self.model_ = self._build_model(n_features, n_classes)
+        self.model_.fit(
+            X_3d, y_enc,
+            epochs=self.epochs,
+            batch_size=self.batch_size,
+            verbose=self.verbose
+        )
+        return self
+
+    def predict(self, X):
+        if hasattr(X, 'values'):
+            X = X.values
+        X_3d = X.reshape(X.shape[0], X.shape[1], 1)
+        probs = self.model_.predict(X_3d, verbose=0)
+        return self.le_.inverse_transform(np.argmax(probs, axis=1))
+
+    def predict_proba(self, X):
+        if hasattr(X, 'values'):
+            X = X.values
+        X_3d = X.reshape(X.shape[0], X.shape[1], 1)
+        return self.model_.predict(X_3d, verbose=0)
+
+    def score(self, X, y):
+        return np.mean(self.predict(X) == y)
