@@ -18,6 +18,9 @@ from tensorflow.keras import layers
 from sklearn.utils.validation import check_is_fitted
 from sklearn.utils.class_weight import compute_class_weight
 import tensorflow as tf
+from sktime.transformations.panel.rocket import MiniRocket
+from sklearn.linear_model import RidgeClassifierCV
+from sklearn.preprocessing import StandardScaler
 
 
 def calculate_fft(array_values: np.ndarray) -> np.ndarray:
@@ -2003,3 +2006,74 @@ class Keras1DCNNClassifier(BaseEstimator, ClassifierMixin):
 
     def score(self, X, y):
         return np.mean(self.predict(X) == y)
+
+
+class MiniRocketClassifier(BaseEstimator, ClassifierMixin):
+    """Wrapper to make MiniROCKET compatible with sklearn GridSearchCV/RandomizedSearchCV"""
+
+    def __init__(self, num_kernels=1000, random_state=42):
+        self.num_kernels = num_kernels
+        self.random_state = random_state
+        self.rocket = None
+        self.scaler = None
+        self.classifier = None
+
+    def fit(self, X, y):
+        # X is dict from SequencePadder
+        if isinstance(X, dict):
+            X_arr = X['X']
+        else:
+            X_arr = X
+
+        # Transpose for Rocket (samples, features, time)
+        X_rocket = np.transpose(X_arr, (0, 2, 1))
+
+        self.rocket = MiniRocket(num_kernels=self.num_kernels, random_state=self.random_state)
+        X_transform = self.rocket.fit_transform(X_rocket)
+
+        self.scaler = StandardScaler()
+        X_scaled = self.scaler.fit_transform(X_transform)
+
+        self.classifier = RidgeClassifierCV(alphas=[0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0])
+        self.classifier.fit(X_scaled, y)
+
+        return self
+
+    def predict(self, X):
+        if isinstance(X, dict):
+            X_arr = X['X']
+        else:
+            X_arr = X
+
+        X_rocket = np.transpose(X_arr, (0, 2, 1))
+        X_transform = self.rocket.transform(X_rocket)
+        X_scaled = self.scaler.transform(X_transform)
+        return self.classifier.predict(X_scaled)
+
+    def predict_proba(self, X):
+        # RidgeClassifierCV doesn't have predict_proba, return decision function instead
+        if isinstance(X, dict):
+            X_arr = X['X']
+        else:
+            X_arr = X
+
+        X_rocket = np.transpose(X_arr, (0, 2, 1))
+        X_transform = self.rocket.transform(X_rocket)
+        X_scaled = self.scaler.transform(X_transform)
+        return self.classifier.decision_function(X_scaled)
+
+    def score(self, X, y):
+        from sklearn.metrics import accuracy_score
+        return accuracy_score(y, self.predict(X))
+
+    # Required for sklearn compatibility
+    def get_params(self, deep=True):
+        return {
+            'num_kernels': self.num_kernels,
+            'random_state': self.random_state,
+        }
+
+    def set_params(self, **params):
+        for key, value in params.items():
+            setattr(self, key, value)
+        return self
