@@ -21,6 +21,7 @@ import tensorflow as tf
 from sktime.transformations.panel.rocket import MiniRocket
 from sklearn.linear_model import RidgeClassifierCV
 from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import f_classif, SelectPercentile
 
 
 def calculate_fft(array_values: np.ndarray) -> np.ndarray:
@@ -2077,3 +2078,33 @@ class MiniRocketClassifier(BaseEstimator, ClassifierMixin):
         for key, value in params.items():
             setattr(self, key, value)
         return self
+
+
+# Cleaner param grid key: select_k_percentile__percentile
+class SequenceLevelSelector(BaseEstimator, TransformerMixin):
+    def __init__(self, score_func=f_classif, percentile=50, target='gesture_action'):
+        self.score_func = score_func
+        self.percentile = percentile
+        self.target = target
+
+    def fit(self, X, y=None):
+        self.selector_ = SelectPercentile(self.score_func, percentile=self.percentile)
+        y_1d = self._extract_y(X, y)
+        self.selector_.fit(X, y_1d)
+        return self
+
+    def transform(self, X):
+        mask = self.selector_.get_support()
+        return X.iloc[:, mask]
+
+    def _extract_y(self, X, y):
+        if isinstance(y, pd.DataFrame):
+            target_map = (
+                y.drop_duplicates('sequence_id')
+                 .set_index('sequence_id')[self.target]
+            )
+            return X.index.map(target_map).to_numpy()
+        return np.asarray(y)
+
+    def get_support(self, indices=False):
+        return self.selector_.get_support(indices=indices)
