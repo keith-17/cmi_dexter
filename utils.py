@@ -2209,10 +2209,10 @@ class TweedieRocketClassifier(BaseRocketClassifier):
 class RidgeRocketClassifier(LinearRocketClassifier):
     """Ridge Classifier with MiniRocket features - L2 regularization, very fast"""
 
-    def __init__(self, num_kernels=1000, random_state=42, alpha=1.0, class_weight='balanced'):
-        super().__init__(num_kernels, random_state, class_weight=class_weight)
-        self.alpha = alpha  # Regularization strength (larger = stronger)
-
+    def __init__(self, num_kernels=1000, random_state=42, alpha=1.0, class_weight='balanced', max_iter=1000):
+        super().__init__(num_kernels, random_state, max_iter=max_iter, class_weight=class_weight)
+        self.alpha = alpha
+        
     def _get_classifier(self):
         return RidgeClassifier(
             alpha=self.alpha,
