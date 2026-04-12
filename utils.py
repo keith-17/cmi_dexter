@@ -2037,3 +2037,422 @@ class SequenceLevelSelector(BaseEstimator, TransformerMixin):
 
     def get_support(self, indices=False):
         return self.selector_.get_support(indices=indices)
+
+
+from abc import ABC, abstractmethod
+from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.linear_model import RidgeClassifier, LogisticRegression, SGDClassifier, PassiveAggressiveClassifier
+from sklearn.linear_model import PoissonRegressor, TweedieRegressor
+from sklearn.svm import LinearSVC
+from sklearn.neural_network import MLPClassifier
+from sklearn.preprocessing import StandardScaler
+import numpy as np
+from sktime.transformations.panel.rocket import MiniRocket
+from sklearn.naive_bayes import MultinomialNB, ComplementNB
+
+
+class BaseRocketClassifier(BaseEstimator, ClassifierMixin, ABC):
+    """Abstract base class for all Rocket-based classifiers"""
+
+    def __init__(self, num_kernels=1000, random_state=42):
+        self.num_kernels = num_kernels
+        self.random_state = random_state
+        self.rocket = None
+        self.scaler = None
+        self.classifier = None
+
+    def _extract_rocket_features(self, X):
+        """Extract Rocket features from input data"""
+        if isinstance(X, dict):
+            X_arr = X['X']
+        else:
+            X_arr = X
+
+        # Transpose for Rocket (samples, features, time)
+        X_rocket = np.transpose(X_arr, (0, 2, 1))
+
+        if self.rocket is None:
+            self.rocket = MiniRocket(
+                num_kernels=self.num_kernels,
+                random_state=self.random_state
+            )
+            X_transform = self.rocket.fit_transform(X_rocket)
+        else:
+            X_transform = self.rocket.transform(X_rocket)
+
+        if self.scaler is None:
+            self.scaler = StandardScaler()
+            X_scaled = self.scaler.fit_transform(X_transform)
+        else:
+            X_scaled = self.scaler.transform(X_transform)
+
+        return X_scaled
+
+    @abstractmethod
+    def _get_classifier(self):
+        """Create the underlying classifier - to be implemented by subclasses"""
+        pass
+
+    def fit(self, X, y):
+        X_scaled = self._extract_rocket_features(X)
+        self.classifier = self._get_classifier()
+        self.classifier.fit(X_scaled, y)
+        return self
+
+    def predict(self, X):
+        X_scaled = self._extract_rocket_features(X)
+        return self.classifier.predict(X_scaled)
+
+    def predict_proba(self, X):
+        X_scaled = self._extract_rocket_features(X)
+        if hasattr(self.classifier, 'predict_proba'):
+            return self.classifier.predict_proba(X_scaled)
+        elif hasattr(self.classifier, 'decision_function'):
+            decisions = self.classifier.decision_function(X_scaled)
+            if len(decisions.shape) == 1:
+                return np.column_stack([1 - decisions, decisions])
+            else:
+                exp_decisions = np.exp(decisions - decisions.max(axis=1, keepdims=True))
+                return exp_decisions / exp_decisions.sum(axis=1, keepdims=True)
+        else:
+            raise AttributeError(f"{type(self.classifier).__name__} has no predict_proba or decision_function")
+
+    def score(self, X, y):
+        from sklearn.metrics import accuracy_score
+        return accuracy_score(y, self.predict(X))
+
+    def get_params(self, deep=True):
+        return {'num_kernels': self.num_kernels, 'random_state': self.random_state}
+
+    def set_params(self, **params):
+        for key, value in params.items():
+            setattr(self, key, value)
+        return self
+
+
+class LinearRocketClassifier(BaseRocketClassifier):
+    """Base class for linear classifiers with Rocket features"""
+
+    def __init__(self, num_kernels=1000, random_state=42, max_iter=1000, class_weight='balanced'):
+        super().__init__(num_kernels, random_state)
+        self.max_iter = max_iter
+        self.class_weight = class_weight
+
+    def get_params(self, deep=True):
+        params = super().get_params(deep)
+        params.update({'max_iter': self.max_iter, 'class_weight': self.class_weight})
+        return params
+
+
+# ============================================================================
+# POISSON-BASED MODELS (For Count Data)
+# ============================================================================
+
+class PoissonRocketClassifier(BaseRocketClassifier):
+    """Poisson Regression with MiniRocket features - for count data where variance = mean"""
+
+    def __init__(self, num_kernels=1000, random_state=42, alpha=1.0, max_iter=1000):
+        super().__init__(num_kernels, random_state)
+        self.alpha = alpha  # Regularization strength (larger = stronger)
+        self.max_iter = max_iter
+
+    def _get_classifier(self):
+        return PoissonRegressor(
+            alpha=self.alpha,
+            max_iter=self.max_iter,
+            tol=1e-4
+        )
+
+    def get_params(self, deep=True):
+        params = super().get_params(deep)
+        params.update({'alpha': self.alpha, 'max_iter': self.max_iter})
+        return params
+
+
+class MultinomialNBRocketClassifier(BaseRocketClassifier):
+    """Multinomial Naive Bayes with MiniRocket features - for count features"""
+
+    def __init__(self, num_kernels=1000, random_state=42, alpha=1.0):
+        super().__init__(num_kernels, random_state)
+        self.alpha = alpha  # Laplace smoothing
+
+    def _get_classifier(self):
+        return MultinomialNB(alpha=self.alpha)
+
+
+class TweedieRocketClassifier(BaseRocketClassifier):
+    """Tweedie Regression with MiniRocket features - for overdispersed count data (variance > mean)"""
+
+    def __init__(self, num_kernels=1000, random_state=42, power=1.5, alpha=1.0, max_iter=1000):
+        super().__init__(num_kernels, random_state)
+        self.power = power  # 1=Poisson, 1.5=NegBinom, 2=Gamma
+        self.alpha = alpha  # Regularization strength (larger = stronger)
+        self.max_iter = max_iter
+
+    def _get_classifier(self):
+        return TweedieRegressor(
+            power=self.power,
+            alpha=self.alpha,
+            max_iter=self.max_iter
+        )
+
+    def get_params(self, deep=True):
+        params = super().get_params(deep)
+        params.update({'power': self.power, 'alpha': self.alpha, 'max_iter': self.max_iter})
+        return params
+
+
+# ============================================================================
+# LINEAR CLASSIFIERS
+# ============================================================================
+
+class RidgeRocketClassifier(LinearRocketClassifier):
+    """Ridge Classifier with MiniRocket features - L2 regularization, very fast"""
+
+    def __init__(self, num_kernels=1000, random_state=42, alpha=1.0, class_weight='balanced'):
+        super().__init__(num_kernels, random_state, class_weight=class_weight)
+        self.alpha = alpha  # Regularization strength (larger = stronger)
+
+    def _get_classifier(self):
+        return RidgeClassifier(
+            alpha=self.alpha,
+            class_weight=self.class_weight,
+            random_state=self.random_state
+        )
+
+    def get_params(self, deep=True):
+        params = super().get_params(deep)
+        params.update({'alpha': self.alpha})
+        return params
+
+
+class LogisticRocketClassifier(LinearRocketClassifier):
+    """Logistic Regression with MiniRocket features - probabilistic, L2 regularization"""
+
+    def __init__(self, num_kernels=1000, random_state=42, C=1.0, penalty='l2',
+                 solver='lbfgs', max_iter=1000, class_weight='balanced'):
+        super().__init__(num_kernels, random_state, max_iter, class_weight)
+        self.C = C  # Inverse regularization (smaller = stronger)
+        self.penalty = penalty
+        self.solver = solver
+
+    def _get_classifier(self):
+        return LogisticRegression(
+            C=self.C,
+            penalty=self.penalty,
+            solver=self.solver,
+            max_iter=self.max_iter,
+            class_weight=self.class_weight,
+            random_state=self.random_state,
+            n_jobs=-1
+        )
+
+    def get_params(self, deep=True):
+        params = super().get_params(deep)
+        params.update({'C': self.C, 'penalty': self.penalty, 'solver': self.solver})
+        return params
+
+
+class SGDRocketClassifier(LinearRocketClassifier):
+    """SGDClassifier with MiniRocket features - supports multiple loss functions"""
+
+    def __init__(self, num_kernels=1000, random_state=42, alpha=0.0001, penalty='l2',
+                 loss='log_loss', max_iter=1000, class_weight='balanced'):
+        super().__init__(num_kernels, random_state, max_iter, class_weight)
+        self.alpha = alpha  # Regularization strength (larger = stronger)
+        self.penalty = penalty
+        self.loss = loss
+
+    def _get_classifier(self):
+        return SGDClassifier(
+            loss=self.loss,
+            penalty=self.penalty,
+            alpha=self.alpha,
+            max_iter=self.max_iter,
+            class_weight=self.class_weight,
+            random_state=self.random_state,
+            n_jobs=-1
+        )
+
+    def get_params(self, deep=True):
+        params = super().get_params(deep)
+        params.update({'alpha': self.alpha, 'penalty': self.penalty, 'loss': self.loss})
+        return params
+
+
+class PassiveRocketClassifier(LinearRocketClassifier):
+    """Passive Aggressive Classifier with MiniRocket features - online learning style"""
+
+    def __init__(self, num_kernels=1000, random_state=42, C=1.0, max_iter=1000, class_weight='balanced'):
+        super().__init__(num_kernels, random_state, max_iter, class_weight)
+        self.C = C  # Regularization (smaller = stronger)
+
+    def _get_classifier(self):
+        return PassiveAggressiveClassifier(
+            C=self.C,
+            max_iter=self.max_iter,
+            class_weight=self.class_weight,
+            random_state=self.random_state,
+            n_jobs=-1
+        )
+
+    def get_params(self, deep=True):
+        params = super().get_params(deep)
+        params.update({'C': self.C})
+        return params
+
+
+class SVMRocketClassifier(LinearRocketClassifier):
+    """Linear SVM with MiniRocket features - max-margin classifier"""
+
+    def __init__(self, num_kernels=1000, random_state=42, C=1.0, loss='squared_hinge',
+                 max_iter=1000, class_weight='balanced'):
+        super().__init__(num_kernels, random_state, max_iter, class_weight)
+        self.C = C  # Inverse regularization (smaller = stronger)
+        self.loss = loss
+
+    def _get_classifier(self):
+        return LinearSVC(
+            C=self.C,
+            loss=self.loss,
+            max_iter=self.max_iter,
+            class_weight=self.class_weight,
+            random_state=self.random_state,
+            dual='auto'
+        )
+
+    def get_params(self, deep=True):
+        params = super().get_params(deep)
+        params.update({'C': self.C, 'loss': self.loss})
+        return params
+
+
+# ============================================================================
+# NEURAL NETWORK
+# ============================================================================
+
+class MLPRocketClassifier(BaseRocketClassifier):
+    """MLP Classifier with MiniRocket features - for non-linear patterns"""
+
+    def __init__(self, num_kernels=1000, random_state=42, hidden_layer_sizes=(100,),
+                 activation='relu', alpha=0.0001, learning_rate_init=0.001,
+                 max_iter=1000, early_stopping=True, class_weight='balanced'):
+        super().__init__(num_kernels, random_state)
+        self.hidden_layer_sizes = hidden_layer_sizes
+        self.activation = activation
+        self.alpha = alpha  # L2 regularization (larger = stronger)
+        self.learning_rate_init = learning_rate_init
+        self.max_iter = max_iter
+        self.early_stopping = early_stopping
+        self.class_weight = class_weight
+
+    def _get_classifier(self):
+        return MLPClassifier(
+            hidden_layer_sizes=self.hidden_layer_sizes,
+            activation=self.activation,
+            alpha=self.alpha,
+            learning_rate_init=self.learning_rate_init,
+            max_iter=self.max_iter,
+            early_stopping=self.early_stopping,
+            class_weight=self.class_weight,
+            random_state=self.random_state
+        )
+
+    def get_params(self, deep=True):
+        params = super().get_params(deep)
+        params.update({
+            'hidden_layer_sizes': self.hidden_layer_sizes,
+            'activation': self.activation,
+            'alpha': self.alpha,
+            'learning_rate_init': self.learning_rate_init,
+            'max_iter': self.max_iter,
+            'early_stopping': self.early_stopping,
+            'class_weight': self.class_weight
+        })
+        return params
+
+
+from sklearn.naive_bayes import ComplementNB
+
+
+class ComplementNBRocketClassifier(BaseRocketClassifier):
+    """Complement Naive Bayes with MiniRocket features - for imbalanced count features"""
+
+    def __init__(self, num_kernels=1000, random_state=42, alpha=1.0, norm=False):
+        super().__init__(num_kernels, random_state)
+        self.alpha = alpha  # Laplace smoothing (larger = more smoothing)
+        self.norm = norm  # Whether to normalize weights
+
+    def _get_classifier(self):
+        return ComplementNB(
+            alpha=self.alpha,
+            norm=self.norm,
+            class_prior=None  # Can be set if needed
+        )
+
+    def get_params(self, deep=True):
+        params = super().get_params(deep)
+        params.update({'alpha': self.alpha, 'norm': self.norm})
+        return params
+
+
+# ============================================================================
+# FACTORY FUNCTION
+# ============================================================================
+
+def create_rocket_classifier(classifier_type='ridge', **kwargs):
+    """
+    Available classifier types in scikit-learn:
+
+    'poisson'     - Poisson Regression (count data)
+    'tweedie'     - Tweedie Regression (overdispersed counts)
+    'multinomial' - Multinomial Naive Bayes (count features)
+    'complement'  - Complement Naive Bayes (imbalanced count data)
+    'ridge'       - Ridge Classifier (L2, fast)
+    'logistic'    - Logistic Regression (probabilities)
+    'sgd'         - SGDClassifier (flexible)
+    'passive'     - Passive Aggressive
+    'svm'         - Linear SVM
+    'mlp'         - MLP Classifier (neural network)
+    """
+
+    classifiers = {
+        'poisson': PoissonRocketClassifier,
+        'tweedie': TweedieRocketClassifier,
+        'multinomial': MultinomialNBRocketClassifier,  # Replaces poisson_nb
+        'complement': ComplementNBRocketClassifier,  # Alternative for imbalanced
+        'ridge': RidgeRocketClassifier,
+        'logistic': LogisticRocketClassifier,
+        'sgd': SGDRocketClassifier,
+        'passive': PassiveRocketClassifier,
+        'svm': SVMRocketClassifier,
+        'mlp': MLPRocketClassifier,
+    }
+
+    if classifier_type not in classifiers:
+        raise ValueError(f"Unknown classifier_type: {classifier_type}. Choose from {list(classifiers.keys())}")
+
+    return classifiers[classifier_type](**kwargs)
+
+
+# ============================================================================
+# QUICK REFERENCE
+# ============================================================================
+"""
+CLASSIFIER QUICK REFERENCE:
+
+1. ridge        - RidgeClassifier, alpha (larger = stronger reg), very fast
+2. logistic     - LogisticRegression, C (smaller = stronger reg), has probabilities
+3. svm          - LinearSVC, C (smaller = stronger reg), max-margin
+4. sgd          - SGDClassifier, alpha (larger = stronger reg), flexible
+5. passive      - PassiveAggressive, C (smaller = stronger reg), online style
+6. mlp          - MLPClassifier, alpha (larger = stronger reg), non-linear
+7. poisson      - PoissonRegressor, alpha (larger = stronger reg), for count data
+8. poisson_nb   - PoissonNB, alpha (larger = more smoothing), count features
+9. tweedie      - TweedieRegressor, power=1.5, alpha (larger = stronger reg)
+
+RECOMMENDED STARTING POINTS:
+- For general classification: classifier_type='ridge', alpha=10.0
+- For probabilities: classifier_type='logistic', C=0.1
+- For overfitting problems: classifier_type='ridge', alpha=50.0, num_kernels=500
+"""
