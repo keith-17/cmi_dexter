@@ -18,9 +18,6 @@ from tensorflow.keras import layers
 from sklearn.utils.validation import check_is_fitted
 from sklearn.utils.class_weight import compute_class_weight
 import tensorflow as tf
-from sktime.transformations.panel.rocket import MiniRocket
-from sklearn.linear_model import RidgeClassifierCV
-from sklearn.preprocessing import StandardScaler
 from sklearn.feature_selection import f_classif, SelectPercentile
 
 
@@ -2076,7 +2073,8 @@ class BaseRocketClassifier(BaseEstimator, ClassifierMixin, ABC):
                 num_kernels=self.num_kernels,
                 random_state=self.random_state
             )
-            X_transform = self.rocket.fit_transform(X_rocket)
+            self.rocket.fit(X_rocket)
+            X_transform = self.rocket.transform(X_rocket)
         else:
             X_transform = self.rocket.transform(X_rocket)
 
@@ -2127,8 +2125,11 @@ class BaseRocketClassifier(BaseEstimator, ClassifierMixin, ABC):
     def set_params(self, **params):
         for key, value in params.items():
             setattr(self, key, value)
-        return self
 
+        self.rocket = None
+        self.scaler = None
+        self.classifier = None
+        return self
 
 class LinearRocketClassifier(BaseRocketClassifier):
     """Base class for linear classifiers with Rocket features"""
@@ -2212,7 +2213,7 @@ class RidgeRocketClassifier(LinearRocketClassifier):
     def __init__(self, num_kernels=1000, random_state=42, alpha=1.0, class_weight='balanced', max_iter=1000):
         super().__init__(num_kernels, random_state, max_iter=max_iter, class_weight=class_weight)
         self.alpha = alpha
-        
+
     def _get_classifier(self):
         return RidgeClassifier(
             alpha=self.alpha,
