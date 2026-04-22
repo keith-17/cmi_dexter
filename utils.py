@@ -1672,6 +1672,110 @@ class KerasRNNClassifier(BaseEstimator, ClassifierMixin):
         return np.mean(self.predict(X) == y)
 
 
+class RocketFeatureSelector(BaseEstimator, TransformerMixin):
+    """
+    Transformer that applies MiniRocket and then selects the best features.
+    Designed to be used in a pipeline BEFORE ManyToOneWrapperRNN.
+    """
+    def __init__(self, num_kernels=1000, percentile=10, random_state=42, verbose=False):
+        self.num_kernels = num_kernels
+        self.percentile = percentile
+        self.random_state = random_state
+        self.verbose = verbose
+        self.rocket = None
+        self.scaler = StandardScaler()
+        self.selector = SelectPercentile(score_func=f_classif, percentile=self.percentile)
+
+    def _collapse_y(self, X, y):
+        """Collapses y to match the number of sequences in X."""
+        if isinstance(X, dict):
+            seq_ids = X["sequence_ids"]
+        else:
+            seq_ids = X.index
+
+        if not isinstance(seq_ids, pd.Series):
+            seq_ids = pd.Series(seq_ids, name="sequence_id")
+
+        # Find the target column (the one that is not sequence_id)
+        target_cols = [c for c in y.columns if c != 'sequence_id']
+        if not target_cols:
+             raise ValueError("y must contain a target column that is not 'sequence_id'")
+        target_col = target_cols[0]
+
+        target_map = (
+            y.drop_duplicates("sequence_id")
+             .set_index("sequence_id")[target_col]
+        )
+
+        y_seq = seq_ids.map(target_map)
+        return y_seq
+
+    def fit(self, X, y=None):
+        if y is None:
+            return self
+
+        # Extract features
+        X_arr = X['X'] if isinstance(X, dict) else X
+        # MiniRocket expects (n_samples, n_channels, n_timesteps)
+        X_rocket = np.transpose(X_arr, (0, 2, 1))
+
+        self.rocket = MiniRocket(num_kernels=self.num_kernels, random_state=self.random_state)
+        X_feats = self.rocket.fit_transform(X_rocket)
+        X_scaled = self.scaler.fit_transform(X_feats)
+
+        # Collapse y
+        y_seq = self._collapse_y(X, y)
+
+        # Debug info
+        if hasattr(self, "verbose") and self.verbose:
+            print(f"RocketFeatureSelector: X_scaled shape {X_scaled.shape}, y_seq length {len(y_seq)}")
+
+        # Handle NaNs in y_seq (sequences without labels)
+        valid_mask = ~y_seq.isna().to_numpy()
+        if not valid_mask.all():
+            if hasattr(self, "verbose") and self.verbose:
+                print(f"RocketFeatureSelector: Dropping {(~valid_mask).sum()} invalid sequences")
+            X_scaled = X_scaled[valid_mask]
+            y_seq = y_seq.loc[valid_mask]
+
+        self.selector.fit(X_scaled, y_seq)
+        return self
+
+    def get_params(self, deep=True):
+        return {
+            "num_kernels": self.num_kernels,
+            "percentile": self.percentile,
+            "random_state": self.random_state,
+            "verbose": self.verbose
+        }
+
+    def set_params(self, **params):
+        for key, value in params.items():
+            setattr(self, key, value)
+        if 'percentile' in params:
+            self.selector.set_params(percentile=self.percentile)
+        return self
+
+    def transform(self, X):
+        check_is_fitted(self, ['rocket', 'scaler', 'selector'])
+
+        X_arr = X['X'] if isinstance(X, dict) else X
+        X_rocket = np.transpose(X_arr, (0, 2, 1))
+
+        X_feats = self.rocket.transform(X_rocket)
+        X_scaled = self.scaler.transform(X_feats)
+        X_selected = self.selector.transform(X_scaled)
+
+        # Return as a dict to be compatible with ManyToOneWrapperRNN
+        if isinstance(X, dict):
+            return {
+                "X": X_selected,
+                "sequence_ids": X["sequence_ids"],
+                "lengths": X["lengths"],
+            }
+        return X_selected
+
+
 class ManyToOneWrapperRNN(BaseEstimator, ClassifierMixin):
     def __init__(self, estimator, target="gesture_action"):
         self.estimator = estimator
@@ -2049,23 +2153,26 @@ from sklearn.naive_bayes import MultinomialNB, ComplementNB
 
 
 class BaseRocketClassifier(BaseEstimator, ClassifierMixin, ABC):
-    """Abstract base class for all Rocket-based classifiers"""
-
-    def __init__(self, num_kernels=1000, random_state=42):
+    def __init__(self, num_kernels=1000, random_state=42,
+                 feature_selection_percentile=None):
         self.num_kernels = num_kernels
         self.random_state = random_state
+        self.feature_selection_percentile = feature_selection_percentile
         self.rocket = None
         self.scaler = None
+        self.selector = None
         self.classifier = None
 
     def _extract_rocket_features(self, X):
-        """Extract Rocket features from input data"""
         if isinstance(X, dict):
             X_arr = X['X']
         else:
             X_arr = X
 
-        # Transpose for Rocket (samples, features, time)
+        # If already 2D, assume features are already extracted
+        if len(X_arr.shape) == 2:
+            return X_arr
+
         X_rocket = np.transpose(X_arr, (0, 2, 1))
 
         if self.rocket is None:
@@ -2086,23 +2193,33 @@ class BaseRocketClassifier(BaseEstimator, ClassifierMixin, ABC):
 
         return X_scaled
 
-    @abstractmethod
-    def _get_classifier(self):
-        """Create the underlying classifier - to be implemented by subclasses"""
-        pass
-
     def fit(self, X, y):
         X_scaled = self._extract_rocket_features(X)
+
+        if self.feature_selection_percentile is not None:
+            self.selector = SelectPercentile(
+                score_func=f_classif,
+                percentile=self.feature_selection_percentile
+            )
+            X_scaled = self.selector.fit_transform(X_scaled, y)
+        else:
+            self.selector = None
+
         self.classifier = self._get_classifier()
         self.classifier.fit(X_scaled, y)
         return self
 
     def predict(self, X):
         X_scaled = self._extract_rocket_features(X)
+        if self.selector is not None:
+            X_scaled = self.selector.transform(X_scaled)
         return self.classifier.predict(X_scaled)
 
     def predict_proba(self, X):
         X_scaled = self._extract_rocket_features(X)
+        if self.selector is not None:
+            X_scaled = self.selector.transform(X_scaled)
+
         if hasattr(self.classifier, 'predict_proba'):
             return self.classifier.predict_proba(X_scaled)
         elif hasattr(self.classifier, 'decision_function'):
@@ -2113,14 +2230,16 @@ class BaseRocketClassifier(BaseEstimator, ClassifierMixin, ABC):
                 exp_decisions = np.exp(decisions - decisions.max(axis=1, keepdims=True))
                 return exp_decisions / exp_decisions.sum(axis=1, keepdims=True)
         else:
-            raise AttributeError(f"{type(self.classifier).__name__} has no predict_proba or decision_function")
-
-    def score(self, X, y):
-        from sklearn.metrics import accuracy_score
-        return accuracy_score(y, self.predict(X))
+            raise AttributeError(
+                f"{type(self.classifier).__name__} has no predict_proba or decision_function"
+            )
 
     def get_params(self, deep=True):
-        return {'num_kernels': self.num_kernels, 'random_state': self.random_state}
+        return {
+            'num_kernels': self.num_kernels,
+            'random_state': self.random_state,
+            'feature_selection_percentile': self.feature_selection_percentile
+        }
 
     def set_params(self, **params):
         for key, value in params.items():
@@ -2128,14 +2247,16 @@ class BaseRocketClassifier(BaseEstimator, ClassifierMixin, ABC):
 
         self.rocket = None
         self.scaler = None
+        self.selector = None
         self.classifier = None
         return self
 
 class LinearRocketClassifier(BaseRocketClassifier):
     """Base class for linear classifiers with Rocket features"""
 
-    def __init__(self, num_kernels=1000, random_state=42, max_iter=1000, class_weight='balanced'):
-        super().__init__(num_kernels, random_state)
+    def __init__(self, num_kernels=1000, random_state=42, feature_selection_percentile=None, 
+                 max_iter=1000, class_weight='balanced'):
+        super().__init__(num_kernels, random_state, feature_selection_percentile=feature_selection_percentile)
         self.max_iter = max_iter
         self.class_weight = class_weight
 
@@ -2152,8 +2273,9 @@ class LinearRocketClassifier(BaseRocketClassifier):
 class PoissonRocketClassifier(BaseRocketClassifier):
     """Poisson Regression with MiniRocket features - for count data where variance = mean"""
 
-    def __init__(self, num_kernels=1000, random_state=42, alpha=1.0, max_iter=1000):
-        super().__init__(num_kernels, random_state)
+    def __init__(self, num_kernels=1000, random_state=42, feature_selection_percentile=None, 
+                 alpha=1.0, max_iter=1000):
+        super().__init__(num_kernels, random_state, feature_selection_percentile=feature_selection_percentile)
         self.alpha = alpha  # Regularization strength (larger = stronger)
         self.max_iter = max_iter
 
@@ -2173,8 +2295,8 @@ class PoissonRocketClassifier(BaseRocketClassifier):
 class MultinomialNBRocketClassifier(BaseRocketClassifier):
     """Multinomial Naive Bayes with MiniRocket features - for count features"""
 
-    def __init__(self, num_kernels=1000, random_state=42, alpha=1.0):
-        super().__init__(num_kernels, random_state)
+    def __init__(self, num_kernels=1000, random_state=42, feature_selection_percentile=None, alpha=1.0):
+        super().__init__(num_kernels, random_state, feature_selection_percentile=feature_selection_percentile)
         self.alpha = alpha  # Laplace smoothing
 
     def _get_classifier(self):
@@ -2184,8 +2306,9 @@ class MultinomialNBRocketClassifier(BaseRocketClassifier):
 class TweedieRocketClassifier(BaseRocketClassifier):
     """Tweedie Regression with MiniRocket features - for overdispersed count data (variance > mean)"""
 
-    def __init__(self, num_kernels=1000, random_state=42, power=1.5, alpha=1.0, max_iter=1000):
-        super().__init__(num_kernels, random_state)
+    def __init__(self, num_kernels=1000, random_state=42, feature_selection_percentile=None, 
+                 power=1.5, alpha=1.0, max_iter=1000):
+        super().__init__(num_kernels, random_state, feature_selection_percentile=feature_selection_percentile)
         self.power = power  # 1=Poisson, 1.5=NegBinom, 2=Gamma
         self.alpha = alpha  # Regularization strength (larger = stronger)
         self.max_iter = max_iter
@@ -2210,8 +2333,10 @@ class TweedieRocketClassifier(BaseRocketClassifier):
 class RidgeRocketClassifier(LinearRocketClassifier):
     """Ridge Classifier with MiniRocket features - L2 regularization, very fast"""
 
-    def __init__(self, num_kernels=1000, random_state=42, alpha=1.0, class_weight='balanced', max_iter=1000):
-        super().__init__(num_kernels, random_state, max_iter=max_iter, class_weight=class_weight)
+    def __init__(self, num_kernels=1000, random_state=42, feature_selection_percentile=None, 
+                 alpha=1.0, class_weight='balanced', max_iter=1000):
+        super().__init__(num_kernels, random_state, feature_selection_percentile=feature_selection_percentile, 
+                         max_iter=max_iter, class_weight=class_weight)
         self.alpha = alpha
 
     def _get_classifier(self):
@@ -2230,9 +2355,10 @@ class RidgeRocketClassifier(LinearRocketClassifier):
 class LogisticRocketClassifier(LinearRocketClassifier):
     """Logistic Regression with MiniRocket features - probabilistic, L2 regularization"""
 
-    def __init__(self, num_kernels=1000, random_state=42, C=1.0, penalty='l2',
-                 solver='lbfgs', max_iter=1000, class_weight='balanced'):
-        super().__init__(num_kernels, random_state, max_iter, class_weight)
+    def __init__(self, num_kernels=1000, random_state=42, feature_selection_percentile=None,
+                 C=1.0, penalty='l2', solver='lbfgs', max_iter=1000, class_weight='balanced'):
+        super().__init__(num_kernels, random_state, feature_selection_percentile=feature_selection_percentile, 
+                         max_iter=max_iter, class_weight=class_weight)
         self.C = C  # Inverse regularization (smaller = stronger)
         self.penalty = penalty
         self.solver = solver
@@ -2257,9 +2383,10 @@ class LogisticRocketClassifier(LinearRocketClassifier):
 class SGDRocketClassifier(LinearRocketClassifier):
     """SGDClassifier with MiniRocket features - supports multiple loss functions"""
 
-    def __init__(self, num_kernels=1000, random_state=42, alpha=0.0001, penalty='l2',
-                 loss='log_loss', max_iter=1000, class_weight='balanced'):
-        super().__init__(num_kernels, random_state, max_iter, class_weight)
+    def __init__(self, num_kernels=1000, random_state=42, feature_selection_percentile=None,
+                 alpha=0.0001, penalty='l2', loss='log_loss', max_iter=1000, class_weight='balanced'):
+        super().__init__(num_kernels, random_state, feature_selection_percentile=feature_selection_percentile, 
+                         max_iter=max_iter, class_weight=class_weight)
         self.alpha = alpha  # Regularization strength (larger = stronger)
         self.penalty = penalty
         self.loss = loss
@@ -2284,8 +2411,10 @@ class SGDRocketClassifier(LinearRocketClassifier):
 class PassiveRocketClassifier(LinearRocketClassifier):
     """Passive Aggressive Classifier with MiniRocket features - online learning style"""
 
-    def __init__(self, num_kernels=1000, random_state=42, C=1.0, max_iter=1000, class_weight='balanced'):
-        super().__init__(num_kernels, random_state, max_iter, class_weight)
+    def __init__(self, num_kernels=1000, random_state=42, feature_selection_percentile=None, 
+                 C=1.0, max_iter=1000, class_weight='balanced'):
+        super().__init__(num_kernels, random_state, feature_selection_percentile=feature_selection_percentile, 
+                         max_iter=max_iter, class_weight=class_weight)
         self.C = C  # Regularization (smaller = stronger)
 
     def _get_classifier(self):
@@ -2306,9 +2435,10 @@ class PassiveRocketClassifier(LinearRocketClassifier):
 class SVMRocketClassifier(LinearRocketClassifier):
     """Linear SVM with MiniRocket features - max-margin classifier"""
 
-    def __init__(self, num_kernels=1000, random_state=42, C=1.0, loss='squared_hinge',
-                 max_iter=1000, class_weight='balanced'):
-        super().__init__(num_kernels, random_state, max_iter, class_weight)
+    def __init__(self, num_kernels=1000, random_state=42, feature_selection_percentile=None, 
+                 C=1.0, loss='squared_hinge', max_iter=1000, class_weight='balanced'):
+        super().__init__(num_kernels, random_state, feature_selection_percentile=feature_selection_percentile, 
+                         max_iter=max_iter, class_weight=class_weight)
         self.C = C  # Inverse regularization (smaller = stronger)
         self.loss = loss
 
@@ -2335,10 +2465,10 @@ class SVMRocketClassifier(LinearRocketClassifier):
 class MLPRocketClassifier(BaseRocketClassifier):
     """MLP Classifier with MiniRocket features - for non-linear patterns"""
 
-    def __init__(self, num_kernels=1000, random_state=42, hidden_layer_sizes=(100,),
-                 activation='relu', alpha=0.0001, learning_rate_init=0.001,
-                 max_iter=1000, early_stopping=True, class_weight='balanced'):
-        super().__init__(num_kernels, random_state)
+    def __init__(self, num_kernels=1000, random_state=42, feature_selection_percentile=None, 
+                 hidden_layer_sizes=(100,), activation='relu', alpha=0.0001, 
+                 learning_rate_init=0.001, max_iter=1000, early_stopping=True, class_weight='balanced'):
+        super().__init__(num_kernels, random_state, feature_selection_percentile=feature_selection_percentile)
         self.hidden_layer_sizes = hidden_layer_sizes
         self.activation = activation
         self.alpha = alpha  # L2 regularization (larger = stronger)
@@ -2379,8 +2509,8 @@ from sklearn.naive_bayes import ComplementNB
 class ComplementNBRocketClassifier(BaseRocketClassifier):
     """Complement Naive Bayes with MiniRocket features - for imbalanced count features"""
 
-    def __init__(self, num_kernels=1000, random_state=42, alpha=1.0, norm=False):
-        super().__init__(num_kernels, random_state)
+    def __init__(self, num_kernels=1000, random_state=42, feature_selection_percentile=None, alpha=1.0, norm=False):
+        super().__init__(num_kernels, random_state, feature_selection_percentile=feature_selection_percentile)
         self.alpha = alpha  # Laplace smoothing (larger = more smoothing)
         self.norm = norm  # Whether to normalize weights
 
