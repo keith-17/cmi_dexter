@@ -1048,7 +1048,8 @@ class ImuExtractor(BaseEstimator, TransformerMixin):
         return feat
 
 
-class ManyToOneWrapper(BaseEstimator, ClassifierMixin):
+class ManyToOneWrapper(ClassifierMixin, BaseEstimator):
+    _estimator_type = "classifier"
     def __init__(self, estimator, extractor, mode=None, target: str = 'gesture', **kwargs):
         self.estimator = estimator
         self.extractor = extractor
@@ -1563,7 +1564,8 @@ class SequencePadder(BaseEstimator, TransformerMixin):
         }
 
 
-class KerasRNNClassifier(BaseEstimator, ClassifierMixin):
+class KerasRNNClassifier(ClassifierMixin, BaseEstimator):
+    _estimator_type = "classifier"
     def __init__(
         self,
         rnn_type="lstm",           # lstm, gru, rnn
@@ -1776,7 +1778,8 @@ class RocketFeatureSelector(BaseEstimator, TransformerMixin):
         return X_selected
 
 
-class ManyToOneWrapperRNN(BaseEstimator, ClassifierMixin):
+class ManyToOneWrapperRNN(ClassifierMixin, BaseEstimator):
+    _estimator_type = "classifier"
     def __init__(self, estimator, target="gesture_action"):
         self.estimator = estimator
         self.target = target
@@ -1829,6 +1832,8 @@ class ManyToOneWrapperRNN(BaseEstimator, ClassifierMixin):
 
         self.estimator_ = clone(self.estimator)
         self.estimator_.fit(X, y_seq)
+        if hasattr(self.estimator_, 'classes_'):
+            self.classes_ = self.estimator_.classes_
         return self
 
     def predict(self, X):
@@ -1883,7 +1888,8 @@ def tcn_residual_block(x, filters, kernel_size, dilation_rate, dropout_rate, reg
     return layers.Add()([x, residual])
 
 
-class KerasTCNClassifier(BaseEstimator, ClassifierMixin):
+class KerasTCNClassifier(ClassifierMixin, BaseEstimator):
+    _estimator_type = "classifier"
     """
     Temporal Convolutional Network classifier.
     Drop-in replacement for KerasRNNClassifier — accepts the same
@@ -2027,7 +2033,8 @@ class KerasTCNClassifier(BaseEstimator, ClassifierMixin):
         return np.mean(self.predict(X) == np.asarray(y))
 
 
-class Keras1DCNNClassifier(BaseEstimator, ClassifierMixin):
+class Keras1DCNNClassifier(ClassifierMixin, BaseEstimator):
+    _estimator_type = "classifier"
     """Sklearn-compatible wrapper around a Keras 1-D CNN classifier.
 
     Expects 2-D feature input (n_samples, n_features). Internally reshapes to
@@ -2152,7 +2159,8 @@ from sktime.transformations.panel.rocket import MiniRocket
 from sklearn.naive_bayes import MultinomialNB, ComplementNB
 
 
-class BaseRocketClassifier(BaseEstimator, ClassifierMixin, ABC):
+class BaseRocketClassifier(ClassifierMixin, BaseEstimator, ABC):
+    _estimator_type = "classifier"
     def __init__(self, num_kernels=1000, random_state=42,
                  feature_selection_percentile=None):
         self.num_kernels = num_kernels
