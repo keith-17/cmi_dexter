@@ -2595,3 +2595,66 @@ RECOMMENDED STARTING POINTS:
 - For probabilities: classifier_type='logistic', C=0.1
 - For overfitting problems: classifier_type='ridge', alpha=50.0, num_kernels=500
 """
+
+
+class RawSequenceExtractorWithChoice(BaseEstimator, TransformerMixin):
+    def __init__(
+        self,
+        acc_choice=1,          # 0=None, 1=acc_columns
+        rot_choice=1,          # 0=None, 1=rot_columns
+        thm_choice=1,          # 0=None, 1=thm_columns
+        tof_choice=0,          # 0=None, 1=tof_columns
+        acc_mode='velocity',
+        rotation_mode='quaternion',
+        thm_mode='delta',
+        tof_mode='baseline',
+        sampling_rate=100,
+        mask_invalid=-999.0,
+    ):
+        self.acc_choice = acc_choice
+        self.rot_choice = rot_choice
+        self.thm_choice = thm_choice
+        self.tof_choice = tof_choice
+        self.acc_mode = acc_mode
+        self.rotation_mode = rotation_mode
+        self.thm_mode = thm_mode
+        self.tof_mode = tof_mode
+        self.sampling_rate = sampling_rate
+        self.mask_invalid = mask_invalid
+
+        # Define actual lists
+        self.acc_columns = ['acc_x', 'acc_y', 'acc_z']
+        self.rot_columns = ['rot_w', 'rot_x', 'rot_y', 'rot_z']
+        self.thm_columns = ['thm_1', 'thm_2', 'thm_3', 'thm_4', 'thm_5']
+        self.tof_columns = [f'tof_{i}_v{j}' for i in range(1, 6) for j in range(64)]
+
+        self._map = {
+            'acc': {0: None, 1: self.acc_columns},
+            'rot': {0: None, 1: self.rot_columns},
+            'thm': {0: None, 1: self.thm_columns},
+            'tof': {0: None, 1: self.tof_columns},
+        }
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        acc_cols = self._map['acc'][self.acc_choice]
+        rot_cols = self._map['rot'][self.rot_choice]
+        thm_cols = self._map['thm'][self.thm_choice]
+        tof_cols = self._map['tof'][self.tof_choice]
+
+        extractor = RawSequenceExtractor(
+            acc_cols=acc_cols,
+            rot_cols=rot_cols,
+            thm_cols=thm_cols,
+            tof_cols=tof_cols,
+            acc_mode=self.acc_mode,
+            rotation_mode=self.rotation_mode,
+            thm_mode=self.thm_mode,
+            tof_mode=self.tof_mode,
+            sampling_rate=self.sampling_rate,
+            mask_invalid=self.mask_invalid,
+        )
+        extractor.fit(X)
+        return extractor.transform(X)
