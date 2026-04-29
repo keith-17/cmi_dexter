@@ -2792,7 +2792,7 @@ class ImuExtractorWithChoice(BaseEstimator, TransformerMixin):
         band_edges = self._map['band_edges'][self.band_edges_choice]
 
         # Create the real ImuExtractor with the resolved parameters
-        extractor = utils.ImuExtractor(
+        extractor = ImuExtractor(
             imu_sensor_list=imu_list,
             rotation_sensor_list=rot_list,
             tof_sensor_list=tof_list,
