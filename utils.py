@@ -1452,11 +1452,119 @@ class RawSequenceExtractor(BaseEstimator, TransformerMixin):
                     out[f"tof{sensor}_min"] = temp[s_cols].min(axis=1)
 
             out = out.fillna(self.mask_invalid)
+        
+        elif self.tof_mode == "spatial_per_frame":
+            out = self._extract_spatial_tof_features_per_frame(df)
 
         else:
             raise ValueError(f"Unknown tof_mode: {self.tof_mode}")
 
         return out
+    
+    def _extract_spatial_tof_features_per_frame(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Extract spatial features from TOF data per timestep.
+        Treats each sensor's 64 values as 8x8 grid.
+        
+        Returns DataFrame with same number of rows (preserves temporal dimension)
+        """
+        if df.empty:
+            return pd.DataFrame()
+        
+        # Identify each TOF sensor (tof_1, tof_2, etc.)
+        sensor_prefixes = sorted(set([c.split('_v')[0] for c in df.columns if '_v' in c]))
+        
+        all_features = []
+        
+        for sensor in sensor_prefixes:
+            # Get 64 columns for this sensor
+            sensor_cols = [c for c in df.columns if c.startswith(f"{sensor}_v")]
+            sensor_cols = sorted(sensor_cols, key=lambda x: int(x.split('_v')[-1]))
+            
+            if len(sensor_cols) != 64:
+                continue
+                
+            # Process each timestep independently
+            for idx in df.index:
+                # Get 64 values for this timestep, reshape to 8x8
+                values = df.loc[idx, sensor_cols].values.astype(float)
+                
+                # Replace invalid values
+                values = np.where((values <= 0) | (values >= 4000), np.nan, values)
+                
+                # Reshape to 8x8 grid
+                try:
+                    frame = values.reshape(8, 8)
+                except:
+                    # If reshaping fails, use zeros
+                    frame = np.zeros((8, 8))
+                
+                # Mask invalid values
+                valid_mask = np.isfinite(frame)
+                valid_ratio = valid_mask.sum() / 64 if valid_mask.any() else 0
+                
+                # Fill NaNs with median or 4000
+                if valid_ratio > 0:
+                    median_val = np.nanmedian(frame[valid_mask])
+                    frame = np.nan_to_num(frame, nan=median_val)
+                else:
+                    frame = np.zeros((8, 8))
+                
+                # === SPATIAL FEATURES (per frame) ===
+                features = {}
+                
+                # Basic statistics
+                features[f'{sensor}_spatial_mean'] = frame.mean()
+                features[f'{sensor}_spatial_std'] = frame.std()
+                features[f'{sensor}_spatial_min'] = frame.min()
+                features[f'{sensor}_spatial_max'] = frame.max()
+                features[f'{sensor}_valid_ratio'] = valid_ratio
+                
+                # Quadrant means (4 quadrants of 4x4 each)
+                features[f'{sensor}_q1_mean'] = frame[:4, :4].mean()   # Top-left
+                features[f'{sensor}_q2_mean'] = frame[:4, 4:].mean()   # Top-right
+                features[f'{sensor}_q3_mean'] = frame[4:, :4].mean()   # Bottom-left
+                features[f'{sensor}_q4_mean'] = frame[4:, 4:].mean()   # Bottom-right
+                
+                # Center vs edge (center 4x4 vs border)
+                features[f'{sensor}_center_mean'] = frame[2:6, 2:6].mean()
+                features[f'{sensor}_edge_mean'] = (frame.sum() - frame[2:6, 2:6].sum()) / (64 - 16)
+                features[f'{sensor}_center_edge_ratio'] = features[f'{sensor}_center_mean'] / (features[f'{sensor}_edge_mean'] + 1e-6)
+                
+                # Left-right asymmetry
+                left_mean = frame[:, :4].mean()
+                right_mean = frame[:, 4:].mean()
+                features[f'{sensor}_lr_asymmetry'] = left_mean - right_mean
+                
+                # Top-bottom asymmetry
+                top_mean = frame[:4, :].mean()
+                bottom_mean = frame[4:, :].mean()
+                features[f'{sensor}_tb_asymmetry'] = top_mean - bottom_mean
+                
+                # Center of mass (intensity-weighted)
+                y_coords, x_coords = np.mgrid[0:8, 0:8]
+                total_intensity = frame.sum()
+                if total_intensity > 0:
+                    features[f'{sensor}_com_x'] = (x_coords * frame).sum() / total_intensity
+                    features[f'{sensor}_com_y'] = (y_coords * frame).sum() / total_intensity
+                else:
+                    features[f'{sensor}_com_x'] = 4.0
+                    features[f'{sensor}_com_y'] = 4.0
+                
+                # Gradient magnitude (edge strength)
+                grad_x = np.abs(np.diff(frame, axis=1, prepend=frame[:, :1]))
+                grad_y = np.abs(np.diff(frame, axis=0, prepend=frame[:1, :]))
+                grad_mag = np.sqrt(grad_x**2 + grad_y**2)
+                features[f'{sensor}_gradient_mean'] = grad_mag.mean()
+                features[f'{sensor}_gradient_std'] = grad_mag.std()
+                
+                all_features.append(features)
+        
+        if not all_features:
+            return pd.DataFrame(index=df.index)
+        
+        result_df = pd.DataFrame(all_features, index=df.index)
+        return result_df
 
     def preprocess_time_signal(self, signal: pd.Series) -> pd.Series:
         signal = signal.astype(float).copy()
@@ -2261,6 +2369,7 @@ class BaseRocketClassifier(ClassifierMixin, BaseEstimator, ABC):
 
 class LinearRocketClassifier(BaseRocketClassifier):
     """Base class for linear classifiers with Rocket features"""
+    _estimator_type = "classifier"
 
     def __init__(self, num_kernels=1000, random_state=42, feature_selection_percentile=None, 
                  max_iter=1000, class_weight='balanced'):
@@ -2280,6 +2389,7 @@ class LinearRocketClassifier(BaseRocketClassifier):
 
 class PoissonRocketClassifier(BaseRocketClassifier):
     """Poisson Regression with MiniRocket features - for count data where variance = mean"""
+    _estimator_type = "classifier"
 
     def __init__(self, num_kernels=1000, random_state=42, feature_selection_percentile=None, 
                  alpha=1.0, max_iter=1000):
@@ -2302,6 +2412,7 @@ class PoissonRocketClassifier(BaseRocketClassifier):
 
 class MultinomialNBRocketClassifier(BaseRocketClassifier):
     """Multinomial Naive Bayes with MiniRocket features - for count features"""
+    _estimator_type = "classifier"
 
     def __init__(self, num_kernels=1000, random_state=42, feature_selection_percentile=None, alpha=1.0):
         super().__init__(num_kernels, random_state, feature_selection_percentile=feature_selection_percentile)
@@ -2313,6 +2424,7 @@ class MultinomialNBRocketClassifier(BaseRocketClassifier):
 
 class TweedieRocketClassifier(BaseRocketClassifier):
     """Tweedie Regression with MiniRocket features - for overdispersed count data (variance > mean)"""
+    _estimator_type = "classifier"
 
     def __init__(self, num_kernels=1000, random_state=42, feature_selection_percentile=None, 
                  power=1.5, alpha=1.0, max_iter=1000):
@@ -2472,10 +2584,11 @@ class SVMRocketClassifier(LinearRocketClassifier):
 
 class MLPRocketClassifier(BaseRocketClassifier):
     """MLP Classifier with MiniRocket features - for non-linear patterns"""
+    _estimator_type = "classifier"
 
     def __init__(self, num_kernels=1000, random_state=42, feature_selection_percentile=None, 
                  hidden_layer_sizes=(100,), activation='relu', alpha=0.0001, 
-                 learning_rate_init=0.001, max_iter=1000, early_stopping=True, class_weight='balanced'):
+                 learning_rate_init=0.001, max_iter=1000, early_stopping=True):
         super().__init__(num_kernels, random_state, feature_selection_percentile=feature_selection_percentile)
         self.hidden_layer_sizes = hidden_layer_sizes
         self.activation = activation
@@ -2483,9 +2596,10 @@ class MLPRocketClassifier(BaseRocketClassifier):
         self.learning_rate_init = learning_rate_init
         self.max_iter = max_iter
         self.early_stopping = early_stopping
-        self.class_weight = class_weight
 
     def _get_classifier(self):
+        # MLPClassifier does not support class_weight directly. 
+        # If needed, one would need to oversample or use a custom loss.
         return MLPClassifier(
             hidden_layer_sizes=self.hidden_layer_sizes,
             activation=self.activation,
@@ -2493,7 +2607,6 @@ class MLPRocketClassifier(BaseRocketClassifier):
             learning_rate_init=self.learning_rate_init,
             max_iter=self.max_iter,
             early_stopping=self.early_stopping,
-            class_weight=self.class_weight,
             random_state=self.random_state
         )
 
@@ -2505,8 +2618,7 @@ class MLPRocketClassifier(BaseRocketClassifier):
             'alpha': self.alpha,
             'learning_rate_init': self.learning_rate_init,
             'max_iter': self.max_iter,
-            'early_stopping': self.early_stopping,
-            'class_weight': self.class_weight
+            'early_stopping': self.early_stopping
         })
         return params
 
@@ -2516,6 +2628,7 @@ from sklearn.naive_bayes import ComplementNB
 
 class ComplementNBRocketClassifier(BaseRocketClassifier):
     """Complement Naive Bayes with MiniRocket features - for imbalanced count features"""
+    _estimator_type = "classifier"
 
     def __init__(self, num_kernels=1000, random_state=42, feature_selection_percentile=None, alpha=1.0, norm=False):
         super().__init__(num_kernels, random_state, feature_selection_percentile=feature_selection_percentile)
@@ -2595,3 +2708,113 @@ RECOMMENDED STARTING POINTS:
 - For probabilities: classifier_type='logistic', C=0.1
 - For overfitting problems: classifier_type='ridge', alpha=50.0, num_kernels=500
 """
+
+
+
+
+class ImuExtractorWithChoice(BaseEstimator, TransformerMixin):
+    """
+    Wrapper around utils.ImuExtractor that uses integer choices for sensor lists.
+    Hyperparameters (tunable):
+        imu_choice, rot_choice, tof_choice, thermo_choice, band_edges_choice, dc_offset
+    All other parameters are passed through.
+    """
+    def __init__(
+        self,
+        imu_choice=1,                  # 0=None, 1=acc_columns
+        rot_choice=1,                  # 0=None, 1=rot_columns
+        tof_choice=1,                  # 0=None, 1=tof_columns
+        thermo_choice=1,               # 0=None, 1=thm_columns
+        band_edges_choice=0,           # 0=None, 1=linear_edges
+        dc_offset=0,
+        imu_domain='acceleration',
+        rotation_domain='orientation',
+        thermopile_mode='baseline',
+        tof_mode='baseline',
+        category_data=True,
+        segmentation=None,
+        window=0.5,
+        step_sec=0.2,
+        combine_imu_axes=True,
+        combine_rot_axes=True,
+        sampling_rate=100,
+        subject_df=None,
+        disable_tqdm=True,
+    ):
+        self.imu_choice = imu_choice
+        self.rot_choice = rot_choice
+        self.tof_choice = tof_choice
+        self.thermo_choice = thermo_choice
+        self.band_edges_choice = band_edges_choice
+        self.dc_offset = dc_offset
+        self.imu_domain = imu_domain
+        self.rotation_domain = rotation_domain
+        self.thermopile_mode = thermopile_mode
+        self.tof_mode = tof_mode
+        self.category_data = category_data
+        self.segmentation = segmentation
+        self.window = window
+        self.step_sec = step_sec
+        self.combine_imu_axes = combine_imu_axes
+        self.combine_rot_axes = combine_rot_axes
+        self.sampling_rate = sampling_rate
+        self.subject_df = subject_df
+        self.disable_tqdm = disable_tqdm
+
+        # Define the actual lists (these could be passed as parameters, but we define them here)
+        self.acc_columns = ['acc_x', 'acc_y', 'acc_z']
+        self.rot_columns = ['rot_w', 'rot_x', 'rot_y', 'rot_z']
+        self.thm_columns = ['thm_1', 'thm_2', 'thm_3', 'thm_4', 'thm_5']
+        self.tof_columns = [f'tof_{i}_v{j}' for i in range(1, 6) for j in range(64)]
+        self.linear_edges = np.arange(0, 51, 10)
+        self.custom_edges = np.array([0, 1, 2, 4, 8, 15, 25, 50])
+        self.log_band_edges = np.logspace(np.log10(0.5), np.log10(50), num=10)
+
+        # Placeholder mapping
+        self._map = {
+            'imu': {0: None, 1: self.acc_columns},
+            'rot': {0: None, 1: self.rot_columns},
+            'tof': {0: None, 1: self.tof_columns},
+            'thermo': {0: None, 1: self.thm_columns},
+            'band_edges': {0: None, 1: self.linear_edges, 2: self.custom_edges, 3: self.log_band_edges},
+        }
+
+    def fit(self, X, y=None):
+        # Nothing to fit – we just transform
+        return self
+
+    def transform(self, X):
+        # Translate choices into actual lists
+        imu_list = self._map['imu'][self.imu_choice]
+        rot_list = self._map['rot'][self.rot_choice]
+        tof_list = self._map['tof'][self.tof_choice]
+        thermo_list = self._map['thermo'][self.thermo_choice]
+        band_edges = self._map['band_edges'][self.band_edges_choice]
+
+        # Create the real ImuExtractor with the resolved parameters
+        extractor = utils.ImuExtractor(
+            imu_sensor_list=imu_list,
+            rotation_sensor_list=rot_list,
+            tof_sensor_list=tof_list,
+            thermopile_sensor_list=thermo_list,
+            band_edges=band_edges,
+            dc_offset=self.dc_offset,
+            imu_domain=self.imu_domain,
+            rotation_domain=self.rotation_domain,
+            thermopile_mode=self.thermopile_mode,
+            tof_mode=self.tof_mode,
+            category_data=self.category_data,
+            segmentation=self.segmentation,
+            window=self.window,
+            step_sec=self.step_sec,
+            combine_imu_axes=self.combine_imu_axes,
+            combine_rot_axes=self.combine_rot_axes,
+            sampling_rate=self.sampling_rate,
+            subject_df=self.subject_df,
+            disable_tqdm=self.disable_tqdm,
+        )
+        # Fit and transform in one go (we don't need to store the extractor)
+        # Actually, we should fit the extractor on the data, but since it's a transformer,
+        # we can just call transform after fit? The original ImuExtractor.transform expects
+        # data, but it also has a no-op fit. We'll call fit_transform.
+        return extractor.fit_transform(X)  # fit_transform calls fit and then transform
