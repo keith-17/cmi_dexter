@@ -1437,3 +1437,364 @@ class ThermoExtractor:
             .diff()
             .fillna(0.0)
         )
+
+
+# ----------------------------------------------------------------------------
+# Multi‐Branch 1D CNN classifier with optional Self‐Attention / BiGRU fusion
+# ----------------------------------------------------------------------------
+class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
+    _estimator_type = "classifier"
+
+    def __init__(
+        self,
+        target: str = "gesture_action",
+        maxlen: int = 64,
+        padding_value: float = -999.0,
+
+        # which columns go to which branch
+        branch_config: dict | None = None,
+
+        # per‑branch Conv1D architecture strings (hyphen‑separated)
+        branch_filters: dict | None = None,
+        branch_kernel_sizes: dict | None = None,
+        branch_pool_sizes: dict | None = None,
+
+        # fusion after branch concatenation
+        fusion_mode: str = "attention",   # "attention", "bigru", "none"
+        attention_heads: int = 4,
+        gru_units: int = 128,
+
+        # common to all branches
+        use_batch_norm: bool = True,
+        spatial_dropout: float = 0.1,
+
+        # classification head
+        dense_units: str = "64",
+        dropout: float = 0.3,
+        learning_rate: float = 5e-4,
+        batch_size: int = 32,
+        epochs: int = 80,
+        patience: int = 12,
+        verbose: int = 0,
+        random_state: int = 42,
+    ):
+        self.target = target
+        self.maxlen = maxlen
+        self.padding_value = padding_value
+
+        self.branch_config = branch_config
+        self.branch_filters = branch_filters
+        self.branch_kernel_sizes = branch_kernel_sizes
+        self.branch_pool_sizes = branch_pool_sizes
+
+        self.fusion_mode = fusion_mode
+        self.attention_heads = attention_heads
+        self.gru_units = gru_units
+
+        self.use_batch_norm = use_batch_norm
+        self.spatial_dropout = spatial_dropout
+
+        self.dense_units = dense_units
+        self.dropout = dropout
+        self.learning_rate = learning_rate
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.patience = patience
+        self.verbose = verbose
+        self.random_state = random_state
+
+    # ------------------------------------------------------------------
+    # Helpers – identical to your existing KerasCNN1DSequenceClassifier
+    # ------------------------------------------------------------------
+    def _to_tuple(self, value):
+        if value is None:
+            return ()
+        if isinstance(value, str):
+            if value == "none":
+                return ()
+            parts = value.split("-")
+            out = []
+            for p in parts:
+                out.append(None if p == "none" else int(p))
+            return tuple(out)
+        if isinstance(value, tuple):
+            return value
+        if isinstance(value, list):
+            return tuple(value)
+        return (value,)
+
+    def _align(self, value, n: int) -> tuple:
+        value = self._to_tuple(value)
+        if len(value) == 0:
+            return (None,) * n
+        if len(value) == n:
+            return value
+        if len(value) == 1:
+            return value * n
+        if len(value) < n:
+            return value + (value[-1],) * (n - len(value))
+        return value[:n]
+
+    # ------------------------------------------------------------------
+    # Default branch definitions
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _default_branch_config() -> dict:
+        return {
+            "acc": ["acc_", "lin_acc_"],
+            "rot": ["rot_", "delta_rot_", "ang_vel_", "rot6d_"],
+            "tof": ["tof_"],
+            "thm": ["thm_"],
+        }
+
+    @staticmethod
+    def _default_branch_filters() -> dict:
+        return {
+            "acc": "64-128",
+            "rot": "32-64",
+            "tof": "32",
+            "thm": "16",
+        }
+
+    @staticmethod
+    def _default_branch_kernel_sizes() -> dict:
+        return {
+            "acc": "3-3",
+            "rot": "3-3",
+            "tof": "3",
+            "thm": "3",
+        }
+
+    @staticmethod
+    def _default_branch_pool_sizes() -> dict:
+        # keep same temporal length for fusion
+        return {
+            "acc": "none-none",
+            "rot": "none-none",
+            "tof": "none",
+            "thm": "none",
+        }
+
+    # ------------------------------------------------------------------
+    # Determine column indices for each branch from DataFrame columns
+    # ------------------------------------------------------------------
+    def _get_branch_indices(self, all_columns: pd.Index):
+        config = self.branch_config or self._default_branch_config()
+        branch_order = []
+        branch_indices = {}   # name -> list of int positions
+        remaining = set(range(len(all_columns)))
+        for name, prefixes in config.items():
+            idxs = []
+            for i, col in enumerate(all_columns):
+                if any(str(col).startswith(p) for p in prefixes):
+                    idxs.append(i)
+            if idxs:
+                branch_order.append(name)
+                branch_indices[name] = sorted(idxs)
+                remaining -= set(idxs)
+        # if any columns left unmatched, assign them to an "other" branch
+        if remaining:
+            branch_order.append("other")
+            branch_indices["other"] = sorted(remaining)
+        return branch_order, branch_indices
+
+    # ------------------------------------------------------------------
+    # Pad (identical to your existing classifier)
+    # ------------------------------------------------------------------
+    def _pad(self, X):
+        grouped = list(X.groupby(level=0, sort=False))
+        n_seq = len(grouped)
+        n_feat = X.shape[1]
+        out = np.full(
+            (n_seq, self.maxlen, n_feat),
+            self.padding_value,
+            dtype=np.float32,
+        )
+        seq_ids = []
+        for i, (sid, g) in enumerate(grouped):
+            arr = g.to_numpy(dtype=np.float32)
+            length = min(len(arr), self.maxlen)
+            out[i, :length, :] = arr[:length, :]
+            seq_ids.append(sid)
+        return out, pd.Series(seq_ids, name="sequence_id")
+
+    # ------------------------------------------------------------------
+    # Collapse y (identical)
+    # ------------------------------------------------------------------
+    def _collapse_y(self, seq_ids, y):
+        if isinstance(y, pd.DataFrame):
+            if "sequence_id" not in y.columns:
+                raise ValueError("y dataframe must contain sequence_id.")
+            if self.target not in y.columns:
+                raise ValueError(f"y dataframe must contain target column: {self.target}")
+            target_map = (
+                y.drop_duplicates("sequence_id")
+                .set_index("sequence_id")[self.target]
+            )
+            y_seq = seq_ids.map(target_map)
+        else:
+            y_seq = pd.Series(y).reset_index(drop=True)
+            if len(y_seq) != len(seq_ids):
+                raise ValueError(
+                    "If y is not a dataframe, it must already be one label per sequence."
+                )
+        if y_seq.isna().any():
+            missing = seq_ids[y_seq.isna()].head(10).tolist()
+            raise ValueError(f"Missing labels for sequence_ids: {missing}")
+        return y_seq.reset_index(drop=True)
+
+    # ------------------------------------------------------------------
+    # Build Keras model
+    # ------------------------------------------------------------------
+    def _build(self, n_features: int, n_classes: int):
+        tf.keras.backend.clear_session()
+        keras.utils.set_random_seed(self.random_state)
+
+        # --- branch configuration ---
+        branch_filters_cfg = self.branch_filters or self._default_branch_filters()
+        branch_kernels_cfg = self.branch_kernel_sizes or self._default_branch_kernel_sizes()
+        branch_pools_cfg = self.branch_pool_sizes or self._default_branch_pool_sizes()
+
+        inp = keras.Input(shape=(self.maxlen, n_features), name="input")
+
+        # --- process each branch ---
+        branch_outs = []
+        for br_name in self.branch_order_:
+            idxs = self.branch_indices_[br_name]
+            # extract branch features
+            br_x = layers.Lambda(
+                lambda t, i=idxs: tf.gather(t, i, axis=-1),
+                name=f"branch_{br_name}_slice",
+            )(inp)
+
+            # parse architecture for this branch
+            f_str = branch_filters_cfg.get(br_name, "32")
+            k_str = branch_kernels_cfg.get(br_name, "3")
+            p_str = branch_pools_cfg.get(br_name, "none")
+
+            filters = self._to_tuple(f_str)
+            n = len(filters)
+            kernels = self._align(k_str, n)
+            pools = self._align(p_str, n)
+
+            # apply Conv1D blocks
+            x = br_x
+            for f, k, p in zip(filters, kernels, pools):
+                x = layers.Conv1D(
+                    filters=int(f),
+                    kernel_size=int(k),
+                    padding="same",
+                    activation="relu",
+                )(x)
+                if self.use_batch_norm:
+                    x = layers.BatchNormalization()(x)
+                if float(self.spatial_dropout) > 0:
+                    x = layers.SpatialDropout1D(rate=float(self.spatial_dropout))(x)
+                if p is not None:
+                    x = layers.MaxPooling1D(pool_size=int(p))(x)
+
+            # ensure output time dimension matches by projecting with a 1x1 if needed (to same length)
+            # but pooling may change length – okay only if all branches have identical pooling factors.
+            branch_outs.append(x)
+
+        # --- fusion ---
+        if len(branch_outs) == 1:
+            x = branch_outs[0]
+        else:
+            x = layers.Concatenate(axis=-1, name="branch_concat")(branch_outs)
+
+        if self.fusion_mode == "attention":
+            # simple self‑attention with residual connection
+            attn = layers.MultiHeadAttention(
+                num_heads=int(self.attention_heads),
+                key_dim=x.shape[-1] // int(self.attention_heads),
+                name="fusion_attn",
+            )(x, x)
+            x = layers.Add()([x, attn])
+            x = layers.LayerNormalization()(x)
+
+        elif self.fusion_mode == "bigru":
+            x = layers.Bidirectional(
+                layers.GRU(int(self.gru_units), return_sequences=True),
+                name="fusion_bigru",
+            )(x)
+
+        elif self.fusion_mode == "none":
+            pass
+        else:
+            raise ValueError(f"Unknown fusion_mode: {self.fusion_mode}")
+
+        # --- global pooling & classification head ---
+        x = layers.GlobalAveragePooling1D(name="global_pool")(x)
+
+        dense_units = self._to_tuple(self.dense_units)
+        for units in dense_units:
+            x = layers.Dense(int(units), activation="relu")(x)
+            if float(self.dropout) > 0:
+                x = layers.Dropout(rate=float(self.dropout))(x)
+
+        out = layers.Dense(n_classes, activation="softmax", name="output")(x)
+
+        model = keras.Model(inp, out)
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=float(self.learning_rate)),
+            loss="sparse_categorical_crossentropy",
+            metrics=["accuracy"],
+        )
+        return model
+
+    # ------------------------------------------------------------------
+    # fit / predict / predict_proba / score
+    # ------------------------------------------------------------------
+    def fit(self, X, y):
+        # determine branch splits from column names
+        if hasattr(X, "columns"):
+            self.branch_order_, self.branch_indices_ = self._get_branch_indices(X.columns)
+        else:
+            # fallback: treat all features as one "all" branch
+            self.branch_order_ = ["all"]
+            self.branch_indices_ = {"all": list(range(X.shape[1]))}
+
+        X_pad, seq_ids = self._pad(X)
+        y_seq = self._collapse_y(seq_ids, y)
+
+        self.le_ = LabelEncoder()
+        y_enc = self.le_.fit_transform(y_seq)
+        self.classes_ = self.le_.classes_
+
+        self.model_ = self._build(
+            n_features=X_pad.shape[2],
+            n_classes=len(self.classes_),
+        )
+
+        self.history_ = self.model_.fit(
+            X_pad,
+            y_enc,
+            batch_size=int(self.batch_size),
+            epochs=int(self.epochs),
+            validation_split=0.15,
+            callbacks=[
+                keras.callbacks.EarlyStopping(
+                    patience=int(self.patience),
+                    restore_best_weights=True,
+                )
+            ],
+            verbose=int(self.verbose),
+            shuffle=True,
+        )
+        return self
+
+    def predict_proba(self, X):
+        X_pad, _ = self._pad(X)
+        return self.model_.predict(X_pad, verbose=0)
+
+    def predict(self, X):
+        proba = self.predict_proba(X)
+        pred_idx = np.argmax(proba, axis=1)
+        return self.le_.inverse_transform(pred_idx)
+
+    def score(self, X, y):
+        _, seq_ids = self._pad(X)
+        y_seq = self._collapse_y(seq_ids, y)
+        preds = self.predict(X)
+        return f1_score(y_seq.to_numpy(), preds, average="macro")
