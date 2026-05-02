@@ -1,13 +1,16 @@
 from __future__ import annotations
-
 from typing import Literal, Optional
-
 import numpy as np
 import pandas as pd
-
-from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.base import BaseEstimator, ClassifierMixin, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
-from sklearn.base import BaseEstimator, ClassifierMixin, clone
+from sklearn.preprocessing import LabelEncoder
+import keras
+from tensorflow.keras import layers
+import tensorflow as tf
+from sklearn.metrics import f1_score, make_scorer
+import warnings
+warnings.filterwarnings('ignore', '.*mask.*Conv1D.*')
 
 
 AccMode = Optional[Literal["raw", "smoothed", "velocity", "displacement", "jerk"]]
@@ -474,53 +477,69 @@ class KerasCNN1DSequenceClassifier(ClassifierMixin, BaseEstimator):
     def __init__(
         self,
         target="gesture_action",
-
         maxlen=64,
         padding_value=-999.0,
-
-        conv_filters=(64,),
-        kernel_sizes=(5,),
-        pool_sizes=(None,),
-
+        conv_filters="64",
+        kernel_sizes="5",
+        pool_sizes="none",
         use_batch_norm=True,
         spatial_dropout=0.0,
-
-        dense_units=(64,),
+        dense_units="64",
         dropout=0.2,
-
         learning_rate=5e-4,
         batch_size=32,
         epochs=80,
         patience=12,
-
         verbose=0,
         random_state=42,
     ):
         self.target = target
-
         self.maxlen = maxlen
         self.padding_value = padding_value
-
         self.conv_filters = conv_filters
         self.kernel_sizes = kernel_sizes
         self.pool_sizes = pool_sizes
-
         self.use_batch_norm = use_batch_norm
         self.spatial_dropout = spatial_dropout
-
         self.dense_units = dense_units
         self.dropout = dropout
-
         self.learning_rate = learning_rate
         self.batch_size = batch_size
         self.epochs = epochs
         self.patience = patience
-
         self.verbose = verbose
         self.random_state = random_state
 
-    def _align(self, value, n):
-        value = tuple(value)
+    def _to_tuple(self, value):
+        if value is None:
+            return ()
+
+        if isinstance(value, str):
+            if value == "none":
+                return ()
+
+            out = []
+            for part in value.split("-"):
+                if part == "none":
+                    out.append(None)
+                else:
+                    out.append(int(part))
+
+            return tuple(out)
+
+        if isinstance(value, tuple):
+            return value
+
+        if isinstance(value, list):
+            return tuple(value)
+
+        return (value,)
+
+    def _align(self, value, n: int) -> tuple:
+        value = self._to_tuple(value)
+
+        if len(value) == 0:
+            return (None,) * n
 
         if len(value) == n:
             return value
@@ -528,7 +547,10 @@ class KerasCNN1DSequenceClassifier(ClassifierMixin, BaseEstimator):
         if len(value) == 1:
             return value * n
 
-        raise ValueError(f"Cannot align {value} to {n} layers")
+        if len(value) < n:
+            return value + (value[-1],) * (n - len(value))
+
+        return value[:n]
 
     def _pad(self, X):
         grouped = list(X.groupby(level=0, sort=False))
@@ -539,47 +561,70 @@ class KerasCNN1DSequenceClassifier(ClassifierMixin, BaseEstimator):
         out = np.full(
             (n_seq, self.maxlen, n_feat),
             self.padding_value,
-            dtype=np.float32
+            dtype=np.float32,
         )
 
         seq_ids = []
 
         for i, (sid, g) in enumerate(grouped):
             arr = g.to_numpy(dtype=np.float32)
-            L = min(len(arr), self.maxlen)
+            length = min(len(arr), self.maxlen)
 
-            out[i, :L] = arr[:L]
+            out[i, :length] = arr[:length]
             seq_ids.append(sid)
 
-        return out, pd.Series(seq_ids)
+        return out, pd.Series(seq_ids, name="sequence_id")
 
     def _collapse_y(self, seq_ids, y):
         if isinstance(y, pd.DataFrame):
-            m = y.drop_duplicates("sequence_id").set_index("sequence_id")[self.target]
-            y_seq = seq_ids.map(m)
+            if "sequence_id" not in y.columns:
+                raise ValueError("y dataframe must contain sequence_id.")
+
+            if self.target not in y.columns:
+                raise ValueError(f"y dataframe must contain target column: {self.target}")
+
+            target_map = (
+                y.drop_duplicates("sequence_id")
+                .set_index("sequence_id")[self.target]
+            )
+
+            y_seq = seq_ids.map(target_map)
+
         else:
-            y_seq = pd.Series(y)
+            y_seq = pd.Series(y).reset_index(drop=True)
+
+            if len(y_seq) != len(seq_ids):
+                raise ValueError(
+                    "If y is not a dataframe, it must already be one label per sequence."
+                )
+
+        if y_seq.isna().any():
+            missing = seq_ids[y_seq.isna()].head(10).tolist()
+            raise ValueError(f"Missing labels for sequence_ids: {missing}")
 
         return y_seq.reset_index(drop=True)
 
     def _build(self, shape, n_classes):
+        tf.keras.backend.clear_session()
         keras.utils.set_random_seed(self.random_state)
 
-        conv_filters = tuple(self.conv_filters)
-        n = len(conv_filters)
+        conv_filters = self._to_tuple(self.conv_filters)
+        n_layers = len(conv_filters)
 
-        kernel_sizes = self._align(self.kernel_sizes, n)
-        pool_sizes = self._align(self.pool_sizes, n)
-        dense_units = tuple(self.dense_units)
+        if n_layers == 0:
+            raise ValueError("conv_filters cannot be empty.")
+
+        kernel_sizes = self._align(self.kernel_sizes, n_layers)
+        pool_sizes = self._align(self.pool_sizes, n_layers)
+        dense_units = self._to_tuple(self.dense_units)
 
         inp = keras.Input(shape=shape)
+        x = inp
 
-        x = layers.Masking(mask_value=self.padding_value)(inp)
-
-        for f, k, p in zip(conv_filters, kernel_sizes, pool_sizes):
+        for filters, kernel_size, pool_size in zip(conv_filters, kernel_sizes, pool_sizes):
             x = layers.Conv1D(
-                filters=int(f),
-                kernel_size=int(k),
+                filters=int(filters),
+                kernel_size=int(kernel_size),
                 padding="same",
                 activation="relu",
             )(x)
@@ -587,26 +632,40 @@ class KerasCNN1DSequenceClassifier(ClassifierMixin, BaseEstimator):
             if self.use_batch_norm:
                 x = layers.BatchNormalization()(x)
 
-            if self.spatial_dropout > 0:
-                x = layers.SpatialDropout1D(self.spatial_dropout)(x)
+            if float(self.spatial_dropout) > 0:
+                x = layers.SpatialDropout1D(
+                    rate=float(self.spatial_dropout)
+                )(x)
 
-            if p is not None:
-                x = layers.MaxPooling1D(pool_size=int(p))(x)
+            if pool_size is not None:
+                x = layers.MaxPooling1D(
+                    pool_size=int(pool_size)
+                )(x)
 
         x = layers.GlobalAveragePooling1D()(x)
 
-        for u in dense_units:
-            x = layers.Dense(int(u), activation="relu")(x)
+        for units in dense_units:
+            x = layers.Dense(
+                int(units),
+                activation="relu",
+            )(x)
 
-            if self.dropout > 0:
-                x = layers.Dropout(self.dropout)(x)
+            if float(self.dropout) > 0:
+                x = layers.Dropout(
+                    rate=float(self.dropout)
+                )(x)
 
-        out = layers.Dense(n_classes, activation="softmax")(x)
+        out = layers.Dense(
+            n_classes,
+            activation="softmax",
+        )(x)
 
         model = keras.Model(inp, out)
 
         model.compile(
-            optimizer=keras.optimizers.Adam(self.learning_rate),
+            optimizer=keras.optimizers.Adam(
+                learning_rate=float(self.learning_rate)
+            ),
             loss="sparse_categorical_crossentropy",
             metrics=["accuracy"],
         )
@@ -619,30 +678,60 @@ class KerasCNN1DSequenceClassifier(ClassifierMixin, BaseEstimator):
 
         self.le_ = LabelEncoder()
         y_enc = self.le_.fit_transform(y_seq)
+        self.classes_ = self.le_.classes_
 
         self.model_ = self._build(
-            (X_pad.shape[1], X_pad.shape[2]),
-            len(self.le_.classes_)
+            shape=(X_pad.shape[1], X_pad.shape[2]),
+            n_classes=len(self.classes_),
         )
 
-        self.model_.fit(
+        self.history_ = self.model_.fit(
             X_pad,
             y_enc,
-            batch_size=self.batch_size,
-            epochs=self.epochs,
+            batch_size=int(self.batch_size),
+            epochs=int(self.epochs),
             validation_split=0.15,
             callbacks=[
                 keras.callbacks.EarlyStopping(
-                    patience=self.patience,
-                    restore_best_weights=True
+                    patience=int(self.patience),
+                    restore_best_weights=True,
                 )
             ],
-            verbose=self.verbose
+            verbose=int(self.verbose),
+            shuffle=True,
         )
 
         return self
 
-    def predict(self, X):
+    def predict_proba(self, X):
         X_pad, _ = self._pad(X)
-        p = self.model_.predict(X_pad, verbose=0)
-        return self.le_.inverse_transform(np.argmax(p, axis=1))
+        return self.model_.predict(X_pad, verbose=0)
+
+    def predict(self, X):
+        proba = self.predict_proba(X)
+        pred_idx = np.argmax(proba, axis=1)
+        return self.le_.inverse_transform(pred_idx)
+
+    def score(self, X, y):
+        _, seq_ids = self._pad(X)
+        y_seq = self._collapse_y(seq_ids, y)
+        preds = self.predict(X)
+        return f1_score(y_seq.to_numpy(), preds, average="macro")
+
+
+class SequenceScorer:
+    def __init__(self, metric: str = 'f1_macro', sequence_col: str = 'sequence_id', target_col: str = 'gesture') -> None:
+        self.metric = metric
+        self.sequence_col = sequence_col
+        self.target_col = target_col
+
+    def __call__(self, y_true: pd.DataFrame | pd.Series | np.ndarray, y_pred: np.ndarray) -> float:
+        if isinstance(y_true, pd.DataFrame):
+            y_true = y_true.drop_duplicates(self.sequence_col).reset_index(drop=True)[self.target_col]
+        else:
+            y_true = pd.Series(y_true).reset_index(drop=True)
+
+        if self.metric == 'f1_macro':
+            return f1_score(y_true, y_pred, average='macro')
+        else:
+            raise ValueError(f"Unsupported metric: {self.metric}")
