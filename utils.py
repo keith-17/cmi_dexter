@@ -1683,25 +1683,21 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
         tf.keras.backend.clear_session()
         keras.utils.set_random_seed(self.random_state)
 
-        # Get branch configurations
         branch_filters_cfg = self.branch_filters if self.branch_filters is not None else self._default_branch_filters()
         branch_kernels_cfg = self.branch_kernel_sizes if self.branch_kernel_sizes is not None else self._default_branch_kernel_sizes()
         branch_pools_cfg = self.branch_pool_sizes if self.branch_pool_sizes is not None else self._default_branch_pool_sizes()
 
         inp = keras.Input(shape=(self.maxlen, n_features), name="input")
 
-        # Process each branch
         branch_outs = []
         for br_name in self.branch_order_:
             idxs = self.branch_indices_[br_name]
 
-            # Extract branch features
             br_x = layers.Lambda(
                 lambda t, i=idxs: tf.gather(t, i, axis=-1),
                 name=f"branch_{br_name}_slice",
             )(inp)
 
-            # Get branch-specific parameters with safe fallbacks
             f_str = self._get_branch_param(branch_filters_cfg, br_name, "32")
             k_str = self._get_branch_param(branch_kernels_cfg, br_name, "3")
             p_str = self._get_branch_param(branch_pools_cfg, br_name, "none")
@@ -1715,7 +1711,6 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
             kernels = self._align(k_str, n)
             pools = self._align(p_str, n)
 
-            # Apply Conv1D blocks
             x = br_x
             for f, k, p in zip(filters, kernels, pools):
                 x = layers.Conv1D(
@@ -1739,28 +1734,65 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
         # Fusion
         if len(branch_outs) == 1:
             x = branch_outs[0]
+            branches_pooled = False
         else:
-            x = layers.Concatenate(axis=-1, name="branch_concat")(branch_outs)
+            time_dims = [b.shape[1] for b in branch_outs]
+            if len(set(time_dims)) > 1:
+                # branches have mismatched time dims due to different pool configs
+                # collapse each to (batch, filters) before concat
+                branch_outs = [
+                    layers.GlobalAveragePooling1D(name=f"branch_pool_{name}")(b)
+                    for name, b in zip(self.branch_order_, branch_outs)
+                ]
+                x = layers.Concatenate(axis=-1, name="branch_concat")(branch_outs)
+                branches_pooled = True
+            else:
+                x = layers.Concatenate(axis=-1, name="branch_concat")(branch_outs)
+                branches_pooled = False
 
-        if self.fusion_mode == "attention":
-            attn = layers.MultiHeadAttention(
-                num_heads=int(self.attention_heads),
-                key_dim=x.shape[-1] // int(self.attention_heads),
-                name="fusion_attn",
-            )(x, x)
-            x = layers.Add()([x, attn])
-            x = layers.LayerNormalization()(x)
-        elif self.fusion_mode == "bigru":
-            x = layers.Bidirectional(
-                layers.GRU(int(self.gru_units), return_sequences=True),
-                name="fusion_bigru",
-            )(x)
-        elif self.fusion_mode == "none":
-            pass
+        if branches_pooled:
+            # x is (batch, total_filters) — reshape to sequence of 1 for attention/gru
+            if self.fusion_mode == "attention":
+                x = layers.Reshape((1, x.shape[-1]))(x)
+                attn = layers.MultiHeadAttention(
+                    num_heads=int(self.attention_heads),
+                    key_dim=max(1, x.shape[-1] // int(self.attention_heads)),
+                    name="fusion_attn",
+                )(x, x)
+                x = layers.Add()([x, attn])
+                x = layers.LayerNormalization()(x)
+                x = layers.Flatten()(x)
+            elif self.fusion_mode == "bigru":
+                # treat each branch vector as a token: (batch, n_branches, filters)
+                stacked = [
+                    layers.Reshape((1, b.shape[-1]))(b)
+                    for b in branch_outs
+                ]
+                x = layers.Concatenate(axis=1, name="branch_tokens")(stacked)
+                x = layers.Bidirectional(
+                    layers.GRU(int(self.gru_units), return_sequences=False),
+                    name="fusion_bigru",
+                )(x)
+            # fusion_mode == "none": x stays as flat concat
+        else:
+            # x is (batch, time, features) — normal temporal fusion
+            if self.fusion_mode == "attention":
+                attn = layers.MultiHeadAttention(
+                    num_heads=int(self.attention_heads),
+                    key_dim=max(1, x.shape[-1] // int(self.attention_heads)),
+                    name="fusion_attn",
+                )(x, x)
+                x = layers.Add()([x, attn])
+                x = layers.LayerNormalization()(x)
+            elif self.fusion_mode == "bigru":
+                x = layers.Bidirectional(
+                    layers.GRU(int(self.gru_units), return_sequences=True),
+                    name="fusion_bigru",
+                )(x)
 
-        # Global pooling & classification head
-        x = layers.GlobalAveragePooling1D(name="global_pool")(x)
+            x = layers.GlobalAveragePooling1D(name="global_pool")(x)
 
+        # Classification head
         dense_units = self._to_tuple(self.dense_units)
         for units in dense_units:
             x = layers.Dense(int(units), activation="relu")(x)
