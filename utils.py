@@ -11,6 +11,7 @@ import tensorflow as tf
 from sklearn.metrics import f1_score, make_scorer
 import warnings
 warnings.filterwarnings('ignore', '.*mask.*Conv1D.*')
+import json
 
 
 AccMode = Optional[Literal["raw", "smoothed", "velocity", "displacement", "jerk"]]
@@ -1446,37 +1447,37 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
     _estimator_type = "classifier"
 
     def __init__(
-        self,
-        target: str = "gesture_action",
-        maxlen: int = 64,
-        padding_value: float = -999.0,
+            self,
+            target: str = "gesture_action",
+            maxlen: int = 64,
+            padding_value: float = -999.0,
 
-        # which columns go to which branch
-        branch_config: dict | None = None,
+            # which columns go to which branch
+            branch_config: dict | None = None,
 
-        # per‑branch Conv1D architecture strings (hyphen‑separated)
-        branch_filters: dict | None = None,
-        branch_kernel_sizes: dict | None = None,
-        branch_pool_sizes: dict | None = None,
+            # per‑branch Conv1D architecture strings (hyphen‑separated)
+            branch_filters: dict | None = None,
+            branch_kernel_sizes: dict | None = None,
+            branch_pool_sizes: dict | None = None,
 
-        # fusion after branch concatenation
-        fusion_mode: str = "attention",   # "attention", "bigru", "none"
-        attention_heads: int = 4,
-        gru_units: int = 128,
+            # fusion after branch concatenation
+            fusion_mode: str = "attention",
+            attention_heads: int = 4,
+            gru_units: int = 128,
 
-        # common to all branches
-        use_batch_norm: bool = True,
-        spatial_dropout: float = 0.1,
+            # common to all branches
+            use_batch_norm: bool = True,
+            spatial_dropout: float = 0.1,
 
-        # classification head
-        dense_units: str = "64",
-        dropout: float = 0.3,
-        learning_rate: float = 5e-4,
-        batch_size: int = 32,
-        epochs: int = 80,
-        patience: int = 12,
-        verbose: int = 0,
-        random_state: int = 42,
+            # classification head
+            dense_units: str = "64",
+            dropout: float = 0.3,
+            learning_rate: float = 5e-4,
+            batch_size: int = 32,
+            epochs: int = 80,
+            patience: int = 12,
+            verbose: int = 0,
+            random_state: int = 42,
     ):
         self.target = target
         self.maxlen = maxlen
@@ -1504,7 +1505,7 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
         self.random_state = random_state
 
     # ------------------------------------------------------------------
-    # Helpers – identical to your existing KerasCNN1DSequenceClassifier
+    # Helpers
     # ------------------------------------------------------------------
     def _to_tuple(self, value):
         if value is None:
@@ -1567,7 +1568,6 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
 
     @staticmethod
     def _default_branch_pool_sizes() -> dict:
-        # keep same temporal length for fusion
         return {
             "acc": "none-none",
             "rot": "none-none",
@@ -1576,13 +1576,26 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
         }
 
     # ------------------------------------------------------------------
-    # Determine column indices for each branch from DataFrame columns
+    # Helper to safely merge dict params (FIX FOR BAYESIAN)
+    # ------------------------------------------------------------------
+    def _get_branch_param(self, param_dict: dict | None, branch_name: str, default: str) -> str:
+        """Safely extract branch parameter, handling None and missing keys."""
+        if param_dict is None:
+            return default
+        if isinstance(param_dict, dict):
+            return param_dict.get(branch_name, default)
+        # If it's something else (rare), return default
+        return default
+
+    # ------------------------------------------------------------------
+    # Determine column indices for each branch
     # ------------------------------------------------------------------
     def _get_branch_indices(self, all_columns: pd.Index):
         config = self.branch_config or self._default_branch_config()
         branch_order = []
-        branch_indices = {}   # name -> list of int positions
+        branch_indices = {}
         remaining = set(range(len(all_columns)))
+
         for name, prefixes in config.items():
             idxs = []
             for i, col in enumerate(all_columns):
@@ -1592,34 +1605,52 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
                 branch_order.append(name)
                 branch_indices[name] = sorted(idxs)
                 remaining -= set(idxs)
-        # if any columns left unmatched, assign them to an "other" branch
+
         if remaining:
             branch_order.append("other")
             branch_indices["other"] = sorted(remaining)
+
         return branch_order, branch_indices
 
     # ------------------------------------------------------------------
-    # Pad (identical to your existing classifier)
+    # Pad sequences
     # ------------------------------------------------------------------
     def _pad(self, X):
-        grouped = list(X.groupby(level=0, sort=False))
+        if hasattr(X, 'groupby') and hasattr(X.index, 'levels') and len(X.index.levels) > 1:
+            grouped = list(X.groupby(level=0, sort=False))
+        elif hasattr(X, 'groupby'):
+            grouped = list(X.groupby(X.index, sort=False))
+        else:
+            grouped = [(i, X) for i in range(len(X))]
+
         n_seq = len(grouped)
-        n_feat = X.shape[1]
+        n_feat = X.shape[1] if hasattr(X, 'shape') else 1
+
         out = np.full(
             (n_seq, self.maxlen, n_feat),
             self.padding_value,
             dtype=np.float32,
         )
+
         seq_ids = []
+
         for i, (sid, g) in enumerate(grouped):
-            arr = g.to_numpy(dtype=np.float32)
+            if hasattr(g, 'to_numpy'):
+                arr = g.to_numpy(dtype=np.float32)
+            else:
+                arr = np.array(g, dtype=np.float32)
+
+            if arr.ndim == 1:
+                arr = arr.reshape(-1, 1)
+
             length = min(len(arr), self.maxlen)
             out[i, :length, :] = arr[:length, :]
             seq_ids.append(sid)
+
         return out, pd.Series(seq_ids, name="sequence_id")
 
     # ------------------------------------------------------------------
-    # Collapse y (identical)
+    # Collapse y
     # ------------------------------------------------------------------
     def _collapse_y(self, seq_ids, y):
         if isinstance(y, pd.DataFrame):
@@ -1629,7 +1660,7 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
                 raise ValueError(f"y dataframe must contain target column: {self.target}")
             target_map = (
                 y.drop_duplicates("sequence_id")
-                .set_index("sequence_id")[self.target]
+                    .set_index("sequence_id")[self.target]
             )
             y_seq = seq_ids.map(target_map)
         else:
@@ -1638,9 +1669,11 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
                 raise ValueError(
                     "If y is not a dataframe, it must already be one label per sequence."
                 )
+
         if y_seq.isna().any():
             missing = seq_ids[y_seq.isna()].head(10).tolist()
             raise ValueError(f"Missing labels for sequence_ids: {missing}")
+
         return y_seq.reset_index(drop=True)
 
     # ------------------------------------------------------------------
@@ -1650,34 +1683,39 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
         tf.keras.backend.clear_session()
         keras.utils.set_random_seed(self.random_state)
 
-        # --- branch configuration ---
-        branch_filters_cfg = self.branch_filters or self._default_branch_filters()
-        branch_kernels_cfg = self.branch_kernel_sizes or self._default_branch_kernel_sizes()
-        branch_pools_cfg = self.branch_pool_sizes or self._default_branch_pool_sizes()
+        # Get branch configurations
+        branch_filters_cfg = self.branch_filters if self.branch_filters is not None else self._default_branch_filters()
+        branch_kernels_cfg = self.branch_kernel_sizes if self.branch_kernel_sizes is not None else self._default_branch_kernel_sizes()
+        branch_pools_cfg = self.branch_pool_sizes if self.branch_pool_sizes is not None else self._default_branch_pool_sizes()
 
         inp = keras.Input(shape=(self.maxlen, n_features), name="input")
 
-        # --- process each branch ---
+        # Process each branch
         branch_outs = []
         for br_name in self.branch_order_:
             idxs = self.branch_indices_[br_name]
-            # extract branch features
+
+            # Extract branch features
             br_x = layers.Lambda(
                 lambda t, i=idxs: tf.gather(t, i, axis=-1),
                 name=f"branch_{br_name}_slice",
             )(inp)
 
-            # parse architecture for this branch
-            f_str = branch_filters_cfg.get(br_name, "32")
-            k_str = branch_kernels_cfg.get(br_name, "3")
-            p_str = branch_pools_cfg.get(br_name, "none")
+            # Get branch-specific parameters with safe fallbacks
+            f_str = self._get_branch_param(branch_filters_cfg, br_name, "32")
+            k_str = self._get_branch_param(branch_kernels_cfg, br_name, "3")
+            p_str = self._get_branch_param(branch_pools_cfg, br_name, "none")
 
             filters = self._to_tuple(f_str)
-            n = len(filters)
+            n = len(filters) if filters else 1
+            if n == 0:
+                filters = (32,)
+                n = 1
+
             kernels = self._align(k_str, n)
             pools = self._align(p_str, n)
 
-            # apply Conv1D blocks
+            # Apply Conv1D blocks
             x = br_x
             for f, k, p in zip(filters, kernels, pools):
                 x = layers.Conv1D(
@@ -1686,25 +1724,25 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
                     padding="same",
                     activation="relu",
                 )(x)
+
                 if self.use_batch_norm:
                     x = layers.BatchNormalization()(x)
+
                 if float(self.spatial_dropout) > 0:
                     x = layers.SpatialDropout1D(rate=float(self.spatial_dropout))(x)
+
                 if p is not None:
                     x = layers.MaxPooling1D(pool_size=int(p))(x)
 
-            # ensure output time dimension matches by projecting with a 1x1 if needed (to same length)
-            # but pooling may change length – okay only if all branches have identical pooling factors.
             branch_outs.append(x)
 
-        # --- fusion ---
+        # Fusion
         if len(branch_outs) == 1:
             x = branch_outs[0]
         else:
             x = layers.Concatenate(axis=-1, name="branch_concat")(branch_outs)
 
         if self.fusion_mode == "attention":
-            # simple self‑attention with residual connection
             attn = layers.MultiHeadAttention(
                 num_heads=int(self.attention_heads),
                 key_dim=x.shape[-1] // int(self.attention_heads),
@@ -1712,19 +1750,15 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
             )(x, x)
             x = layers.Add()([x, attn])
             x = layers.LayerNormalization()(x)
-
         elif self.fusion_mode == "bigru":
             x = layers.Bidirectional(
                 layers.GRU(int(self.gru_units), return_sequences=True),
                 name="fusion_bigru",
             )(x)
-
         elif self.fusion_mode == "none":
             pass
-        else:
-            raise ValueError(f"Unknown fusion_mode: {self.fusion_mode}")
 
-        # --- global pooling & classification head ---
+        # Global pooling & classification head
         x = layers.GlobalAveragePooling1D(name="global_pool")(x)
 
         dense_units = self._to_tuple(self.dense_units)
@@ -1747,13 +1781,12 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
     # fit / predict / predict_proba / score
     # ------------------------------------------------------------------
     def fit(self, X, y):
-        # determine branch splits from column names
+        # Determine branch splits from column names
         if hasattr(X, "columns"):
             self.branch_order_, self.branch_indices_ = self._get_branch_indices(X.columns)
         else:
-            # fallback: treat all features as one "all" branch
             self.branch_order_ = ["all"]
-            self.branch_indices_ = {"all": list(range(X.shape[1]))}
+            self.branch_indices_ = {"all": list(range(X.shape[1])) if hasattr(X, 'shape') else [0]}
 
         X_pad, seq_ids = self._pad(X)
         y_seq = self._collapse_y(seq_ids, y)
@@ -1794,7 +1827,56 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
         return self.le_.inverse_transform(pred_idx)
 
     def score(self, X, y):
-        _, seq_ids = self._pad(X)
+        X_pad, seq_ids = self._pad(X)
         y_seq = self._collapse_y(seq_ids, y)
-        preds = self.predict(X)
+        proba = self.model_.predict(X_pad, verbose=0)
+        pred_idx = np.argmax(proba, axis=1)
+        preds = self.le_.inverse_transform(pred_idx)
         return f1_score(y_seq.to_numpy(), preds, average="macro")
+
+    def set_params(self, **params):
+        """Override set_params to auto-decode JSON-encoded branch dicts."""
+        import json
+        BRANCH_DICT_PARAMS = {"branch_filters", "branch_kernel_sizes", "branch_pool_sizes"}
+        decoded = {}
+        for k, v in params.items():
+            if k in BRANCH_DICT_PARAMS and isinstance(v, str):
+                try:
+                    decoded[k] = json.loads(v)
+                except (json.JSONDecodeError, TypeError):
+                    decoded[k] = v
+            else:
+                decoded[k] = v
+        return super().set_params(**decoded)
+
+
+def prepare_multibranch_param_space(param_space, search_mode, Categorical=None, ECat=None):
+    """
+    Encode dict-valued branch params (branch_filters, branch_kernel_sizes,
+    branch_pool_sizes) as JSON strings so BayesSearchCV can handle them.
+
+    For 'bayesian' mode: wraps lists of dicts in skopt Categorical as JSON strings.
+    For 'evolutionary' mode: wraps in sklearn_genetic ECat as JSON strings.
+    For 'grid'/'random' mode: leaves as-is (plain lists of dicts work fine).
+
+    The KerasMultiBranchClassifier.set_params() must decode these back via
+    _decode_branch_params().
+    """
+    BRANCH_DICT_PARAMS = {"branch_filters", "branch_kernel_sizes", "branch_pool_sizes"}
+
+    if search_mode not in ("bayesian", "evolutionary"):
+        return param_space  # grid/random: dicts in lists work natively
+
+    out = {}
+    for key, val in param_space.items():
+        # Check if this is a branch dict param (key ends with one of our special names)
+        param_name = key.split("__")[-1]
+        if param_name in BRANCH_DICT_PARAMS and isinstance(val, list) and val and isinstance(val[0], dict):
+            encoded = [json.dumps(d, sort_keys=True) for d in val]
+            if search_mode == "bayesian":
+                out[key] = Categorical(encoded)
+            elif search_mode == "evolutionary":
+                out[key] = ECat(encoded)
+        else:
+            out[key] = val
+    return out
