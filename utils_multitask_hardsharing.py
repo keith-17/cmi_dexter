@@ -11,6 +11,7 @@ import tensorflow as tf
 from sklearn.metrics import f1_score, make_scorer
 import warnings
 warnings.filterwarnings('ignore', '.*mask.*Conv1D.*')
+import json
 
 
 AccMode = Optional[Literal["raw", "smoothed", "velocity", "displacement", "jerk"]]
@@ -1974,12 +1975,30 @@ class MultiDomainSequenceExtractor(BaseEstimator, TransformerMixin):
         self.tof_cols = tof_cols
         self.thm_cols = thm_cols
 
-    def _as_modes(self, modes: Optional[Sequence[str]], single_mode: Optional[str]) -> list[str]:
+    def _as_modes(self, modes, single_mode):
         if modes is None:
             return [] if single_mode is None else [single_mode]
+
         if isinstance(modes, str):
-            return [] if modes == "none" else [modes]
-        return [m for m in list(modes) if m is not None and m != "none"]
+            if modes in ("none", "", "None"):
+                return []
+
+            # allows bayes-safe strings like:
+            # "raw|velocity|displacement"
+            if "|" in modes:
+                return [
+                    m.strip()
+                    for m in modes.split("|")
+                    if m.strip() not in ("", "none", "None")
+                ]
+
+            return [modes]
+
+        return [
+            m
+            for m in list(modes)
+            if m is not None and m != "none"
+        ]
 
     def fit(self, X: pd.DataFrame, y: Optional[pd.DataFrame] = None) -> "MultiDomainSequenceExtractor":
         self.cleaner_ = SignalCleaner(
