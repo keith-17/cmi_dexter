@@ -11,7 +11,6 @@ import tensorflow as tf
 from sklearn.metrics import f1_score, make_scorer
 import warnings
 warnings.filterwarnings('ignore', '.*mask.*Conv1D.*')
-import json
 
 
 AccMode = Optional[Literal["raw", "smoothed", "velocity", "displacement", "jerk"]]
@@ -1447,37 +1446,37 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
     _estimator_type = "classifier"
 
     def __init__(
-            self,
-            target: str = "gesture_action",
-            maxlen: int = 64,
-            padding_value: float = -999.0,
+        self,
+        target: str = "gesture_action",
+        maxlen: int = 64,
+        padding_value: float = -999.0,
 
-            # which columns go to which branch
-            branch_config: dict | None = None,
+        # which columns go to which branch
+        branch_config: dict | None = None,
 
-            # per‑branch Conv1D architecture strings (hyphen‑separated)
-            branch_filters: dict | None = None,
-            branch_kernel_sizes: dict | None = None,
-            branch_pool_sizes: dict | None = None,
+        # per‑branch Conv1D architecture strings (hyphen‑separated)
+        branch_filters: dict | None = None,
+        branch_kernel_sizes: dict | None = None,
+        branch_pool_sizes: dict | None = None,
 
-            # fusion after branch concatenation
-            fusion_mode: str = "attention",
-            attention_heads: int = 4,
-            gru_units: int = 128,
+        # fusion after branch concatenation
+        fusion_mode: str = "attention",   # "attention", "bigru", "none"
+        attention_heads: int = 4,
+        gru_units: int = 128,
 
-            # common to all branches
-            use_batch_norm: bool = True,
-            spatial_dropout: float = 0.1,
+        # common to all branches
+        use_batch_norm: bool = True,
+        spatial_dropout: float = 0.1,
 
-            # classification head
-            dense_units: str = "64",
-            dropout: float = 0.3,
-            learning_rate: float = 5e-4,
-            batch_size: int = 32,
-            epochs: int = 80,
-            patience: int = 12,
-            verbose: int = 0,
-            random_state: int = 42,
+        # classification head
+        dense_units: str = "64",
+        dropout: float = 0.3,
+        learning_rate: float = 5e-4,
+        batch_size: int = 32,
+        epochs: int = 80,
+        patience: int = 12,
+        verbose: int = 0,
+        random_state: int = 42,
     ):
         self.target = target
         self.maxlen = maxlen
@@ -1505,7 +1504,7 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
         self.random_state = random_state
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Helpers – identical to your existing KerasCNN1DSequenceClassifier
     # ------------------------------------------------------------------
     def _to_tuple(self, value):
         if value is None:
@@ -1568,6 +1567,7 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
 
     @staticmethod
     def _default_branch_pool_sizes() -> dict:
+        # keep same temporal length for fusion
         return {
             "acc": "none-none",
             "rot": "none-none",
@@ -1576,26 +1576,13 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
         }
 
     # ------------------------------------------------------------------
-    # Helper to safely merge dict params (FIX FOR BAYESIAN)
-    # ------------------------------------------------------------------
-    def _get_branch_param(self, param_dict: dict | None, branch_name: str, default: str) -> str:
-        """Safely extract branch parameter, handling None and missing keys."""
-        if param_dict is None:
-            return default
-        if isinstance(param_dict, dict):
-            return param_dict.get(branch_name, default)
-        # If it's something else (rare), return default
-        return default
-
-    # ------------------------------------------------------------------
-    # Determine column indices for each branch
+    # Determine column indices for each branch from DataFrame columns
     # ------------------------------------------------------------------
     def _get_branch_indices(self, all_columns: pd.Index):
         config = self.branch_config or self._default_branch_config()
         branch_order = []
-        branch_indices = {}
+        branch_indices = {}   # name -> list of int positions
         remaining = set(range(len(all_columns)))
-
         for name, prefixes in config.items():
             idxs = []
             for i, col in enumerate(all_columns):
@@ -1605,52 +1592,34 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
                 branch_order.append(name)
                 branch_indices[name] = sorted(idxs)
                 remaining -= set(idxs)
-
+        # if any columns left unmatched, assign them to an "other" branch
         if remaining:
             branch_order.append("other")
             branch_indices["other"] = sorted(remaining)
-
         return branch_order, branch_indices
 
     # ------------------------------------------------------------------
-    # Pad sequences
+    # Pad (identical to your existing classifier)
     # ------------------------------------------------------------------
     def _pad(self, X):
-        if hasattr(X, 'groupby') and hasattr(X.index, 'levels') and len(X.index.levels) > 1:
-            grouped = list(X.groupby(level=0, sort=False))
-        elif hasattr(X, 'groupby'):
-            grouped = list(X.groupby(X.index, sort=False))
-        else:
-            grouped = [(i, X) for i in range(len(X))]
-
+        grouped = list(X.groupby(level=0, sort=False))
         n_seq = len(grouped)
-        n_feat = X.shape[1] if hasattr(X, 'shape') else 1
-
+        n_feat = X.shape[1]
         out = np.full(
             (n_seq, self.maxlen, n_feat),
             self.padding_value,
             dtype=np.float32,
         )
-
         seq_ids = []
-
         for i, (sid, g) in enumerate(grouped):
-            if hasattr(g, 'to_numpy'):
-                arr = g.to_numpy(dtype=np.float32)
-            else:
-                arr = np.array(g, dtype=np.float32)
-
-            if arr.ndim == 1:
-                arr = arr.reshape(-1, 1)
-
+            arr = g.to_numpy(dtype=np.float32)
             length = min(len(arr), self.maxlen)
             out[i, :length, :] = arr[:length, :]
             seq_ids.append(sid)
-
         return out, pd.Series(seq_ids, name="sequence_id")
 
     # ------------------------------------------------------------------
-    # Collapse y
+    # Collapse y (identical)
     # ------------------------------------------------------------------
     def _collapse_y(self, seq_ids, y):
         if isinstance(y, pd.DataFrame):
@@ -1660,7 +1629,7 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
                 raise ValueError(f"y dataframe must contain target column: {self.target}")
             target_map = (
                 y.drop_duplicates("sequence_id")
-                    .set_index("sequence_id")[self.target]
+                .set_index("sequence_id")[self.target]
             )
             y_seq = seq_ids.map(target_map)
         else:
@@ -1669,11 +1638,9 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
                 raise ValueError(
                     "If y is not a dataframe, it must already be one label per sequence."
                 )
-
         if y_seq.isna().any():
             missing = seq_ids[y_seq.isna()].head(10).tolist()
             raise ValueError(f"Missing labels for sequence_ids: {missing}")
-
         return y_seq.reset_index(drop=True)
 
     # ------------------------------------------------------------------
@@ -1683,34 +1650,34 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
         tf.keras.backend.clear_session()
         keras.utils.set_random_seed(self.random_state)
 
-        branch_filters_cfg = self.branch_filters if self.branch_filters is not None else self._default_branch_filters()
-        branch_kernels_cfg = self.branch_kernel_sizes if self.branch_kernel_sizes is not None else self._default_branch_kernel_sizes()
-        branch_pools_cfg = self.branch_pool_sizes if self.branch_pool_sizes is not None else self._default_branch_pool_sizes()
+        # --- branch configuration ---
+        branch_filters_cfg = self.branch_filters or self._default_branch_filters()
+        branch_kernels_cfg = self.branch_kernel_sizes or self._default_branch_kernel_sizes()
+        branch_pools_cfg = self.branch_pool_sizes or self._default_branch_pool_sizes()
 
         inp = keras.Input(shape=(self.maxlen, n_features), name="input")
 
+        # --- process each branch ---
         branch_outs = []
         for br_name in self.branch_order_:
             idxs = self.branch_indices_[br_name]
-
+            # extract branch features
             br_x = layers.Lambda(
                 lambda t, i=idxs: tf.gather(t, i, axis=-1),
                 name=f"branch_{br_name}_slice",
             )(inp)
 
-            f_str = self._get_branch_param(branch_filters_cfg, br_name, "32")
-            k_str = self._get_branch_param(branch_kernels_cfg, br_name, "3")
-            p_str = self._get_branch_param(branch_pools_cfg, br_name, "none")
+            # parse architecture for this branch
+            f_str = branch_filters_cfg.get(br_name, "32")
+            k_str = branch_kernels_cfg.get(br_name, "3")
+            p_str = branch_pools_cfg.get(br_name, "none")
 
             filters = self._to_tuple(f_str)
-            n = len(filters) if filters else 1
-            if n == 0:
-                filters = (32,)
-                n = 1
-
+            n = len(filters)
             kernels = self._align(k_str, n)
             pools = self._align(p_str, n)
 
+            # apply Conv1D blocks
             x = br_x
             for f, k, p in zip(filters, kernels, pools):
                 x = layers.Conv1D(
@@ -1719,80 +1686,47 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
                     padding="same",
                     activation="relu",
                 )(x)
-
                 if self.use_batch_norm:
                     x = layers.BatchNormalization()(x)
-
                 if float(self.spatial_dropout) > 0:
                     x = layers.SpatialDropout1D(rate=float(self.spatial_dropout))(x)
-
                 if p is not None:
                     x = layers.MaxPooling1D(pool_size=int(p))(x)
 
+            # ensure output time dimension matches by projecting with a 1x1 if needed (to same length)
+            # but pooling may change length – okay only if all branches have identical pooling factors.
             branch_outs.append(x)
 
-        # Fusion
+        # --- fusion ---
         if len(branch_outs) == 1:
             x = branch_outs[0]
-            branches_pooled = False
         else:
-            time_dims = [b.shape[1] for b in branch_outs]
-            if len(set(time_dims)) > 1:
-                # branches have mismatched time dims due to different pool configs
-                # collapse each to (batch, filters) before concat
-                branch_outs = [
-                    layers.GlobalAveragePooling1D(name=f"branch_pool_{name}")(b)
-                    for name, b in zip(self.branch_order_, branch_outs)
-                ]
-                x = layers.Concatenate(axis=-1, name="branch_concat")(branch_outs)
-                branches_pooled = True
-            else:
-                x = layers.Concatenate(axis=-1, name="branch_concat")(branch_outs)
-                branches_pooled = False
+            x = layers.Concatenate(axis=-1, name="branch_concat")(branch_outs)
 
-        if branches_pooled:
-            # x is (batch, total_filters) — reshape to sequence of 1 for attention/gru
-            if self.fusion_mode == "attention":
-                x = layers.Reshape((1, x.shape[-1]))(x)
-                attn = layers.MultiHeadAttention(
-                    num_heads=int(self.attention_heads),
-                    key_dim=max(1, x.shape[-1] // int(self.attention_heads)),
-                    name="fusion_attn",
-                )(x, x)
-                x = layers.Add()([x, attn])
-                x = layers.LayerNormalization()(x)
-                x = layers.Flatten()(x)
-            elif self.fusion_mode == "bigru":
-                # treat each branch vector as a token: (batch, n_branches, filters)
-                stacked = [
-                    layers.Reshape((1, b.shape[-1]))(b)
-                    for b in branch_outs
-                ]
-                x = layers.Concatenate(axis=1, name="branch_tokens")(stacked)
-                x = layers.Bidirectional(
-                    layers.GRU(int(self.gru_units), return_sequences=False),
-                    name="fusion_bigru",
-                )(x)
-            # fusion_mode == "none": x stays as flat concat
+        if self.fusion_mode == "attention":
+            # simple self‑attention with residual connection
+            attn = layers.MultiHeadAttention(
+                num_heads=int(self.attention_heads),
+                key_dim=x.shape[-1] // int(self.attention_heads),
+                name="fusion_attn",
+            )(x, x)
+            x = layers.Add()([x, attn])
+            x = layers.LayerNormalization()(x)
+
+        elif self.fusion_mode == "bigru":
+            x = layers.Bidirectional(
+                layers.GRU(int(self.gru_units), return_sequences=True),
+                name="fusion_bigru",
+            )(x)
+
+        elif self.fusion_mode == "none":
+            pass
         else:
-            # x is (batch, time, features) — normal temporal fusion
-            if self.fusion_mode == "attention":
-                attn = layers.MultiHeadAttention(
-                    num_heads=int(self.attention_heads),
-                    key_dim=max(1, x.shape[-1] // int(self.attention_heads)),
-                    name="fusion_attn",
-                )(x, x)
-                x = layers.Add()([x, attn])
-                x = layers.LayerNormalization()(x)
-            elif self.fusion_mode == "bigru":
-                x = layers.Bidirectional(
-                    layers.GRU(int(self.gru_units), return_sequences=True),
-                    name="fusion_bigru",
-                )(x)
+            raise ValueError(f"Unknown fusion_mode: {self.fusion_mode}")
 
-            x = layers.GlobalAveragePooling1D(name="global_pool")(x)
+        # --- global pooling & classification head ---
+        x = layers.GlobalAveragePooling1D(name="global_pool")(x)
 
-        # Classification head
         dense_units = self._to_tuple(self.dense_units)
         for units in dense_units:
             x = layers.Dense(int(units), activation="relu")(x)
@@ -1813,12 +1747,13 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
     # fit / predict / predict_proba / score
     # ------------------------------------------------------------------
     def fit(self, X, y):
-        # Determine branch splits from column names
+        # determine branch splits from column names
         if hasattr(X, "columns"):
             self.branch_order_, self.branch_indices_ = self._get_branch_indices(X.columns)
         else:
+            # fallback: treat all features as one "all" branch
             self.branch_order_ = ["all"]
-            self.branch_indices_ = {"all": list(range(X.shape[1])) if hasattr(X, 'shape') else [0]}
+            self.branch_indices_ = {"all": list(range(X.shape[1]))}
 
         X_pad, seq_ids = self._pad(X)
         y_seq = self._collapse_y(seq_ids, y)
@@ -1859,56 +1794,690 @@ class KerasMultiBranchClassifier(ClassifierMixin, BaseEstimator):
         return self.le_.inverse_transform(pred_idx)
 
     def score(self, X, y):
-        X_pad, seq_ids = self._pad(X)
+        _, seq_ids = self._pad(X)
         y_seq = self._collapse_y(seq_ids, y)
-        proba = self.model_.predict(X_pad, verbose=0)
-        pred_idx = np.argmax(proba, axis=1)
-        preds = self.le_.inverse_transform(pred_idx)
+        preds = self.predict(X)
         return f1_score(y_seq.to_numpy(), preds, average="macro")
 
-    def set_params(self, **params):
-        """Override set_params to auto-decode JSON-encoded branch dicts."""
-        import json
-        BRANCH_DICT_PARAMS = {"branch_filters", "branch_kernel_sizes", "branch_pool_sizes"}
-        decoded = {}
-        for k, v in params.items():
-            if k in BRANCH_DICT_PARAMS and isinstance(v, str):
-                try:
-                    decoded[k] = json.loads(v)
-                except (json.JSONDecodeError, TypeError):
-                    decoded[k] = v
-            else:
-                decoded[k] = v
-        return super().set_params(**decoded)
+# =============================================================================
+# Extra utilities for hierarchical plain CNN experiments
+# - SensorOrientationCorrector
+# - MultiDomainSequenceExtractor
+# - KerasAugmentedCNN1DSequenceClassifier
+# =============================================================================
+
+from typing import Any, Sequence
 
 
-def prepare_multibranch_param_space(param_space, search_mode, Categorical=None, ECat=None):
+class SensorOrientationCorrector(BaseEstimator, TransformerMixin):
+    """Row-level sensor correction before sequence feature extraction.
+
+    Keeps notebook clean. Uses train/test demographics for handedness correction and
+    hardcoded upside-down subject IDs.
     """
-    Encode dict-valued branch params (branch_filters, branch_kernel_sizes,
-    branch_pool_sizes) as JSON strings so BayesSearchCV can handle them.
 
-    For 'bayesian' mode: wraps lists of dicts in skopt Categorical as JSON strings.
-    For 'evolutionary' mode: wraps in sklearn_genetic ECat as JSON strings.
-    For 'grid'/'random' mode: leaves as-is (plain lists of dicts work fine).
+    def __init__(
+        self,
+        demo_df: Optional[pd.DataFrame] = None,
+        handedness_col: str = "handedness",
+        subject_col: str = "subject",
+        left_handed_value: int = 0,
+        apply_handedness: bool = True,
+        apply_upside_down: bool = True,
+        upside_down_subjects: Optional[list[str]] = None,
+    ) -> None:
+        self.demo_df = demo_df
+        self.handedness_col = handedness_col
+        self.subject_col = subject_col
+        self.left_handed_value = left_handed_value
+        self.apply_handedness = apply_handedness
+        self.apply_upside_down = apply_upside_down
+        self.upside_down_subjects = upside_down_subjects
 
-    The KerasMultiBranchClassifier.set_params() must decode these back via
-    _decode_branch_params().
-    """
-    BRANCH_DICT_PARAMS = {"branch_filters", "branch_kernel_sizes", "branch_pool_sizes"}
-
-    if search_mode not in ("bayesian", "evolutionary"):
-        return param_space  # grid/random: dicts in lists work natively
-
-    out = {}
-    for key, val in param_space.items():
-        # Check if this is a branch dict param (key ends with one of our special names)
-        param_name = key.split("__")[-1]
-        if param_name in BRANCH_DICT_PARAMS and isinstance(val, list) and val and isinstance(val[0], dict):
-            encoded = [json.dumps(d, sort_keys=True) for d in val]
-            if search_mode == "bayesian":
-                out[key] = Categorical(encoded)
-            elif search_mode == "evolutionary":
-                out[key] = ECat(encoded)
+    def fit(self, X: pd.DataFrame, y: Optional[pd.DataFrame] = None) -> "SensorOrientationCorrector":
+        if self.demo_df is not None and self.subject_col in self.demo_df.columns:
+            self.handedness_map_ = self.demo_df.set_index(self.subject_col)[self.handedness_col].to_dict()
         else:
-            out[key] = val
-    return out
+            self.handedness_map_ = {}
+
+        self.upside_down_subjects_ = self.upside_down_subjects or [
+            "SUBJ_019262",
+            "SUBJ_045235",
+        ]
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        check_is_fitted(self, ["handedness_map_", "upside_down_subjects_"])
+        df = X.copy()
+
+        rot_cols = ["rot_w", "rot_x", "rot_y", "rot_z"]
+
+        if self.apply_handedness and self.handedness_map_ and self.subject_col in df.columns:
+            handedness = df[self.subject_col].map(self.handedness_map_)
+            left_mask = handedness.eq(self.left_handed_value)
+
+            if "acc_x" in df.columns:
+                df.loc[left_mask, "acc_x"] *= -1.0
+
+            if set(rot_cols).issubset(df.columns) and int(left_mask.sum()) > 0:
+                q = df.loc[left_mask, rot_cols].to_numpy(dtype=float)
+                q = np.nan_to_num(q, nan=0.0, posinf=0.0, neginf=0.0)
+                norm = np.linalg.norm(q, axis=1, keepdims=True)
+                bad = norm.squeeze() == 0.0
+                if bad.any():
+                    q[bad] = np.array([1.0, 0.0, 0.0, 0.0])
+                    norm = np.linalg.norm(q, axis=1, keepdims=True)
+                q = q / norm
+
+                w, x, yv, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+                roll = np.arctan2(2.0 * (w * x + yv * z), 1.0 - 2.0 * (x * x + yv * yv))
+                pitch = np.arcsin(np.clip(2.0 * (w * yv - z * x), -1.0, 1.0))
+                yaw = np.arctan2(2.0 * (w * z + x * yv), 1.0 - 2.0 * (yv * yv + z * z))
+
+                # handedness mirror: keep roll, flip pitch/yaw
+                pitch *= -1.0
+                yaw *= -1.0
+
+                cr, sr = np.cos(roll / 2.0), np.sin(roll / 2.0)
+                cp, sp = np.cos(pitch / 2.0), np.sin(pitch / 2.0)
+                cy, sy = np.cos(yaw / 2.0), np.sin(yaw / 2.0)
+
+                q_fixed = np.column_stack([
+                    cr * cp * cy + sr * sp * sy,
+                    sr * cp * cy - cr * sp * sy,
+                    cr * sp * cy + sr * cp * sy,
+                    cr * cp * sy - sr * sp * cy,
+                ])
+                q_fixed = q_fixed / np.linalg.norm(q_fixed, axis=1, keepdims=True)
+                df.loc[left_mask, rot_cols] = q_fixed
+
+            if {"ang_vel_x", "ang_vel_y", "ang_vel_z"}.issubset(df.columns):
+                df.loc[left_mask, ["ang_vel_y", "ang_vel_z"]] *= -1.0
+
+        if self.apply_upside_down and self.subject_col in df.columns:
+            upside_mask = df[self.subject_col].isin(self.upside_down_subjects_)
+
+            acc_cols = [c for c in ["acc_x", "acc_y", "acc_z"] if c in df.columns]
+            if acc_cols:
+                df.loc[upside_mask, acc_cols] *= -1.0
+
+            if {"rot_x", "rot_y", "rot_z"}.issubset(df.columns):
+                df.loc[upside_mask, ["rot_x", "rot_y", "rot_z"]] *= -1.0
+
+            if {"ang_vel_x", "ang_vel_y", "ang_vel_z"}.issubset(df.columns):
+                df.loc[upside_mask, ["ang_vel_x", "ang_vel_y", "ang_vel_z"]] *= -1.0
+
+        return df
+
+
+class MultiDomainSequenceExtractor(BaseEstimator, TransformerMixin):
+    """SequenceExtractor that can emit multiple domains per sensor.
+
+    Backwards-compatible with single acc_mode / rotation_mode, but adds:
+        acc_modes=("raw", "velocity", "displacement", "jerk")
+        rotation_modes=("quaternion", "rot6d", "angular_velocity")
+    """
+
+    def __init__(
+        self,
+        acc_mode: AccMode = "raw",
+        acc_modes: Optional[Sequence[str]] = None,
+        linear_acc_mode: LinearAccMode = None,
+        use_acc_magnitude: bool = False,
+        use_linear_acc_magnitude: bool = False,
+        sampling_rate: int = 20,
+        compute_dt: bool = True,
+        clip_value: Optional[float] = None,
+        interp_mode: InterpMode = None,
+        use_highpass_fallback: bool = True,
+        window_size: int = 5,
+        smooth_alpha: Optional[float] = None,
+        standardize: StandardizeMode = None,
+        include_mask: bool = False,
+        sequence_col: str = "sequence_id",
+        counter_col: str = "sequence_counter",
+        acc_cols: Optional[list[str]] = None,
+        rot_cols: Optional[list[str]] = None,
+        rotation_mode: RotationMode = None,
+        rotation_modes: Optional[Sequence[str]] = None,
+        fix_quaternion_sign: bool = True,
+        tof_mode: TOFMode = None,
+        tof_fill_mode: TOFFillMode = "far_255",
+        thm_mode: THMMode = None,
+        tof_cols: Optional[list[str]] = None,
+        thm_cols: Optional[list[str]] = None,
+    ) -> None:
+        self.acc_mode = acc_mode
+        self.acc_modes = acc_modes
+        self.linear_acc_mode = linear_acc_mode
+        self.use_acc_magnitude = use_acc_magnitude
+        self.use_linear_acc_magnitude = use_linear_acc_magnitude
+        self.sampling_rate = sampling_rate
+        self.compute_dt = compute_dt
+        self.clip_value = clip_value
+        self.interp_mode = interp_mode
+        self.use_highpass_fallback = use_highpass_fallback
+        self.window_size = window_size
+        self.smooth_alpha = smooth_alpha
+        self.standardize = standardize
+        self.include_mask = include_mask
+        self.sequence_col = sequence_col
+        self.counter_col = counter_col
+        self.acc_cols = acc_cols
+        self.rot_cols = rot_cols
+        self.rotation_mode = rotation_mode
+        self.rotation_modes = rotation_modes
+        self.fix_quaternion_sign = fix_quaternion_sign
+        self.tof_mode = tof_mode
+        self.tof_fill_mode = tof_fill_mode
+        self.thm_mode = thm_mode
+        self.tof_cols = tof_cols
+        self.thm_cols = thm_cols
+
+    def _as_modes(self, modes: Optional[Sequence[str]], single_mode: Optional[str]) -> list[str]:
+        if modes is None:
+            return [] if single_mode is None else [single_mode]
+        if isinstance(modes, str):
+            return [] if modes == "none" else [modes]
+        return [m for m in list(modes) if m is not None and m != "none"]
+
+    def fit(self, X: pd.DataFrame, y: Optional[pd.DataFrame] = None) -> "MultiDomainSequenceExtractor":
+        self.cleaner_ = SignalCleaner(
+            sampling_rate=self.sampling_rate,
+            compute_dt=self.compute_dt,
+            clip_value=self.clip_value,
+            interp_mode=self.interp_mode,
+            linear_acc_mode=self.linear_acc_mode,
+            use_highpass_fallback=self.use_highpass_fallback,
+            window_size=self.window_size,
+            sequence_col=self.sequence_col,
+            counter_col=self.counter_col,
+            acc_cols=self.acc_cols,
+            rot_cols=self.rot_cols,
+        )
+        self.cleaner_.fit(X, y)
+        cleaned = self.cleaner_.transform(X)
+
+        self.acc_modes_ = self._as_modes(self.acc_modes, self.acc_mode)
+        self.rotation_modes_ = self._as_modes(self.rotation_modes, self.rotation_mode)
+
+        self.imu_extractors_ = []
+        for mode in self.acc_modes_:
+            ext = IMUExtractor(
+                acc_mode=mode,
+                linear_acc_mode=None,
+                use_acc_magnitude=False,
+                use_linear_acc_magnitude=False,
+                window_size=self.window_size,
+                smooth_alpha=self.smooth_alpha,
+                sequence_col=self.sequence_col,
+                acc_cols=self.cleaner_.acc_cols_,
+            )
+            ext.fit(cleaned, y)
+            self.imu_extractors_.append((mode, ext))
+
+        self.extra_imu_extractor_ = IMUExtractor(
+            acc_mode=None,
+            linear_acc_mode=self.linear_acc_mode,
+            use_acc_magnitude=self.use_acc_magnitude,
+            use_linear_acc_magnitude=self.use_linear_acc_magnitude,
+            window_size=self.window_size,
+            smooth_alpha=self.smooth_alpha,
+            sequence_col=self.sequence_col,
+            acc_cols=self.cleaner_.acc_cols_,
+        )
+        self.extra_imu_extractor_.fit(cleaned, y)
+
+        self.rotation_extractors_ = []
+        for mode in self.rotation_modes_:
+            ext = RotationExtractor(
+                rotation_mode=mode,
+                sequence_col=self.sequence_col,
+                counter_col=self.counter_col,
+                dt_col="dt",
+                sampling_rate=self.sampling_rate,
+                rot_cols=self.cleaner_.rot_cols_,
+                fix_quaternion_sign=self.fix_quaternion_sign,
+            )
+            ext.fit(cleaned, y)
+            self.rotation_extractors_.append((mode, ext))
+
+        self.tof_extractor_ = TOFExtractor(
+            tof_mode=self.tof_mode,
+            tof_fill_mode=self.tof_fill_mode,
+            sequence_col=self.sequence_col,
+            tof_cols=self.tof_cols,
+        ).fit(cleaned, y)
+
+        self.thermo_extractor_ = ThermoExtractor(
+            thm_mode=self.thm_mode,
+            sequence_col=self.sequence_col,
+            thm_cols=self.thm_cols,
+        ).fit(cleaned, y)
+
+        sample_parts = []
+        for _, ext in self.imu_extractors_:
+            sample_parts.append(ext.transform(cleaned))
+        sample_parts.append(self.extra_imu_extractor_.transform(cleaned))
+        for _, ext in self.rotation_extractors_:
+            sample_parts.append(ext.transform(cleaned))
+        sample_parts.extend([
+            self.tof_extractor_.transform(cleaned),
+            self.thermo_extractor_.transform(cleaned),
+        ])
+        sample = pd.concat([p for p in sample_parts if p is not None and not p.empty], axis=1)
+
+        if self.include_mask:
+            sample["mask"] = cleaned["mask"].to_numpy()
+
+        self.feature_names_in_ = list(sample.columns)
+
+        if self.standardize == "mean_std" and not sample.empty:
+            self.mean_ = sample.mean(axis=0)
+            self.std_ = sample.std(axis=0).replace(0.0, 1.0)
+        else:
+            self.mean_ = None
+            self.std_ = None
+
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        check_is_fitted(self, ["cleaner_", "feature_names_in_"])
+        cleaned = self.cleaner_.transform(X)
+
+        parts = []
+        for _, ext in self.imu_extractors_:
+            parts.append(ext.transform(cleaned))
+        parts.append(self.extra_imu_extractor_.transform(cleaned))
+        for _, ext in self.rotation_extractors_:
+            parts.append(ext.transform(cleaned))
+        parts.extend([
+            self.tof_extractor_.transform(cleaned),
+            self.thermo_extractor_.transform(cleaned),
+        ])
+
+        out = pd.concat([p for p in parts if p is not None and not p.empty], axis=1)
+
+        if self.include_mask:
+            out["mask"] = cleaned["mask"].to_numpy()
+
+        if self.standardize == "mean_std" and not out.empty:
+            out = (out - self.mean_) / self.std_
+
+        out = out.fillna(0.0)
+        out.index = cleaned[self.sequence_col].to_numpy()
+        out.columns = [str(c) for c in out.columns]
+        return out
+
+
+class KerasAugmentedCNN1DSequenceClassifier(ClassifierMixin, BaseEstimator):
+    _estimator_type = "classifier"
+
+    def __init__(
+        self,
+        target: str = "gesture_action",
+        maxlen: int = 64,
+        padding_value: float = -999.0,
+        conv_filters: str = "64",
+        kernel_sizes: str = "5",
+        pool_sizes: str = "none",
+        use_batch_norm: bool = True,
+        spatial_dropout: float = 0.0,
+        dense_units: str = "64",
+        dropout: float = 0.2,
+        learning_rate: float = 5e-4,
+        batch_size: int = 32,
+        epochs: int = 80,
+        patience: int = 12,
+        validation_fraction: float = 0.15,
+        verbose: int = 0,
+        random_state: int = 42,
+        use_mixup: bool = False,
+        mixup_alpha: float = 0.4,
+        mixup_size: float = 1.0,
+        mixup_prob: float = 1.0,
+        use_time_shift: bool = False,
+        max_shift_pct: float = 0.25,
+        use_time_stretch: bool = False,
+        time_stretch_min_rate: float = 0.5,
+        time_stretch_max_rate: float = 1.5,
+        use_gaussian_noise: bool = False,
+        noise_std: float = 0.01,
+        use_magnitude_scaling: bool = False,
+        magnitude_scale_min: float = 0.9,
+        magnitude_scale_max: float = 1.1,
+        use_time_mask: bool = False,
+        time_mask_ratio: float = 0.1,
+        use_channel_dropout: bool = False,
+        channel_dropout_prob: float = 0.0,
+        use_tof_dropout: bool = False,
+        tof_dropout_prob: float = 0.0,
+        use_modality_dropout: bool = False,
+        drop_acc_prob: float = 0.0,
+        drop_rot_prob: float = 0.0,
+        drop_tof_prob: float = 0.0,
+        drop_thm_prob: float = 0.0,
+        use_quaternion_sign_flip: bool = False,
+        quaternion_flip_prob: float = 0.5,
+        use_cutmix: bool = False,
+        cutmix_prob: float = 0.0,
+        cutmix_size: float = 0.5,
+        use_frequency_filter: bool = False,
+        freq_keep_low: float = 0.1,
+        freq_keep_high: float = 0.9,
+    ) -> None:
+        self.target = target
+        self.maxlen = maxlen
+        self.padding_value = padding_value
+        self.conv_filters = conv_filters
+        self.kernel_sizes = kernel_sizes
+        self.pool_sizes = pool_sizes
+        self.use_batch_norm = use_batch_norm
+        self.spatial_dropout = spatial_dropout
+        self.dense_units = dense_units
+        self.dropout = dropout
+        self.learning_rate = learning_rate
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.patience = patience
+        self.validation_fraction = validation_fraction
+        self.verbose = verbose
+        self.random_state = random_state
+        self.use_mixup = use_mixup
+        self.mixup_alpha = mixup_alpha
+        self.mixup_size = mixup_size
+        self.mixup_prob = mixup_prob
+        self.use_time_shift = use_time_shift
+        self.max_shift_pct = max_shift_pct
+        self.use_time_stretch = use_time_stretch
+        self.time_stretch_min_rate = time_stretch_min_rate
+        self.time_stretch_max_rate = time_stretch_max_rate
+        self.use_gaussian_noise = use_gaussian_noise
+        self.noise_std = noise_std
+        self.use_magnitude_scaling = use_magnitude_scaling
+        self.magnitude_scale_min = magnitude_scale_min
+        self.magnitude_scale_max = magnitude_scale_max
+        self.use_time_mask = use_time_mask
+        self.time_mask_ratio = time_mask_ratio
+        self.use_channel_dropout = use_channel_dropout
+        self.channel_dropout_prob = channel_dropout_prob
+        self.use_tof_dropout = use_tof_dropout
+        self.tof_dropout_prob = tof_dropout_prob
+        self.use_modality_dropout = use_modality_dropout
+        self.drop_acc_prob = drop_acc_prob
+        self.drop_rot_prob = drop_rot_prob
+        self.drop_tof_prob = drop_tof_prob
+        self.drop_thm_prob = drop_thm_prob
+        self.use_quaternion_sign_flip = use_quaternion_sign_flip
+        self.quaternion_flip_prob = quaternion_flip_prob
+        self.use_cutmix = use_cutmix
+        self.cutmix_prob = cutmix_prob
+        self.cutmix_size = cutmix_size
+        self.use_frequency_filter = use_frequency_filter
+        self.freq_keep_low = freq_keep_low
+        self.freq_keep_high = freq_keep_high
+
+    def _to_tuple(self, value: Any) -> tuple[Any, ...]:
+        if value is None:
+            return ()
+        if isinstance(value, str):
+            if value == "none":
+                return ()
+            return tuple(None if p == "none" else int(p) for p in value.split("-"))
+        if isinstance(value, tuple):
+            return value
+        if isinstance(value, list):
+            return tuple(value)
+        return (value,)
+
+    def _align(self, value: Any, n: int) -> tuple[Any, ...]:
+        value = self._to_tuple(value)
+        if len(value) == 0:
+            return (None,) * n
+        if len(value) == n:
+            return value
+        if len(value) == 1:
+            return value * n
+        if len(value) < n:
+            return value + (value[-1],) * (n - len(value))
+        return value[:n]
+
+    def _pad(self, X: pd.DataFrame) -> tuple[np.ndarray, pd.Series]:
+        self.feature_columns_ = list(X.columns)
+        grouped = list(X.groupby(level=0, sort=False))
+        n_seq = len(grouped)
+        n_feat = X.shape[1]
+        out = np.full((n_seq, int(self.maxlen), n_feat), float(self.padding_value), dtype=np.float32)
+        seq_ids = []
+        for i, (sid, g) in enumerate(grouped):
+            arr = g.to_numpy(dtype=np.float32)
+            length = min(len(arr), int(self.maxlen))
+            out[i, :length, :] = arr[:length]
+            seq_ids.append(sid)
+        return out, pd.Series(seq_ids, name="sequence_id")
+
+    def _collapse_y(self, seq_ids: pd.Series, y: Any) -> pd.Series:
+        if isinstance(y, pd.DataFrame):
+            if "sequence_id" not in y.columns:
+                raise ValueError("y dataframe must contain sequence_id.")
+            if self.target not in y.columns:
+                raise ValueError(f"y dataframe must contain target column: {self.target}")
+            target_map = y.drop_duplicates("sequence_id").set_index("sequence_id")[self.target]
+            y_seq = seq_ids.map(target_map)
+        else:
+            y_seq = pd.Series(y).reset_index(drop=True)
+            if len(y_seq) != len(seq_ids):
+                raise ValueError("If y is not a dataframe, it must already be one label per sequence.")
+        if y_seq.isna().any():
+            missing = seq_ids[y_seq.isna()].head(10).tolist()
+            raise ValueError(f"Missing labels for sequence_ids: {missing}")
+        return y_seq.reset_index(drop=True)
+
+    def _column_indices(self, prefixes: tuple[str, ...]) -> list[int]:
+        cols = getattr(self, "feature_columns_", [])
+        return [i for i, c in enumerate(cols) if str(c).startswith(prefixes)]
+
+    def _augment_hard_labels(self, X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        rng = np.random.default_rng(int(self.random_state))
+        X_aug = X.copy().astype(np.float32)
+        y_aug = y.copy()
+        n, t, f = X_aug.shape
+        valid = X_aug != float(self.padding_value)
+
+        if self.use_time_shift and t > 1:
+            max_shift = max(1, int(float(self.max_shift_pct) * t))
+            for i in range(n):
+                shift = int(rng.integers(-max_shift, max_shift + 1))
+                if shift != 0:
+                    row = np.full_like(X_aug[i], float(self.padding_value))
+                    if shift > 0:
+                        row[shift:] = X_aug[i, :-shift]
+                    else:
+                        row[:shift] = X_aug[i, -shift:]
+                    X_aug[i] = row
+
+        if self.use_time_stretch and t > 2:
+            x_old = np.arange(t)
+            for i in range(n):
+                rate = float(rng.uniform(float(self.time_stretch_min_rate), float(self.time_stretch_max_rate)))
+                x_new = np.clip(np.arange(t) * rate, 0, t - 1)
+                for j in range(f):
+                    X_aug[i, :, j] = np.interp(x_new, x_old, X_aug[i, :, j])
+
+        if self.use_gaussian_noise and float(self.noise_std) > 0:
+            noise = rng.normal(0.0, float(self.noise_std), size=X_aug.shape).astype(np.float32)
+            X_aug = np.where(valid, X_aug + noise, X_aug)
+
+        if self.use_magnitude_scaling:
+            scale = rng.uniform(float(self.magnitude_scale_min), float(self.magnitude_scale_max), size=(n, 1, 1)).astype(np.float32)
+            X_aug = np.where(valid, X_aug * scale, X_aug)
+
+        if self.use_time_mask and float(self.time_mask_ratio) > 0:
+            mask_len = max(1, int(float(self.time_mask_ratio) * t))
+            for i in range(n):
+                start = int(rng.integers(0, max(1, t - mask_len + 1)))
+                X_aug[i, start:start + mask_len, :] = 0.0
+
+        if self.use_channel_dropout and float(self.channel_dropout_prob) > 0:
+            ch_mask = rng.random((n, 1, f)) < float(self.channel_dropout_prob)
+            X_aug = np.where(ch_mask & valid, 0.0, X_aug)
+
+        if self.use_tof_dropout and float(self.tof_dropout_prob) > 0:
+            idx = self._column_indices(("tof_",))
+            if idx:
+                drop = rng.random((n, 1, len(idx))) < float(self.tof_dropout_prob)
+                X_aug[:, :, idx] = np.where(drop, 0.0, X_aug[:, :, idx])
+
+        if self.use_modality_dropout:
+            for prefixes, prob in [
+                (("acc_", "lin_acc_"), self.drop_acc_prob),
+                (("rot_", "delta_rot_", "ang_vel_", "rot6d_"), self.drop_rot_prob),
+                (("tof_",), self.drop_tof_prob),
+                (("thm_",), self.drop_thm_prob),
+            ]:
+                idx = self._column_indices(prefixes)
+                if idx and float(prob) > 0:
+                    drop_rows = rng.random((n, 1, 1)) < float(prob)
+                    X_aug[:, :, idx] = np.where(drop_rows, 0.0, X_aug[:, :, idx])
+
+        if self.use_quaternion_sign_flip and float(self.quaternion_flip_prob) > 0:
+            idx = self._column_indices(("rot_w_norm", "rot_x_norm", "rot_y_norm", "rot_z_norm"))
+            if idx:
+                flip = rng.random((n, 1, 1)) < float(self.quaternion_flip_prob)
+                X_aug[:, :, idx] = np.where(flip, -X_aug[:, :, idx], X_aug[:, :, idx])
+
+        if self.use_frequency_filter and 0 <= float(self.freq_keep_low) < float(self.freq_keep_high) <= 1:
+            fft = np.fft.rfft(np.where(valid, X_aug, 0.0), axis=1)
+            m = fft.shape[1]
+            lo = int(float(self.freq_keep_low) * m)
+            hi = max(lo + 1, int(float(self.freq_keep_high) * m))
+            filt = np.zeros(m, dtype=bool)
+            filt[lo:hi] = True
+            fft[:, ~filt, :] = 0
+            X_aug = np.fft.irfft(fft, n=t, axis=1).astype(np.float32)
+
+        if self.use_cutmix and float(self.cutmix_prob) > 0 and n > 1:
+            n_mix = int(n * float(self.cutmix_size))
+            idx_a = rng.integers(0, n, size=n_mix)
+            idx_b = rng.integers(0, n, size=n_mix)
+            same = y_aug[idx_a] == y_aug[idx_b]
+            idx_a, idx_b = idx_a[same], idx_b[same]
+            for a, b in zip(idx_a, idx_b):
+                if rng.random() < float(self.cutmix_prob):
+                    start = int(rng.integers(0, t))
+                    end = int(rng.integers(start + 1, t + 1))
+                    X_aug[a, start:end, :] = X_aug[b, start:end, :]
+
+        return X_aug, y_aug
+
+    def _make_mixup(self, X: np.ndarray, y: np.ndarray, n_classes: int) -> tuple[np.ndarray, np.ndarray]:
+        y_onehot = keras.utils.to_categorical(y, num_classes=n_classes).astype(np.float32)
+        if not self.use_mixup:
+            return X.astype(np.float32), y_onehot
+
+        rng = np.random.default_rng(int(self.random_state))
+        n = X.shape[0]
+        n_mix = int(n * float(self.mixup_size))
+        if n_mix <= 0:
+            return X.astype(np.float32), y_onehot
+
+        idx_a = rng.integers(0, n, size=n_mix)
+        idx_b = rng.integers(0, n, size=n_mix)
+        lam = rng.beta(float(self.mixup_alpha), float(self.mixup_alpha), size=n_mix).astype(np.float32)
+        use_mix = rng.random(n_mix) < float(self.mixup_prob)
+        lam[~use_mix] = 1.0
+        X_mix = lam.reshape(-1, 1, 1) * X[idx_a] + (1.0 - lam.reshape(-1, 1, 1)) * X[idx_b]
+        y_mix = lam.reshape(-1, 1) * y_onehot[idx_a] + (1.0 - lam.reshape(-1, 1)) * y_onehot[idx_b]
+        return np.concatenate([X, X_mix], axis=0).astype(np.float32), np.concatenate([y_onehot, y_mix], axis=0).astype(np.float32)
+
+    def _build(self, shape: tuple[int, int], n_classes: int) -> keras.Model:
+        tf.keras.backend.clear_session()
+        keras.utils.set_random_seed(int(self.random_state))
+
+        conv_filters = self._to_tuple(self.conv_filters)
+        n_layers = len(conv_filters)
+        if n_layers == 0:
+            raise ValueError("conv_filters cannot be empty.")
+        kernel_sizes = self._align(self.kernel_sizes, n_layers)
+        pool_sizes = self._align(self.pool_sizes, n_layers)
+        dense_units = self._to_tuple(self.dense_units)
+
+        inp = keras.Input(shape=shape)
+        x = inp
+        for filters, kernel_size, pool_size in zip(conv_filters, kernel_sizes, pool_sizes):
+            x = layers.Conv1D(int(filters), int(kernel_size), padding="same", activation="relu")(x)
+            if self.use_batch_norm:
+                x = layers.BatchNormalization()(x)
+            if float(self.spatial_dropout) > 0:
+                x = layers.SpatialDropout1D(float(self.spatial_dropout))(x)
+            if pool_size is not None:
+                x = layers.MaxPooling1D(pool_size=int(pool_size))(x)
+
+        x = layers.GlobalAveragePooling1D()(x)
+        for units in dense_units:
+            x = layers.Dense(int(units), activation="relu")(x)
+            if float(self.dropout) > 0:
+                x = layers.Dropout(float(self.dropout))(x)
+        out = layers.Dense(n_classes, activation="softmax")(x)
+        model = keras.Model(inp, out)
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=float(self.learning_rate)),
+            loss="categorical_crossentropy",
+            metrics=["accuracy"],
+        )
+        return model
+
+    def fit(self, X: pd.DataFrame, y: Any) -> "KerasAugmentedCNN1DSequenceClassifier":
+        X_pad, seq_ids = self._pad(X)
+        y_seq = self._collapse_y(seq_ids, y)
+
+        self.le_ = LabelEncoder()
+        y_enc = self.le_.fit_transform(y_seq)
+        self.classes_ = self.le_.classes_
+        n_classes = len(self.classes_)
+
+        self.model_ = self._build((X_pad.shape[1], X_pad.shape[2]), n_classes)
+
+        rng = np.random.default_rng(int(self.random_state))
+        n = X_pad.shape[0]
+        idx = rng.permutation(n)
+        n_val = max(1, int(float(self.validation_fraction) * n)) if n > 3 else 1
+        val_idx = idx[:n_val]
+        train_idx = idx[n_val:]
+        if len(train_idx) == 0:
+            train_idx = idx
+            val_idx = idx[:1]
+
+        X_train, y_train = X_pad[train_idx], y_enc[train_idx]
+        X_val, y_val = X_pad[val_idx], y_enc[val_idx]
+
+        X_train, y_train = self._augment_hard_labels(X_train, y_train)
+        X_train, y_train = self._make_mixup(X_train, y_train, n_classes)
+        y_val = keras.utils.to_categorical(y_val, num_classes=n_classes).astype(np.float32)
+
+        self.history_ = self.model_.fit(
+            X_train,
+            y_train,
+            batch_size=int(self.batch_size),
+            epochs=int(self.epochs),
+            validation_data=(X_val, y_val),
+            callbacks=[keras.callbacks.EarlyStopping(patience=int(self.patience), restore_best_weights=True)],
+            verbose=int(self.verbose),
+            shuffle=True,
+        )
+        return self
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        check_is_fitted(self, ["model_", "le_"])
+        X_pad, _ = self._pad(X)
+        return self.model_.predict(X_pad, verbose=0)
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        proba = self.predict_proba(X)
+        return self.le_.inverse_transform(np.argmax(proba, axis=1))
+
+    def score(self, X: pd.DataFrame, y: Any) -> float:
+        _, seq_ids = self._pad(X)
+        y_seq = self._collapse_y(seq_ids, y)
+        preds = self.predict(X)
+        return f1_score(y_seq.to_numpy(), preds, average="macro")
