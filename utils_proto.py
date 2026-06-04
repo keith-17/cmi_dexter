@@ -472,6 +472,7 @@ class BinaryPlusGesturePrototypicalNetwork(ClassifierMixin, BaseEstimator):
 
     def get_params(self, deep=True):
         return {
+            'gesture_column': self.gesture_column,
             'n_way': self.n_way,
             'n_support': self.n_support,
             'n_query': self.n_query,
@@ -669,6 +670,13 @@ class BinaryPlusGesturePrototypicalNetwork(ClassifierMixin, BaseEstimator):
         y_gesture_encoded = y_gesture_encoded[[seq_ids.get_loc(sid) for sid in seq_order]]
         
         self.embedding_net_ = self._build_embedding_net((self.maxlen, X.shape[1]), len(self.gesture_classes_))
+        
+        # Create embedding extractor model
+        self.embedding_extractor_ = keras.Model(
+            inputs=self.embedding_net_.inputs,
+            outputs=self.embedding_net_.get_layer("embedding").output
+        )
+        
         self.embedding_net_.compile(
             optimizer=keras.optimizers.Adam(self.learning_rate),
             loss={"binary": "binary_crossentropy", "gesture": "sparse_categorical_crossentropy"},
@@ -678,6 +686,7 @@ class BinaryPlusGesturePrototypicalNetwork(ClassifierMixin, BaseEstimator):
         # Only use target sequences for prototype computation
         target_mask = y_gesture_encoded >= 0
         X_target = X_pad[target_mask]
+        y_binary_target = y_binary[target_mask]
         y_gesture_target = y_gesture_encoded[target_mask]
         
         gesture_classes = np.arange(len(self.gesture_classes_))
@@ -691,12 +700,13 @@ class BinaryPlusGesturePrototypicalNetwork(ClassifierMixin, BaseEstimator):
             epoch_loss = 0.0
             for _ in range(steps):
                 sup_x, sup_bin, sup_ges, qry_x, qry_bin, qry_ges, ep_classes = self._sample_episode(
-                    X_target, y_binary[target_mask], y_gesture_target, gesture_classes
+                    X_target, y_binary_target, y_gesture_target, gesture_classes
                 )
                 
                 with tf.GradientTape() as tape:
-                    sup_emb = self.embedding_net_.get_layer("embedding")(sup_x, training=True)
-                    qry_emb = self.embedding_net_.get_layer("embedding")(qry_x, training=True)
+                    # Get embeddings using the extractor model
+                    sup_emb = self.embedding_extractor_(sup_x, training=True)
+                    qry_emb = self.embedding_extractor_(qry_x, training=True)
                     
                     # Prototype loss for gesture
                     prototypes = tf.stack([tf.reduce_mean(sup_emb[sup_ges == c], axis=0) for c in ep_classes])
@@ -727,7 +737,7 @@ class BinaryPlusGesturePrototypicalNetwork(ClassifierMixin, BaseEstimator):
                     break
         
         # Store prototypes
-        all_emb = self.embedding_net_.get_layer("embedding")(X_target, training=False).numpy()
+        all_emb = self.embedding_extractor_(X_target, training=False).numpy()
         self.prototypes_ = np.array([
             np.mean(all_emb[y_gesture_target == c], axis=0) for c in range(len(self.gesture_classes_))
         ])
@@ -735,9 +745,9 @@ class BinaryPlusGesturePrototypicalNetwork(ClassifierMixin, BaseEstimator):
         return self
 
     def predict(self, X):
-        check_is_fitted(self, ["embedding_net_", "gesture_encoder_", "prototypes_"])
+        check_is_fitted(self, ["embedding_net_", "embedding_extractor_", "gesture_encoder_", "prototypes_"])
         X_pad, _ = self._pad(X)
-        emb = self.embedding_net_.get_layer("embedding")(X_pad, training=False).numpy()
+        emb = self.embedding_extractor_(X_pad, training=False).numpy()
         
         # Binary prediction
         binary_pred, _ = self.embedding_net_(X_pad, training=False)
