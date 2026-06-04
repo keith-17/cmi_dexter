@@ -717,7 +717,9 @@ class BinaryPlusGesturePrototypicalNetwork(ClassifierMixin, BaseEstimator):
                     
                     # Binary loss from head
                     binary_pred, gesture_pred = self.embedding_net_(sup_x, training=True)
-                    binary_loss = tf.reduce_mean(tf.keras.losses.binary_crossentropy(sup_bin, binary_pred))
+                    # Fix: squeeze binary_pred to match sup_bin shape
+                    binary_pred_squeezed = tf.squeeze(binary_pred, axis=-1)
+                    binary_loss = tf.reduce_mean(tf.keras.losses.binary_crossentropy(sup_bin, binary_pred_squeezed))
                     
                     total_loss = binary_loss + gesture_loss
                 
