@@ -1,451 +1,170 @@
-
-from sklearn.base import BaseEstimator, ClassifierMixin
-from sklearn.preprocessing import LabelEncoder
-from sklearn.utils.validation import check_is_fitted
+"""
+utils_proto.py
+Corrected Prototypical Network – works with pipeline (3D numpy array) or DataFrame.
+Compatible with base_utils.py SequenceExtractor.
+"""
+from __future__ import annotations
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
-
-
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.preprocessing import LabelEncoder
 from sklearn.utils.validation import check_is_fitted
-import numpy as np
-import pandas as pd
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
+from sklearn.metrics import f1_score, make_scorer
+from typing import Tuple, Dict, Any
+import warnings
+warnings.filterwarnings("ignore")
 
-
-class DynamicMultiHeadPrototypicalNetwork(ClassifierMixin, BaseEstimator):
+# ----------------------------------------------------------------------
+# Custom Scorer for Pipeline
+# ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Custom Scorer for Pipeline
+# ----------------------------------------------------------------------
+def make_competition_scorer(target_col='bfrb'):
     """
-    Dynamic multi-output Prototypical Network.
-    Specify which heads you want: e.g., heads = ["gesture_action", "orientation", "phase"]
-    Automatically builds lookup table from training data.
+    Custom scorer that handles the mismatch between row-level y_true
+    (from CV splitter) and sequence-level y_pred (from the model).
     """
+
+    def _score(y_true, y_pred):
+        # y_true is a row-level DataFrame. We need sequence-level labels.
+        if isinstance(y_true, pd.DataFrame):
+            y_true_seq = y_true.drop_duplicates(subset=['sequence_id']).sort_values('sequence_id')
+            y_true_binary = y_true_seq['is_target'].astype(int).values
+            y_true_gesture = y_true_seq[target_col].values
+        else:
+            # Fallback if y_true is somehow already sequence-level
+            y_true_binary = np.array(y_true)
+            y_true_gesture = np.array(y_true)
+
+        y_pred = np.array(y_pred)
+
+        # Binary F1 (target vs non-target)
+        # The model predicts 'non_bfrb' for non-targets
+        y_pred_binary = (y_pred != 'non_bfrb').astype(int)
+        binary_f1 = f1_score(y_true_binary, y_pred_binary, zero_division=0)
+
+        # Gesture Macro F1 (only target sequences)
+        target_mask = y_true_binary == 1
+        if target_mask.sum() > 0:
+            gesture_f1 = f1_score(
+                y_true_gesture[target_mask],
+                y_pred[target_mask],
+                average='macro',
+                zero_division=0
+            )
+        else:
+            gesture_f1 = 0.0
+
+        return (binary_f1 + gesture_f1) / 2
+
+    return make_scorer(_score, response_method='predict')
+
+
+# Default scorer for the 'bfrb' column
+competition_scorer = make_competition_scorer('bfrb')
+
+# Default scorer for the 'bfrb' column
+competition_scorer = make_competition_scorer('bfrb')
+
+# ----------------------------------------------------------------------
+# Encoder builder
+# ----------------------------------------------------------------------
+def build_encoder(
+    input_shape: Tuple[int, int],  # (maxlen, n_features)
+    conv_filters: str = "64-128",
+    kernel_sizes: str = "5-3",
+    pool_sizes: str = "none",
+    use_batch_norm: bool = True,
+    spatial_dropout: float = 0.1,
+    dense_units: str = "64",
+    dropout: float = 0.3,
+    embedding_dim: int = 128,
+) -> keras.Model:
+    tf.keras.backend.clear_session()
     
-    _estimator_type = "classifier"
-    
-    def __init__(
-        self,
-        heads=None,  # List of target columns: ["gesture_action", "orientation", "phase"]
-        primary_target="gesture",  # Target for final F1 score (e.g., "gesture", "gesture_action")
-        n_way=20,
-        n_support=5,
-        n_query=15,
-        backbone_type="1dcnn",
-        conv_filters="64",
-        kernel_sizes="5",
-        pool_sizes="none",
-        use_batch_norm=True,
-        spatial_dropout=0.1,
-        dense_units="64",
-        dropout=0.3,
-        embedding_dim=128,
-        distance="euclidean",
-        learning_rate=1e-3,
-        batch_size=32,
-        epochs=100,
-        patience=15,
-        maxlen=160,
-        padding_value=-999.0,
-        verbose=0,
-        random_state=42,
-    ):
-        self.heads = heads if heads is not None else ["gesture_action"]
-        self.primary_target = primary_target
-        self.n_way = n_way
-        self.n_support = n_support
-        self.n_query = n_query
-        self.backbone_type = backbone_type
-        self.conv_filters = conv_filters
-        self.kernel_sizes = kernel_sizes
-        self.pool_sizes = pool_sizes
-        self.use_batch_norm = use_batch_norm
-        self.spatial_dropout = spatial_dropout
-        self.dense_units = dense_units
-        self.dropout = dropout
-        self.embedding_dim = embedding_dim
-        self.distance = distance
-        self.learning_rate = learning_rate
-        self.batch_size = batch_size
-        self.epochs = epochs
-        self.patience = patience
-        self.maxlen = maxlen
-        self.padding_value = padding_value
-        self.verbose = verbose
-        self.random_state = random_state
-
-    def get_params(self, deep=True):
-        return {
-            'heads': self.heads,
-            'primary_target': self.primary_target,
-            'n_way': self.n_way,
-            'n_support': self.n_support,
-            'n_query': self.n_query,
-            'backbone_type': self.backbone_type,
-            'conv_filters': self.conv_filters,
-            'kernel_sizes': self.kernel_sizes,
-            'pool_sizes': self.pool_sizes,
-            'use_batch_norm': self.use_batch_norm,
-            'spatial_dropout': self.spatial_dropout,
-            'dense_units': self.dense_units,
-            'dropout': self.dropout,
-            'embedding_dim': self.embedding_dim,
-            'distance': self.distance,
-            'learning_rate': self.learning_rate,
-            'batch_size': self.batch_size,
-            'epochs': self.epochs,
-            'patience': self.patience,
-            'maxlen': self.maxlen,
-            'padding_value': self.padding_value,
-            'verbose': self.verbose,
-            'random_state': self.random_state,
-        }
-
-    def set_params(self, **params):
-        for k, v in params.items():
-            setattr(self, k, v)
-        return self
-
-    def _to_tuple(self, value):
-        if value is None:
-            return ()
-        if isinstance(value, str):
-            if value == "none":
+    def to_tuple(val):
+        if isinstance(val, str):
+            if val == "none":
                 return ()
-            return tuple(None if p == "none" else int(p) for p in value.split("-"))
-        if isinstance(value, tuple):
-            return value
-        return (value,)
+            return tuple(None if p == "none" else int(p) for p in val.split("-"))
+        return (val,) if not isinstance(val, tuple) else val
 
-    def _align(self, value, n):
-        value = self._to_tuple(value)
-        if len(value) == 0:
+    def align(val, n):
+        t = to_tuple(val)
+        if len(t) == 0:
             return (None,) * n
-        if len(value) == n:
-            return value
-        if len(value) == 1:
-            return value * n
-        if len(value) < n:
-            return value + (value[-1],) * (n - len(value))
-        return value[:n]
+        if len(t) == n:
+            return t
+        if len(t) == 1:
+            return t * n
+        if len(t) < n:
+            return t + (t[-1],) * (n - len(t))
+        return t[:n]
 
-    def _build_embedding_net(self, input_shape, head_dims):
-        tf.keras.backend.clear_session()
-        keras.utils.set_random_seed(self.random_state)
-        
-        inp = keras.Input(shape=input_shape)
-        x = inp
-        
-        if self.backbone_type == "1dcnn":
-            filters = self._to_tuple(self.conv_filters)
-            n_layers = max(1, len(filters))
-            kernels = self._align(self.kernel_sizes, n_layers)
-            pools = self._align(self.pool_sizes, n_layers)
-            
-            for f, k, p in zip(filters, kernels, pools):
-                x = layers.Conv1D(int(f), int(k), padding="same", activation="relu")(x)
-                if self.use_batch_norm:
-                    x = layers.BatchNormalization()(x)
-                if self.spatial_dropout > 0:
-                    x = layers.SpatialDropout1D(self.spatial_dropout)(x)
-                if p is not None:
-                    x = layers.MaxPooling1D(int(p))(x)
-            x = layers.GlobalAveragePooling1D()(x)
-        else:
-            x = layers.Reshape((input_shape[0], input_shape[1], 1))(inp)
-            filters = self._to_tuple(self.conv_filters)
-            n_layers = max(1, len(filters))
-            kernels = self._align(self.kernel_sizes, n_layers)
-            pools = self._align(self.pool_sizes, n_layers)
-            for f, k, p in zip(filters, kernels, pools):
-                x = layers.Conv2D(int(f), (int(k), int(k)), padding="same", activation="relu")(x)
-                if self.use_batch_norm:
-                    x = layers.BatchNormalization()(x)
-                if self.spatial_dropout > 0:
-                    x = layers.SpatialDropout2D(self.spatial_dropout)(x)
-                if p is not None:
-                    x = layers.MaxPooling2D((int(p), int(p)))(x)
-            x = layers.GlobalAveragePooling2D()(x)
-        
-        dense_units = self._to_tuple(self.dense_units)
-        for units in dense_units:
-            x = layers.Dense(int(units), activation="relu")(x)
-            if self.dropout > 0:
-                x = layers.Dropout(self.dropout)(x)
-        
-        embedding = layers.Dense(self.embedding_dim, name="embedding")(x)
-        
-        outputs = []
-        for head in self.heads:
-            out = layers.Dense(head_dims[head], activation="softmax", name=head)(embedding)
-            outputs.append(out)
-        
-        return keras.Model(inp, outputs)
+    inp = keras.Input(shape=input_shape, name="input")
+    x = inp
 
-    def _distance(self, z_proto, z_query):
-        if self.distance == "euclidean":
-            return tf.reduce_sum((z_proto[:, None] - z_query[None, :]) ** 2, axis=2)
-        else:
-            proto_norm = tf.nn.l2_normalize(z_proto, axis=-1)
-            query_norm = tf.nn.l2_normalize(z_query, axis=-1)
-            return 1.0 - tf.matmul(proto_norm, query_norm, transpose_b=True)
+    filters_list = to_tuple(conv_filters)
+    n_layers = max(1, len(filters_list))
+    kernels = align(kernel_sizes, n_layers)
+    pools = align(pool_sizes, n_layers)
 
-    def _pad(self, X):
-        grouped = list(X.groupby(level=0, sort=False))
-        n_seq = len(grouped)
-        n_feat = X.shape[1]
-        X_pad = np.full((n_seq, self.maxlen, n_feat), self.padding_value, dtype=np.float32)
-        seq_order = []
-        for i, (sid, g) in enumerate(grouped):
-            arr = g.to_numpy(dtype=np.float32)
-            length = min(len(arr), self.maxlen)
-            X_pad[i, :length] = arr[:length]
-            seq_order.append(sid)
-        return X_pad, seq_order
+    for f, k, p in zip(filters_list, kernels, pools):
+        x = layers.Conv1D(int(f), int(k), padding="same", activation="relu")(x)
+        if use_batch_norm:
+            x = layers.BatchNormalization()(x)
+        if spatial_dropout > 0:
+            x = layers.SpatialDropout1D(spatial_dropout)(x)
+        if p is not None:
+            x = layers.MaxPooling1D(int(p))(x)
 
-    def _sample_episode(self, X, y_dict, classes_dict):
-        # Pick random classes for each head independently
-        episode_classes = {}
-        for head in self.heads:
-            episode_classes[head] = np.random.choice(classes_dict[head], size=self.n_way, replace=False)
-        
-        support_x, query_x = [], []
-        support_y = {head: [] for head in self.heads}
-        query_y = {head: [] for head in self.heads}
-        
-        for i in range(self.n_way):
-            # Try to find indices where ALL heads match
-            mask = np.ones(len(y_dict[self.heads[0]]), dtype=bool)
-            for head in self.heads:
-                mask &= (y_dict[head] == episode_classes[head][i])
-            idx = np.where(mask)[0]
-            
-            # Fallback: use first head only if no match
-            if len(idx) < self.n_support + self.n_query:
-                mask = (y_dict[self.heads[0]] == episode_classes[self.heads[0]][i])
-                idx = np.where(mask)[0]
-            
-            if len(idx) < self.n_support + self.n_query:
-                idx = np.tile(idx, (self.n_support + self.n_query + len(idx) - 1) // len(idx))[:self.n_support + self.n_query]
-            
-            np.random.shuffle(idx)
-            support_x.append(X[idx[:self.n_support]])
-            for head in self.heads:
-                support_y[head].extend([episode_classes[head][i]] * self.n_support)
-            
-            query_x.append(X[idx[self.n_support:self.n_support + self.n_query]])
-            for head in self.heads:
-                query_y[head].extend([episode_classes[head][i]] * self.n_query)
-        
-        support_x = np.concatenate(support_x)
-        query_x = np.concatenate(query_x)
-        for head in self.heads:
-            support_y[head] = np.array(support_y[head])
-            query_y[head] = np.array(query_y[head])
-        
-        return support_x, support_y, query_x, query_y, episode_classes
+    x = layers.GlobalAveragePooling1D()(x)
 
-    def fit(self, X, y):
-        # Process multi-output labels
-        if isinstance(y, pd.DataFrame):
-            y_encoded = {}
-            classes_dict = {}
-            self.label_encoders_ = {}
-            
-            for head in self.heads:
-                if head not in y.columns:
-                    raise ValueError(f"Head '{head}' not found in y columns")
-                y_head = y.drop_duplicates("sequence_id").set_index("sequence_id")[head]
-                le = LabelEncoder()
-                y_encoded[head] = le.fit_transform(y_head)
-                self.label_encoders_[head] = le
-                classes_dict[head] = le.classes_
-        else:
-            raise ValueError("y must be DataFrame for multi-output")
-        
-        seq_ids = X.index.unique()
-        for head in self.heads:
-            y_encoded[head] = y_encoded[head].reindex(seq_ids)
-            if y_encoded[head].isna().any():
-                raise ValueError(f"Missing labels for head: {head}")
-        
-        X_pad, seq_order = self._pad(X)
-        for head in self.heads:
-            y_encoded[head] = y_encoded[head].reindex(pd.Index(seq_order)).to_numpy()
-        
-        head_dims = {head: len(self.label_encoders_[head].classes_) for head in self.heads}
-        self.embedding_net_ = self._build_embedding_net((self.maxlen, X.shape[1]), head_dims)
-        
-        losses = {head: 'sparse_categorical_crossentropy' for head in self.heads}
-        self.embedding_net_.compile(optimizer=keras.optimizers.Adam(self.learning_rate), loss=losses)
-        
-        classes_dict = {head: np.arange(len(self.label_encoders_[head].classes_)) for head in self.heads}
-        
-        optimizer = keras.optimizers.Adam(self.learning_rate)
-        steps = max(1, len(X_pad) // self.batch_size)
-        best_loss = np.inf
-        patience_counter = 0
-        
-        for epoch in range(self.epochs):
-            epoch_loss = 0.0
-            for _ in range(steps):
-                sup_x, sup_y, qry_x, qry_y, ep_classes = self._sample_episode(X_pad, y_encoded, classes_dict)
-                
-                with tf.GradientTape() as tape:
-                    all_emb = self.embedding_net_(sup_x, training=True)
-                    sup_emb = all_emb[-len(self.heads)]  # embedding is last output? Actually embedding is first
-                    # Re-arrange: embedding_net outputs [embedding, head1, head2, ...]
-                    # Need to get embedding correctly
-                    sup_emb = self.embedding_net_.get_layer("embedding")(sup_x, training=True)
-                    qry_emb = self.embedding_net_.get_layer("embedding")(qry_x, training=True)
-                    
-                    total_loss = 0.0
-                    for head in self.heads:
-                        ep_classes_head = ep_classes[head]
-                        sup_y_head = sup_y[head]
-                        qry_y_head = qry_y[head]
-                        
-                        prototypes = tf.stack([tf.reduce_mean(sup_emb[sup_y_head == c], axis=0) for c in ep_classes_head])
-                        dist = self._distance(prototypes, qry_emb)
-                        loss = tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(
-                            labels=qry_y_head, logits=tf.transpose(-dist)
-                        ))
-                        total_loss += loss
-                    
-                    # Add supervised losses from heads
-                    head_outputs = self.embedding_net_(sup_x, training=True)
-                    for idx, head in enumerate(self.heads):
-                        total_loss += tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(
-                            labels=sup_y[head], logits=head_outputs[idx]
-                        ))
-                
-                grads = tape.gradient(total_loss, self.embedding_net_.trainable_variables)
-                optimizer.apply_gradients(zip(grads, self.embedding_net_.trainable_variables))
-                epoch_loss += total_loss.numpy()
-            
-            epoch_loss /= steps
-            if self.verbose:
-                print(f"Epoch {epoch+1}/{self.epochs}, loss: {epoch_loss:.4f}")
-            if epoch_loss < best_loss:
-                best_loss = epoch_loss
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= self.patience:
-                    break
-        
-        # Store prototypes for each head
-        all_emb = self.embedding_net_.get_layer("embedding")(X_pad, training=False).numpy()
-        self.prototypes_ = {}
-        for head in self.heads:
-            self.prototypes_[head] = np.array([
-                np.mean(all_emb[y_encoded[head] == c], axis=0) for c in range(len(self.label_encoders_[head].classes_))
-            ])
-        
-        # Build lookup table for primary target
-        if self.primary_target in train_df.columns:
-            cols = [self.primary_target] + self.heads
-            self.lookup_table_ = train_df[train_df["sequence_type"] == "Target"][cols].drop_duplicates().reset_index(drop=True)
-        else:
-            self.lookup_table_ = None
-        
-        return self
+    dense_list = to_tuple(dense_units)
+    for units in dense_list:
+        x = layers.Dense(int(units), activation="relu")(x)
+        if dropout > 0:
+            x = layers.Dropout(dropout)(x)
 
-    def predict(self, X):
-        check_is_fitted(self, ["embedding_net_", "label_encoders_", "prototypes_"])
-        X_pad, _ = self._pad(X)
-        emb = self.embedding_net_.get_layer("embedding")(X_pad, training=False).numpy()
-        
-        # Predict each head
-        preds = {}
-        for head in self.heads:
-            dist = self._distance(self.prototypes_[head], emb)
-            preds[head] = self.label_encoders_[head].inverse_transform(np.argmin(dist, axis=0))
-        
-        # If we have a lookup table, decode to primary target
-        if self.lookup_table_ is not None and self.primary_target in self.lookup_table_.columns:
-            decoded = []
-            for i in range(len(preds[self.heads[0]])):
-                # Build filter
-                mask = True
-                for head in self.heads:
-                    mask &= (self.lookup_table_[head] == preds[head][i])
-                matches = self.lookup_table_[mask]
-                if len(matches) > 0:
-                    decoded.append(matches.iloc[0][self.primary_target])
-                else:
-                    # Fallback: concatenate
-                    decoded.append(" | ".join([f"{preds[head][i]}" for head in self.heads]))
-            return np.array(decoded)
-        
-        # Otherwise return first head
-        return preds[self.heads[0]]
+    embedding = layers.Dense(embedding_dim, name="embedding")(x)
+    embedding = layers.Lambda(lambda t: tf.math.l2_normalize(t, axis=-1))(embedding)
+    return keras.Model(inp, embedding, name="encoder")
 
-    def predict_all(self, X):
-        """Return all head predictions"""
-        check_is_fitted(self, ["embedding_net_", "label_encoders_", "prototypes_"])
-        X_pad, _ = self._pad(X)
-        emb = self.embedding_net_.get_layer("embedding")(X_pad, training=False).numpy()
-        
-        result = {}
-        for head in self.heads:
-            dist = self._distance(self.prototypes_[head], emb)
-            result[head] = self.label_encoders_[head].inverse_transform(np.argmin(dist, axis=0))
-        return result
 
-    def score(self, X, y):
-        from sklearn.metrics import f1_score
-        y_pred = self.predict(X)
-        if isinstance(y, pd.DataFrame):
-            if self.primary_target in y.columns:
-                y_true = y.drop_duplicates("sequence_id").set_index("sequence_id")[self.primary_target]
-            else:
-                y_true = y.drop_duplicates("sequence_id").set_index("sequence_id")[y.columns[0]]
-            y_true = y_true.reindex(X.index.unique())
-        else:
-            y_true = pd.Series(y)
-        return f1_score(y_true, y_pred, average="macro")
-    
-
+# ----------------------------------------------------------------------
+# Single‑head prototypical network
+# ----------------------------------------------------------------------
 class BinaryPlusGesturePrototypicalNetwork(ClassifierMixin, BaseEstimator):
-    """
-    Prototypical Network with two heads:
-    - Binary: target (1) vs non-target (0)
-    - Gesture: pinch skin, pull hair, pull hairline, scratch (only for target sequences)
-    
-    Competition metric = (binary_f1 + gesture_macro_f1) / 2
-    """
-    
     _estimator_type = "classifier"
     
     def __init__(
         self,
-        gesture_column="gesture",
-        n_way=20,
-        n_support=5,
-        n_query=15,
-        backbone_type="1dcnn",
-        conv_filters="64",
-        kernel_sizes="5",
-        pool_sizes="none",
-        use_batch_norm=True,
-        spatial_dropout=0.1,
-        dense_units="64",
-        dropout=0.3,
-        embedding_dim=128,
-        distance="euclidean",
-        learning_rate=1e-3,
-        batch_size=32,
-        epochs=100,
-        patience=15,
-        maxlen=160,
-        padding_value=-999.0,
-        verbose=0,
-        random_state=42,
+        gesture_column: str = "bfrb",
+        n_way: int = 20,
+        n_support: int = 5,
+        n_query: int = 15,
+        backbone_type: str = "1dcnn",
+        conv_filters: str = "64-128",
+        kernel_sizes: str = "5-3",
+        pool_sizes: str = "none",
+        use_batch_norm: bool = True,
+        spatial_dropout: float = 0.1,
+        dense_units: str = "64",
+        dropout: float = 0.3,
+        embedding_dim: int = 128,
+        distance: str = "euclidean",
+        learning_rate: float = 1e-3,
+        batch_size: int = 32,
+        epochs: int = 100,
+        patience: int = 15,
+        maxlen: int = 160,
+        padding_value: float = -999.0,
+        verbose: int = 0,
+        random_state: int = 42,
     ):
         self.gesture_column = gesture_column
         self.n_way = n_way
@@ -471,329 +190,271 @@ class BinaryPlusGesturePrototypicalNetwork(ClassifierMixin, BaseEstimator):
         self.random_state = random_state
 
     def get_params(self, deep=True):
-        return {
-            'gesture_column': self.gesture_column,
-            'n_way': self.n_way,
-            'n_support': self.n_support,
-            'n_query': self.n_query,
-            'backbone_type': self.backbone_type,
-            'conv_filters': self.conv_filters,
-            'kernel_sizes': self.kernel_sizes,
-            'pool_sizes': self.pool_sizes,
-            'use_batch_norm': self.use_batch_norm,
-            'spatial_dropout': self.spatial_dropout,
-            'dense_units': self.dense_units,
-            'dropout': self.dropout,
-            'embedding_dim': self.embedding_dim,
-            'distance': self.distance,
-            'learning_rate': self.learning_rate,
-            'batch_size': self.batch_size,
-            'epochs': self.epochs,
-            'patience': self.patience,
-            'maxlen': self.maxlen,
-            'padding_value': self.padding_value,
-            'verbose': self.verbose,
-            'random_state': self.random_state,
-        }
+        return {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
 
     def set_params(self, **params):
         for k, v in params.items():
             setattr(self, k, v)
         return self
 
-    def _to_tuple(self, value):
-        if value is None:
-            return ()
-        if isinstance(value, str):
-            if value == "none":
-                return ()
-            return tuple(None if p == "none" else int(p) for p in value.split("-"))
-        if isinstance(value, tuple):
-            return value
-        return (value,)
-
-    def _align(self, value, n):
-        value = self._to_tuple(value)
-        if len(value) == 0:
-            return (None,) * n
-        if len(value) == n:
-            return value
-        if len(value) == 1:
-            return value * n
-        if len(value) < n:
-            return value + (value[-1],) * (n - len(value))
-        return value[:n]
-
-    def _build_embedding_net(self, input_shape, n_gesture_classes):
-        tf.keras.backend.clear_session()
-        keras.utils.set_random_seed(self.random_state)
-        
-        inp = keras.Input(shape=input_shape)
-        x = inp
-        
-        if self.backbone_type == "1dcnn":
-            filters = self._to_tuple(self.conv_filters)
-            n_layers = max(1, len(filters))
-            kernels = self._align(self.kernel_sizes, n_layers)
-            pools = self._align(self.pool_sizes, n_layers)
-            
-            for f, k, p in zip(filters, kernels, pools):
-                x = layers.Conv1D(int(f), int(k), padding="same", activation="relu")(x)
-                if self.use_batch_norm:
-                    x = layers.BatchNormalization()(x)
-                if self.spatial_dropout > 0:
-                    x = layers.SpatialDropout1D(self.spatial_dropout)(x)
-                if p is not None:
-                    x = layers.MaxPooling1D(int(p))(x)
-            x = layers.GlobalAveragePooling1D()(x)
+    # ------------------------------------------------------------------
+    # Accept both DataFrame (row‑level) and pre‑padded numpy array
+    # ------------------------------------------------------------------
+    def _prepare_X(self, X):
+        """Convert X to padded numpy array (n_seq, maxlen, n_feat) if needed."""
+        if isinstance(X, np.ndarray) and X.ndim == 3:
+            return X, None
+        elif isinstance(X, pd.DataFrame):
+            grouped = list(X.groupby(level=0, sort=False))
+            n_seq = len(grouped)
+            n_feat = X.shape[1]
+            out = np.full((n_seq, self.maxlen, n_feat), self.padding_value, dtype=np.float32)
+            seq_ids = []
+            for i, (sid, g) in enumerate(grouped):
+                arr = g.to_numpy(dtype=np.float32)
+                length = min(len(arr), self.maxlen)
+                out[i, :length] = arr[:length]
+                seq_ids.append(sid)
+            return out, pd.Series(seq_ids, name="sequence_id")
         else:
-            x = layers.Reshape((input_shape[0], input_shape[1], 1))(inp)
-            filters = self._to_tuple(self.conv_filters)
-            n_layers = max(1, len(filters))
-            kernels = self._align(self.kernel_sizes, n_layers)
-            pools = self._align(self.pool_sizes, n_layers)
-            for f, k, p in zip(filters, kernels, pools):
-                x = layers.Conv2D(int(f), (int(k), int(k)), padding="same", activation="relu")(x)
-                if self.use_batch_norm:
-                    x = layers.BatchNormalization()(x)
-                if self.spatial_dropout > 0:
-                    x = layers.SpatialDropout2D(self.spatial_dropout)(x)
-                if p is not None:
-                    x = layers.MaxPooling2D((int(p), int(p)))(x)
-            x = layers.GlobalAveragePooling2D()(x)
-        
-        dense_units = self._to_tuple(self.dense_units)
-        for units in dense_units:
-            x = layers.Dense(int(units), activation="relu")(x)
-            if self.dropout > 0:
-                x = layers.Dropout(self.dropout)(x)
-        
-        embedding = layers.Dense(self.embedding_dim, name="embedding")(x)
-        
-        binary_output = layers.Dense(1, activation="sigmoid", name="binary")(embedding)
-        gesture_output = layers.Dense(n_gesture_classes, activation="softmax", name="gesture")(embedding)
-        
-        return keras.Model(inp, outputs=[binary_output, gesture_output])
+            raise TypeError("X must be a DataFrame (row‑level) or 3D numpy array (padded sequences).")
 
-    def _distance(self, z_proto, z_query):
-        if self.distance == "euclidean":
-            return tf.reduce_sum((z_proto[:, None] - z_query[None, :]) ** 2, axis=2)
-        else:
-            proto_norm = tf.nn.l2_normalize(z_proto, axis=-1)
-            query_norm = tf.nn.l2_normalize(z_query, axis=-1)
-            return 1.0 - tf.matmul(proto_norm, query_norm, transpose_b=True)
-
-    def _pad(self, X):
-        grouped = list(X.groupby(level=0, sort=False))
-        n_seq = len(grouped)
-        n_feat = X.shape[1]
-        X_pad = np.full((n_seq, self.maxlen, n_feat), self.padding_value, dtype=np.float32)
-        seq_order = []
-        for i, (sid, g) in enumerate(grouped):
-            arr = g.to_numpy(dtype=np.float32)
-            length = min(len(arr), self.maxlen)
-            X_pad[i, :length] = arr[:length]
-            seq_order.append(sid)
-        return X_pad, seq_order
-
-    def _sample_episode(self, X, y_binary, y_gesture, gesture_classes):
-        # Sample episodes using gesture classes only (binary is determined by gesture)
-        episode_classes = np.random.choice(gesture_classes, size=self.n_way, replace=False)
-        
-        support_x, query_x = [], []
-        support_binary, support_gesture = [], []
-        query_binary, query_gesture = [], []
-        
-        for cls in episode_classes:
-            idx = np.where(y_gesture == cls)[0]
-            np.random.shuffle(idx)
-            
-            if len(idx) < self.n_support + self.n_query:
-                idx = np.tile(idx, (self.n_support + self.n_query + len(idx) - 1) // len(idx))[:self.n_support + self.n_query]
-            
-            support_x.append(X[idx[:self.n_support]])
-            support_binary.extend([1] * self.n_support)
-            support_gesture.extend([cls] * self.n_support)
-            
-            query_x.append(X[idx[self.n_support:self.n_support + self.n_query]])
-            query_binary.extend([1] * self.n_query)
-            query_gesture.extend([cls] * self.n_query)
-        
-        # Also add non-target examples (binary=0)
-        non_target_idx = np.where(y_binary == 0)[0]
-        if len(non_target_idx) > 0:
-            np.random.shuffle(non_target_idx)
-            n_non_target = min(len(non_target_idx), self.n_support + self.n_query)
-            non_target_sample = non_target_idx[:n_non_target]
-            support_x.append(X[non_target_sample[:self.n_support]])
-            support_binary.extend([0] * min(self.n_support, len(non_target_sample)))
-            support_gesture.extend([-1] * min(self.n_support, len(non_target_sample)))
-            
-            if len(non_target_sample) > self.n_support:
-                query_x.append(X[non_target_sample[self.n_support:self.n_support + self.n_query]])
-                query_binary.extend([0] * min(self.n_query, len(non_target_sample) - self.n_support))
-                query_gesture.extend([-1] * min(self.n_query, len(non_target_sample) - self.n_support))
-        
-        support_x = np.concatenate(support_x)
-        query_x = np.concatenate(query_x)
-        
-        return (support_x, np.array(support_binary), np.array(support_gesture),
-                query_x, np.array(query_binary), np.array(query_gesture), episode_classes)
-
-    def fit(self, X, y):
-        # y should have columns: sequence_id, is_target, gesture
+    def _prepare_y(self, y, seq_ids=None):
+        """Convert y to 1D label array (one per sequence)."""
         if isinstance(y, pd.DataFrame):
-            y_binary = y.drop_duplicates("sequence_id").set_index("sequence_id")["is_target"]
-            y_gesture = y.drop_duplicates("sequence_id").set_index("sequence_id")[self.gesture_column]
+            if seq_ids is not None:
+                y_df = y.drop_duplicates("sequence_id").set_index("sequence_id")
+                y_combined = []
+                for sid in seq_ids:
+                    row = y_df.loc[sid]
+                    if row["is_target"]:
+                        y_combined.append(row[self.gesture_column])
+                    else:
+                        y_combined.append("non_bfrb") # FIXED: was "non_target"
+                return pd.Series(y_combined)
+            else:
+                if "sequence_id" in y.columns:
+                    y_df = y.drop_duplicates("sequence_id").sort_values("sequence_id")
+                    y_combined = []
+                    for _, row in y_df.iterrows():
+                        if row["is_target"]:
+                            y_combined.append(row[self.gesture_column])
+                        else:
+                            y_combined.append("non_bfrb") # FIXED: was "non_target"
+                    return pd.Series(y_combined)
+                else:
+                    y_combined = []
+                    for _, row in y.iterrows():
+                        if "is_target" in row and row["is_target"]:
+                            y_combined.append(row.get(self.gesture_column, "non_bfrb"))
+                        else:
+                            y_combined.append("non_bfrb") # FIXED: was "non_target"
+                    return pd.Series(y_combined)
         else:
-            raise ValueError("y must be DataFrame with 'is_target' and 'gesture' columns")
-        
-        seq_ids = X.index.unique()
-        y_binary = y_binary.reindex(seq_ids)
-        y_gesture = y_gesture.reindex(seq_ids)
-        
-        # Encode gesture labels (non-target gets -1, we'll handle separately)
-        self.gesture_encoder_ = LabelEncoder()
-        # Only fit on target gestures
-        target_gestures = y_gesture[y_gesture != "non_target"].dropna().unique()
-        self.gesture_encoder_.fit(target_gestures)
-        self.gesture_classes_ = self.gesture_encoder_.classes_
-        
-        # Convert to numeric
-        y_binary = y_binary.fillna(0).astype(int).to_numpy()
-        y_gesture_encoded = np.full(len(y_gesture), -1, dtype=int)
-        mask_target = y_gesture.isin(self.gesture_classes_)
-        y_gesture_encoded[mask_target] = self.gesture_encoder_.transform(y_gesture[mask_target])
-        
-        X_pad, seq_order = self._pad(X)
-        y_binary = y_binary[[seq_ids.get_loc(sid) for sid in seq_order]]
-        y_gesture_encoded = y_gesture_encoded[[seq_ids.get_loc(sid) for sid in seq_order]]
-        
-        self.embedding_net_ = self._build_embedding_net((self.maxlen, X.shape[1]), len(self.gesture_classes_))
-        
-        # Create embedding extractor model
-        self.embedding_extractor_ = keras.Model(
-            inputs=self.embedding_net_.inputs,
-            outputs=self.embedding_net_.get_layer("embedding").output
+            return pd.Series(y)
+
+    # ------------------------------------------------------------------
+    # Episode sampling
+    # ------------------------------------------------------------------
+    def _sample_episode(
+        self, X: np.ndarray, y_enc: np.ndarray, class_indices: Dict[int, np.ndarray]
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        available = [c for c, idx in class_indices.items() if len(idx) >= self.n_support + self.n_query]
+        if len(available) < self.n_way:
+            available = list(class_indices.keys())
+        episode_classes = np.random.choice(available, self.n_way, replace=False)
+
+        support_x, support_y = [], []
+        query_x, query_y = [], []
+
+        for local_label, cls in enumerate(episode_classes):
+            pool = class_indices[cls].copy()
+            np.random.shuffle(pool)
+            need = self.n_support + self.n_query
+            if len(pool) < need:
+                pool = np.tile(pool, (need + len(pool) - 1) // len(pool))[:need]
+
+            support_idx = pool[:self.n_support]
+            query_idx = pool[self.n_support:self.n_support + self.n_query]
+
+            support_x.append(X[support_idx])
+            support_y.extend([local_label] * self.n_support)
+            query_x.append(X[query_idx])
+            query_y.extend([local_label] * self.n_query)
+
+        support_x = np.concatenate(support_x, axis=0)
+        query_x = np.concatenate(query_x, axis=0)
+        support_y = np.array(support_y, dtype=np.int32)
+        query_y = np.array(query_y, dtype=np.int32)
+        return support_x, support_y, query_x, query_y
+
+    # ------------------------------------------------------------------
+    # Prototypical loss
+    # ------------------------------------------------------------------
+    @staticmethod
+    def prototypical_loss(
+        support_emb: tf.Tensor, support_labels: tf.Tensor,
+        query_emb: tf.Tensor, query_labels: tf.Tensor,
+        n_way: int, distance: str
+    ) -> tf.Tensor:
+        prototypes = tf.stack([
+            tf.reduce_mean(tf.boolean_mask(support_emb, tf.equal(support_labels, c)), axis=0)
+            for c in range(n_way)
+        ])
+        if distance == "euclidean":
+            dist = tf.reduce_sum((tf.expand_dims(query_emb, 1) - tf.expand_dims(prototypes, 0)) ** 2, axis=2)
+        else:
+            q_norm = tf.math.l2_normalize(query_emb, axis=-1)
+            p_norm = tf.math.l2_normalize(prototypes, axis=-1)
+            dist = 1.0 - tf.matmul(q_norm, p_norm, transpose_b=True)
+        log_p = tf.nn.log_softmax(-dist, axis=-1)
+        loss = -tf.reduce_mean(tf.gather(log_p, query_labels, batch_dims=1))
+        return loss
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+    def fit(self, X, y):
+        X_pad, seq_ids = self._prepare_X(X)
+        y_series = self._prepare_y(y, seq_ids)
+
+        self.label_encoder_ = LabelEncoder()
+        y_enc = self.label_encoder_.fit_transform(y_series)
+        self.classes_ = self.label_encoder_.classes_
+
+        class_indices = {c: np.where(y_enc == c)[0] for c in range(len(self.classes_))}
+        n_way_actual = min(self.n_way, len(self.classes_))
+
+        # Dynamically use X_pad.shape[1] to match the sequence length output by SequenceExtractor
+        input_shape = (X_pad.shape[1], X_pad.shape[2])
+        self.encoder_ = build_encoder(
+            input_shape,
+            conv_filters=self.conv_filters,
+            kernel_sizes=self.kernel_sizes,
+            pool_sizes=self.pool_sizes,
+            use_batch_norm=self.use_batch_norm,
+            spatial_dropout=self.spatial_dropout,
+            dense_units=self.dense_units,
+            dropout=self.dropout,
+            embedding_dim=self.embedding_dim,
         )
-        
-        self.embedding_net_.compile(
-            optimizer=keras.optimizers.Adam(self.learning_rate),
-            loss={"binary": "binary_crossentropy", "gesture": "sparse_categorical_crossentropy"},
-            loss_weights={"binary": 1.0, "gesture": 1.0}
-        )
-        
-        # Only use target sequences for prototype computation
-        target_mask = y_gesture_encoded >= 0
-        X_target = X_pad[target_mask]
-        y_binary_target = y_binary[target_mask]
-        y_gesture_target = y_gesture_encoded[target_mask]
-        
-        gesture_classes = np.arange(len(self.gesture_classes_))
-        
-        optimizer = keras.optimizers.Adam(self.learning_rate)
-        steps = max(1, len(X_target) // self.batch_size)
+        optimizer = keras.optimizers.Adam(learning_rate=self.learning_rate)
+
         best_loss = np.inf
         patience_counter = 0
-        
+        steps_per_epoch = max(1, len(X_pad) // self.batch_size)
+
         for epoch in range(self.epochs):
             epoch_loss = 0.0
-            for _ in range(steps):
-                sup_x, sup_bin, sup_ges, qry_x, qry_bin, qry_ges, ep_classes = self._sample_episode(
-                    X_target, y_binary_target, y_gesture_target, gesture_classes
-                )
-                
+            for _ in range(steps_per_epoch):
+                sup_x, sup_y, qry_x, qry_y = self._sample_episode(X_pad, y_enc, class_indices)
                 with tf.GradientTape() as tape:
-                    # Get embeddings using the extractor model
-                    sup_emb = self.embedding_extractor_(sup_x, training=True)
-                    qry_emb = self.embedding_extractor_(qry_x, training=True)
-                    
-                    # Prototype loss for gesture
-                    prototypes = tf.stack([tf.reduce_mean(sup_emb[sup_ges == c], axis=0) for c in ep_classes])
-                    dist = self._distance(prototypes, qry_emb)
-                    gesture_loss = tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(
-                        labels=qry_ges, logits=tf.transpose(-dist)
-                    ))
-                    
-                    # Binary loss from head
-                    binary_pred, gesture_pred = self.embedding_net_(sup_x, training=True)
-                    # Fix: squeeze binary_pred to match sup_bin shape
-                    binary_pred_squeezed = tf.squeeze(binary_pred, axis=-1)
-                    binary_loss = tf.reduce_mean(tf.keras.losses.binary_crossentropy(sup_bin, binary_pred_squeezed))
-                    
-                    total_loss = binary_loss + gesture_loss
-                
-                grads = tape.gradient(total_loss, self.embedding_net_.trainable_variables)
-                optimizer.apply_gradients(zip(grads, self.embedding_net_.trainable_variables))
-                epoch_loss += total_loss.numpy()
-            
-            epoch_loss /= steps
+                    sup_emb = self.encoder_(sup_x, training=True)
+                    qry_emb = self.encoder_(qry_x, training=True)
+                    loss = self.prototypical_loss(sup_emb, sup_y, qry_emb, qry_y, n_way_actual, self.distance)
+                grads = tape.gradient(loss, self.encoder_.trainable_variables)
+                optimizer.apply_gradients(zip(grads, self.encoder_.trainable_variables))
+                epoch_loss += loss.numpy()
+            epoch_loss /= steps_per_epoch
             if self.verbose:
-                print(f"Epoch {epoch+1}/{self.epochs}, loss: {epoch_loss:.4f}")
+                print(f"Epoch {epoch+1}/{self.epochs} - loss: {epoch_loss:.4f}")
+
             if epoch_loss < best_loss:
                 best_loss = epoch_loss
                 patience_counter = 0
             else:
                 patience_counter += 1
                 if patience_counter >= self.patience:
+                    if self.verbose:
+                        print(f"Early stopping at epoch {epoch+1}")
                     break
-        
-        # Store prototypes
-        all_emb = self.embedding_extractor_(X_target, training=False).numpy()
+
+        all_emb = self.encoder_.predict(X_pad, verbose=0)
         self.prototypes_ = np.array([
-            np.mean(all_emb[y_gesture_target == c], axis=0) for c in range(len(self.gesture_classes_))
+            np.mean(all_emb[y_enc == c], axis=0) for c in range(len(self.classes_))
         ])
-        
+        norms = np.linalg.norm(self.prototypes_, axis=1, keepdims=True)
+        self.prototypes_ = self.prototypes_ / (norms + 1e-8)
+        return self
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
+    def fit_support(self, X_support, y_support):
+        X_pad, seq_ids = self._prepare_X(X_support)
+        y_series = self._prepare_y(y_support, seq_ids)
+        y_enc = self.label_encoder_.transform(y_series)
+        emb = self.encoder_.predict(X_pad, verbose=0)
+        self.prototypes_ = np.array([
+            np.mean(emb[y_enc == c], axis=0) for c in range(len(self.classes_))
+        ])
+        norms = np.linalg.norm(self.prototypes_, axis=1, keepdims=True)
+        self.prototypes_ = self.prototypes_ / (norms + 1e-8)
         return self
 
     def predict(self, X):
-        check_is_fitted(self, ["embedding_net_", "embedding_extractor_", "gesture_encoder_", "prototypes_"])
-        X_pad, _ = self._pad(X)
-        emb = self.embedding_extractor_(X_pad, training=False).numpy()
-        
-        # Binary prediction
-        binary_pred, _ = self.embedding_net_(X_pad, training=False)
-        binary_class = (binary_pred.numpy().flatten() > 0.5).astype(int)
-        
-        # Gesture prediction (only for those predicted as target)
-        dist = self._distance(self.prototypes_, emb)
-        gesture_idx = np.argmin(dist, axis=0)
-        gesture_pred = self.gesture_encoder_.inverse_transform(gesture_idx)
-        
-        # Final output: "non_target" for binary=0, otherwise gesture name
-        result = np.where(binary_class == 0, "non_target", gesture_pred)
-        return result
+        check_is_fitted(self, ["encoder_", "label_encoder_", "prototypes_"])
+        X_pad, _ = self._prepare_X(X)
+        emb = self.encoder_.predict(X_pad, verbose=0)
+        if self.distance == "euclidean":
+            dist = np.sum((emb[:, np.newaxis, :] - self.prototypes_[np.newaxis, :, :]) ** 2, axis=2)
+        else:
+            q_norm = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8)
+            p_norm = self.prototypes_ / (np.linalg.norm(self.prototypes_, axis=1, keepdims=True) + 1e-8)
+            dist = 1.0 - np.dot(q_norm, p_norm.T)
+        pred_idx = np.argmin(dist, axis=1)
+        return self.label_encoder_.inverse_transform(pred_idx)
 
     def predict_proba(self, X):
-        check_is_fitted(self, ["embedding_net_"])
-        X_pad, _ = self._pad(X)
-        binary_pred, gesture_pred = self.embedding_net_(X_pad, training=False)
-        return {"binary": binary_pred.numpy(), "gesture": gesture_pred.numpy()}
+        check_is_fitted(self, ["encoder_", "prototypes_"])
+        X_pad, _ = self._prepare_X(X)
+        emb = self.encoder_.predict(X_pad, verbose=0)
+        if self.distance == "euclidean":
+            dist = np.sum((emb[:, np.newaxis, :] - self.prototypes_[np.newaxis, :, :]) ** 2, axis=2)
+        else:
+            q_norm = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8)
+            p_norm = self.prototypes_ / (np.linalg.norm(self.prototypes_, axis=1, keepdims=True) + 1e-8)
+            dist = 1.0 - np.dot(q_norm, p_norm.T)
+        neg_d = -dist
+        neg_d -= neg_d.max(axis=1, keepdims=True)
+        probs = np.exp(neg_d) / np.exp(neg_d).sum(axis=1, keepdims=True)
+        return probs
 
     def score(self, X, y):
-        from sklearn.metrics import f1_score
-        
         y_pred = self.predict(X)
-        
         if isinstance(y, pd.DataFrame):
-            y_true = y.drop_duplicates("sequence_id").set_index("sequence_id")["gesture"]
-            y_true = y_true.reindex(X.index.unique()).fillna("non_target")
+            y_seq = y.drop_duplicates(subset=['sequence_id']).sort_values('sequence_id')
+            y_true_binary = y_seq['is_target'].astype(int).values
+            y_true_gesture = y_seq[self.gesture_column].values
         else:
-            y_true = pd.Series(y)
-        
-        # Binary F1 (target vs non_target)
-        y_true_binary = (y_true != "non_target").astype(int)
-        y_pred_binary = (y_pred != "non_target").astype(int)
-        binary_f1 = f1_score(y_true_binary, y_pred_binary)
-        
-        # Macro F1 on gestures (only target sequences)
-        target_mask = y_true != "non_target"
+            y_true_binary = np.array(y)
+            y_true_gesture = np.array(y)
+
+        y_pred_binary = (np.array(y_pred) != 'non_bfrb').astype(int)
+        binary_f1 = f1_score(y_true_binary, y_pred_binary, zero_division=0)
+
+        target_mask = y_true_binary == 1
         if target_mask.sum() > 0:
-            gesture_f1 = f1_score(y_true[target_mask], y_pred[target_mask], average="macro")
+            gesture_f1 = f1_score(
+                y_true_gesture[target_mask],
+                np.array(y_pred)[target_mask],
+                average='macro',
+                zero_division=0
+            )
         else:
             gesture_f1 = 0.0
+
+        return (binary_f1 + gesture_f1) / 2
+
+
+# ----------------------------------------------------------------------
+# Multi‑head version (minimal)
+# ----------------------------------------------------------------------
+class DynamicMultiHeadPrototypicalNetwork(BinaryPlusGesturePrototypicalNetwork):
+    def __init__(self, heads=None, primary_target="gesture", **kwargs):
+        super().__init__(gesture_column=primary_target, **kwargs)
+        self.heads = heads or ["gesture_action", "orientation", "gesture_position"]
+        self.primary_target = primary_target
         
-        # Competition metric = average of binary F1 and gesture macro F1
-        competition_score = (binary_f1 + gesture_f1) / 2
-        
-        return competition_score
+    def predict(self, X):
+        return super().predict(X)
