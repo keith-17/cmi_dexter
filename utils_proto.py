@@ -17,9 +17,7 @@ from typing import Tuple, Dict, Any
 import warnings
 warnings.filterwarnings("ignore")
 
-# ----------------------------------------------------------------------
-# Custom Scorer for Pipeline
-# ----------------------------------------------------------------------
+
 # ----------------------------------------------------------------------
 # Custom Scorer for Pipeline
 # ----------------------------------------------------------------------
@@ -29,6 +27,7 @@ def make_competition_scorer(target_col='bfrb'):
     (from CV splitter) and sequence-level y_pred (from the model).
     """
 
+    # IMPORTANT: The signature MUST be (y_true, y_pred) for make_scorer
     def _score(y_true, y_pred):
         # y_true is a row-level DataFrame. We need sequence-level labels.
         if isinstance(y_true, pd.DataFrame):
@@ -61,11 +60,9 @@ def make_competition_scorer(target_col='bfrb'):
 
         return (binary_f1 + gesture_f1) / 2
 
+    # Wrap the metric function into an sklearn scorer object
     return make_scorer(_score, response_method='predict')
 
-
-# Default scorer for the 'bfrb' column
-competition_scorer = make_competition_scorer('bfrb')
 
 # Default scorer for the 'bfrb' column
 competition_scorer = make_competition_scorer('bfrb')
@@ -448,13 +445,153 @@ class BinaryPlusGesturePrototypicalNetwork(ClassifierMixin, BaseEstimator):
 
 
 # ----------------------------------------------------------------------
-# Multi‑head version (minimal)
+# Multi‑head version
 # ----------------------------------------------------------------------
 class DynamicMultiHeadPrototypicalNetwork(BinaryPlusGesturePrototypicalNetwork):
-    def __init__(self, heads=None, primary_target="gesture", **kwargs):
+    def __init__(self, heads=None, primary_target="bfrb", **kwargs):
+        # Initialize base class with primary target
         super().__init__(gesture_column=primary_target, **kwargs)
         self.heads = heads or ["gesture_action", "orientation", "gesture_position"]
         self.primary_target = primary_target
-        
+        self.y_enc_dict_ = {}
+        self.label_encoders_ = {}
+
+    def _prepare_y_single(self, y, column, seq_ids):
+        """Helper to extract and prepare a single column from the multi-head y DataFrame."""
+        if isinstance(y, pd.DataFrame):
+            if seq_ids is not None:
+                y_df = y.drop_duplicates("sequence_id").set_index("sequence_id")
+                y_combined = []
+                for sid in seq_ids:
+                    val = y_df.loc[sid, column]
+                    y_combined.append(str(val) if pd.notna(val) else "unknown")
+                return pd.Series(y_combined)
+            else:
+                y_combined = [str(row[column]) if pd.notna(row[column]) else "unknown" for _, row in y.iterrows()]
+                return pd.Series(y_combined)
+        return pd.Series(y)
+
+    def fit(self, X, y):
+        if not isinstance(y, pd.DataFrame):
+            raise ValueError("For multi-head mode, y must be a pandas DataFrame containing all head columns.")
+
+        # Ensure primary target is in heads
+        if self.primary_target not in self.heads:
+            self.heads = list(self.heads) + [self.primary_target]
+
+        X_pad, seq_ids = self._prepare_X(X)
+
+        # 1. Fit LabelEncoders and encode labels for ALL heads
+        for head in self.heads:
+            le = LabelEncoder()
+            y_series = self._prepare_y_single(y, head, seq_ids)
+            self.label_encoders_[head] = le
+            self.y_enc_dict_[head] = le.fit_transform(y_series)
+
+        # 2. Build shared encoder
+        input_shape = (X_pad.shape[1], X_pad.shape[2])
+        self.encoder_ = build_encoder(
+            input_shape,
+            conv_filters=self.conv_filters,
+            kernel_sizes=self.kernel_sizes,
+            pool_sizes=self.pool_sizes,
+            use_batch_norm=self.use_batch_norm,
+            spatial_dropout=self.spatial_dropout,
+            dense_units=self.dense_units,
+            dropout=self.dropout,
+            embedding_dim=self.embedding_dim,
+        )
+        optimizer = keras.optimizers.Adam(learning_rate=self.learning_rate)
+
+        # 3. Episode sampling is driven by the PRIMARY target to ensure valid N-way K-shot
+        primary_y_enc = self.y_enc_dict_[self.primary_target]
+        primary_le = self.label_encoders_[self.primary_target]
+        primary_classes = primary_le.classes_
+        primary_class_indices = {c: np.where(primary_y_enc == c)[0] for c in range(len(primary_classes))}
+        n_way_actual = min(self.n_way, len(primary_classes))
+
+        best_loss = np.inf
+        patience_counter = 0
+        steps_per_epoch = max(1, len(X_pad) // self.batch_size)
+
+        for epoch in range(self.epochs):
+            epoch_loss = 0.0
+            for _ in range(steps_per_epoch):
+                # Sample indices based on primary target
+                sup_idx, qry_idx = self._sample_episode_indices(X_pad, primary_y_enc, primary_class_indices,
+                                                                n_way_actual)
+
+                total_loss = 0.0
+                with tf.GradientTape() as tape:
+                    for head in self.heads:
+                        head_y_enc = self.y_enc_dict_[head]
+                        sup_y_head = head_y_enc[sup_idx]
+                        qry_y_head = head_y_enc[qry_idx]
+
+                        # Number of unique classes in this head's support set for this episode
+                        n_way_head = len(np.unique(sup_y_head))
+
+                        sup_emb = self.encoder_(X_pad[sup_idx], training=True)
+                        qry_emb = self.encoder_(X_pad[qry_idx], training=True)
+
+                        loss = self.prototypical_loss(sup_emb, sup_y_head, qry_emb, qry_y_head, n_way_head,
+                                                      self.distance)
+                        total_loss += loss
+
+                grads = tape.gradient(total_loss, self.encoder_.trainable_variables)
+                optimizer.apply_gradients(zip(grads, self.encoder_.trainable_variables))
+                epoch_loss += total_loss.numpy()
+
+            epoch_loss /= steps_per_epoch
+            if self.verbose:
+                print(f"Epoch {epoch + 1}/{self.epochs} - loss: {epoch_loss:.4f}")
+
+            if epoch_loss < best_loss:
+                best_loss = epoch_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= self.patience:
+                    if self.verbose:
+                        print(f"Early stopping at epoch {epoch + 1}")
+                    break
+
+        # 4. Store prototypes for the PRIMARY target (so base .predict() works seamlessly)
+        all_emb = self.encoder_.predict(X_pad, verbose=0)
+        self.prototypes_ = np.array([
+            np.mean(all_emb[primary_y_enc == c], axis=0) for c in range(len(primary_classes))
+        ])
+        norms = np.linalg.norm(self.prototypes_, axis=1, keepdims=True)
+        self.prototypes_ = self.prototypes_ / (norms + 1e-8)
+
+        # Set base class attributes expected by .predict()
+        self.label_encoder_ = primary_le
+        self.classes_ = primary_classes
+
+        return self
+
+    def _sample_episode_indices(self, X, y_enc, class_indices, n_way):
+        """Returns support and query indices based on the target classes."""
+        available = [c for c, idx in class_indices.items() if len(idx) >= self.n_support + self.n_query]
+        if len(available) < n_way:
+            available = list(class_indices.keys())
+        actual_n_way = min(n_way, len(available))
+        episode_classes = np.random.choice(available, actual_n_way, replace=False)
+
+        support_idx, query_idx = [], []
+        for cls in episode_classes:
+            pool = class_indices[cls].copy()
+            np.random.shuffle(pool)
+            need = self.n_support + self.n_query
+            if len(pool) < need:
+                pool = np.tile(pool, (need + len(pool) - 1) // len(pool))[:need]
+
+            support_idx.extend(pool[:self.n_support])
+            query_idx.extend(pool[self.n_support:self.n_support + self.n_query])
+
+        return np.array(support_idx), np.array(query_idx)
+
     def predict(self, X):
+        # Predict using the primary target's prototypes and label encoder
+        # This ensures compatibility with the notebook's evaluation cell
         return super().predict(X)
