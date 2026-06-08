@@ -372,23 +372,31 @@ class AdvancedMultiDomainSequenceExtractor(HoneycombBase):
 
     def transform(self, X: pd.DataFrame) -> np.ndarray:
         check_is_fitted(self, ["feature_names_in_", "modality_slices_"])
+        
         cleaned = self.cleaner.transform(X)
         filtered = self.motion_filter.transform(cleaned)
+        
         out = pd.concat([
             self.imu.transform(filtered),
             self.tof.transform(filtered),
             self.thermo.transform(filtered)
         ], axis=1).fillna(0.0)
 
+        # ✅ FIX: Re-attach the sequence_id column from the original X so we can group by it
+        out[self.sequence_col] = X[self.sequence_col].values
+
         sequences = []
         for _, g in out.groupby(self.sequence_col, sort=False):
             arr = g[self.feature_names_in_].to_numpy(dtype=np.float32)
+            
             if len(arr) >= self.maxlen:
                 arr = arr[:self.maxlen]
             else:
                 pad = np.full((self.maxlen - len(arr), arr.shape[1]), self.padding_value, dtype=np.float32)
                 arr = np.vstack([arr, pad])
+                
             sequences.append(arr)
+            
         return np.stack(sequences, axis=0)
 
 # Backward compatibility alias

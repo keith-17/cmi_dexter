@@ -138,14 +138,15 @@ class DynamicMultiHeadPrototypicalNetwork(ClassifierMixin, BaseEstimator):
         k_list = (k_list * n)[:n] if len(k_list) < n else k_list[:n]
         p_list = (p_list * n)[:n] if len(p_list) < n else p_list[:n]
 
-        for f, k, p in zip(f_list, k_list, p_list):
-            x = layers.Conv1D(int(f), int(k), padding="same", activation="relu", name=f"{name}_conv")(x)
+        for i, (f, k, p) in enumerate(zip(f_list, k_list, p_list)):
+            # ✅ FIX: Append index 'i' to ensure uniqueness across layers within the same branch
+            x = layers.Conv1D(int(f), int(k), padding="same", activation="relu", name=f"{name}_conv_{i}")(x)
             if self.use_batch_norm:
-                x = layers.BatchNormalization(name=f"{name}_bn")(x)
+                x = layers.BatchNormalization(name=f"{name}_bn_{i}")(x)
             if self.spatial_dropout > 0:
-                x = layers.SpatialDropout1D(self.spatial_dropout)(x)
+                x = layers.SpatialDropout1D(self.spatial_dropout, name=f"{name}_sdrop_{i}")(x)
             if p is not None:
-                x = layers.MaxPooling1D(int(p), name=f"{name}_pool")(x)
+                x = layers.MaxPooling1D(int(p), name=f"{name}_pool_{i}")(x)
         return x
 
     def _build_model(self, input_shape: Tuple[int, int], modality_slices: Dict[str, slice]) -> keras.Model:
