@@ -483,14 +483,14 @@ class SingleHeadPrototypicalNetwork(PrototypicalBase):
             'val_loss': [], 'val_acc': []
         }
 
-        # Progress bar setup
-        if self.verbose > 0:
-            from tqdm.auto import tqdm
-            epoch_iterator = tqdm(range(self.epochs), desc="Training", unit="epoch")
-        else:
-            epoch_iterator = range(self.epochs)
+        if int(self.verbose) > 0:
+            print(
+                f"Training for up to {self.epochs} epochs "
+                f"({steps} steps/epoch, {len(train_indices)} train / {len(val_indices)} val sequences)...",
+                flush=True,
+            )
 
-        for epoch in epoch_iterator:
+        for epoch in range(self.epochs):
             # Training phase
             train_loss = 0.0
             train_acc = 0.0
@@ -518,18 +518,15 @@ class SingleHeadPrototypicalNetwork(PrototypicalBase):
             # Validation phase (if we have validation data)
             val_loss = 0.0
             val_acc = 0.0
+            val_ran = False
 
-            if len(val_indices) > 0 and len(train_class_indices) > 0:
-                # Create validation class indices
+            if len(val_indices) > 0:
                 val_class_indices = {}
                 for c in range(len(self.classes_)):
                     val_class_indices[c] = [i for i in val_indices if y_enc[i] == c]
 
-                # Only validate if we have at least n_way classes with enough samples
-                available_val_classes = [c for c, idx in val_class_indices.items()
-                                         if len(idx) >= self.n_support + self.n_query]
-
-                if len(available_val_classes) >= min(self.n_way, len(self.classes_)):
+                if any(len(idx) > 0 for idx in val_class_indices.values()):
+                    val_ran = True
                     val_steps = max(1, len(val_indices) // self.batch_size)
                     for _ in range(val_steps):
                         sup_x, sup_y, qry_x, qry_y = self._sample_episode(X, y_enc, val_class_indices)
@@ -553,43 +550,28 @@ class SingleHeadPrototypicalNetwork(PrototypicalBase):
             self.history_['val_loss'].append(val_loss)
             self.history_['val_acc'].append(val_acc)
 
-            # Display progress
-            if self.verbose == 1:
-                if isinstance(epoch_iterator, tqdm):
-                    postfix = {
-                        'train_loss': f'{train_loss:.4f}',
-                        'train_acc': f'{train_acc:.4f}',
-                        'val_loss': f'{val_loss:.4f}' if val_loss > 0 else 'N/A',
-                        'val_acc': f'{val_acc:.4f}' if val_acc > 0 else 'N/A'
-                    }
-                    epoch_iterator.set_postfix(postfix)
-            elif self.verbose >= 2:
-                print(f"Epoch {epoch + 1}/{self.epochs} - "
-                      f"train_loss: {train_loss:.4f} - train_acc: {train_acc:.4f} - "
-                      f"val_loss: {val_loss:.4f} - val_acc: {val_acc:.4f}")
+            if int(self.verbose) > 0:
+                msg = (
+                    f"Epoch {epoch + 1:3d}/{self.epochs}"
+                    f"  train_loss={train_loss:.4f}  train_acc={train_acc:.4f}"
+                )
+                if val_ran:
+                    msg += f"  val_loss={val_loss:.4f}  val_acc={val_acc:.4f}"
+                else:
+                    msg += "  val_loss=N/A  val_acc=N/A"
+                print(msg, flush=True)
 
             # Early stopping
-            if val_loss > 0:
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    patience_cnt = 0
-                else:
-                    patience_cnt += 1
-                    if patience_cnt >= self.patience:
-                        if self.verbose > 0:
-                            print(f"\nEarly stopping at epoch {epoch + 1}")
-                        break
+            monitor_loss = val_loss if val_ran else train_loss
+            if monitor_loss < best_val_loss:
+                best_val_loss = monitor_loss
+                patience_cnt = 0
             else:
-                # If no validation data, use training loss
-                if train_loss < best_val_loss:
-                    best_val_loss = train_loss
-                    patience_cnt = 0
-                else:
-                    patience_cnt += 1
-                    if patience_cnt >= self.patience:
-                        if self.verbose > 0:
-                            print(f"\nEarly stopping at epoch {epoch + 1}")
-                        break
+                patience_cnt += 1
+                if patience_cnt >= self.patience:
+                    if int(self.verbose) > 0:
+                        print(f"Early stopping at epoch {epoch + 1}", flush=True)
+                    break
 
         # Compute final prototypes using all training data
         all_emb = self.encoder_.predict(X[train_indices] if len(val_indices) > 0 else X, verbose=0)
@@ -764,18 +746,22 @@ class MultiHeadPrototypicalNetwork(PrototypicalBase):
         steps = max(1, len(train_indices) // self.batch_size)
 
         # Store history
-        self.history_ = {'train_loss': [], 'val_loss': []}
+        self.history_ = {
+            'train_loss': [], 'train_acc': [],
+            'val_loss': [], 'val_acc': [],
+        }
 
-        # Progress bar
-        if self.verbose > 0:
-            from tqdm.auto import tqdm
-            epoch_iterator = tqdm(range(self.epochs), desc="Training", unit="epoch")
-        else:
-            epoch_iterator = range(self.epochs)
+        if int(self.verbose) > 0:
+            print(
+                f"Training for up to {self.epochs} epochs "
+                f"({steps} steps/epoch, {len(train_indices)} train / {len(val_indices)} val sequences)...",
+                flush=True,
+            )
 
-        for epoch in epoch_iterator:
+        for epoch in range(self.epochs):
             # Training phase
             train_loss = 0.0
+            train_acc = 0.0
             for _ in range(steps):
                 sup_x, sup_y, qry_x, qry_y = self._sample_episode(X, y_primary, train_class_indices)
                 sup_x, _ = self.augmentor(sup_x, padding_value=self.padding_value)
@@ -784,27 +770,29 @@ class MultiHeadPrototypicalNetwork(PrototypicalBase):
                 with tf.GradientTape() as tape:
                     sup_emb = self.encoder_(sup_x, training=True)
                     qry_emb = self.encoder_(qry_x, training=True)
-                    loss, _ = self._proto_loss(
+                    loss, acc = self._proto_loss(
                         sup_emb, sup_y, qry_emb, qry_y, len(np.unique(sup_y))
                     )
 
                 grads = tape.gradient(loss, self.encoder_.trainable_variables)
                 opt.apply_gradients(zip(grads, self.encoder_.trainable_variables))
                 train_loss += loss.numpy()
+                train_acc += acc.numpy()
 
             train_loss /= steps
+            train_acc /= steps
 
             # Validation phase
             val_loss = 0.0
+            val_acc = 0.0
+            val_ran = False
             if len(val_indices) > 0:
                 val_class_indices = {}
                 for c in range(len(self.primary_classes_)):
                     val_class_indices[c] = [i for i in val_indices if y_primary[i] == c]
 
-                available_val_classes = [c for c, idx in val_class_indices.items()
-                                         if len(idx) >= self.n_support + self.n_query]
-
-                if len(available_val_classes) >= min(self.n_way, len(self.primary_classes_)):
+                if any(len(idx) > 0 for idx in val_class_indices.values()):
+                    val_ran = True
                     val_steps = max(1, len(val_indices) // self.batch_size)
                     for _ in range(val_steps):
                         sup_x, sup_y, qry_x, qry_y = self._sample_episode(X, y_primary, val_class_indices)
@@ -813,39 +801,42 @@ class MultiHeadPrototypicalNetwork(PrototypicalBase):
 
                         sup_emb = self.encoder_(sup_x, training=False)
                         qry_emb = self.encoder_(qry_x, training=False)
-                        loss, _ = self._proto_loss(
+                        loss, acc = self._proto_loss(
                             sup_emb, sup_y, qry_emb, qry_y, len(np.unique(sup_y))
                         )
                         val_loss += loss.numpy()
+                        val_acc += acc.numpy()
 
                     val_loss /= val_steps
+                    val_acc /= val_steps
 
             # Store history
             self.history_['train_loss'].append(train_loss)
+            self.history_['train_acc'].append(train_acc)
             self.history_['val_loss'].append(val_loss)
+            self.history_['val_acc'].append(val_acc)
 
-            # Display progress
-            if self.verbose == 1:
-                if isinstance(epoch_iterator, tqdm):
-                    postfix = {
-                        'train_loss': f'{train_loss:.4f}',
-                        'val_loss': f'{val_loss:.4f}' if val_loss > 0 else 'N/A'
-                    }
-                    epoch_iterator.set_postfix(postfix)
-            elif self.verbose >= 2:
-                print(f"Epoch {epoch + 1}/{self.epochs} - "
-                      f"train_loss: {train_loss:.4f} - val_loss: {val_loss:.4f}")
+            if int(self.verbose) > 0:
+                msg = (
+                    f"Epoch {epoch + 1:3d}/{self.epochs}"
+                    f"  train_loss={train_loss:.4f}  train_acc={train_acc:.4f}"
+                )
+                if val_ran:
+                    msg += f"  val_loss={val_loss:.4f}  val_acc={val_acc:.4f}"
+                else:
+                    msg += "  val_loss=N/A  val_acc=N/A"
+                print(msg, flush=True)
 
             # Early stopping
-            monitor_loss = val_loss if val_loss > 0 else train_loss
+            monitor_loss = val_loss if val_ran else train_loss
             if monitor_loss < best_val_loss:
                 best_val_loss = monitor_loss
                 patience_cnt = 0
             else:
                 patience_cnt += 1
                 if patience_cnt >= self.patience:
-                    if self.verbose > 0:
-                        print(f"\nEarly stopping at epoch {epoch + 1}")
+                    if int(self.verbose) > 0:
+                        print(f"Early stopping at epoch {epoch + 1}", flush=True)
                     break
 
         # Compute primary prototypes using all training data
