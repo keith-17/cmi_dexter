@@ -11,6 +11,8 @@ from sklearn.utils.validation import check_is_fitted
 from typing import Literal, Optional, List, Dict, Any, Tuple
 import warnings
 warnings.filterwarnings("ignore")
+import json
+from skopt.space import Categorical
 
 # --- Type Aliases ---
 AccModeStr = str  # e.g., "raw|velocity|displacement|jerk"
@@ -547,3 +549,34 @@ class SequenceExtractor(HoneycombBase):
             sequences.append(arr)
 
         return np.stack(sequences, axis=0)
+
+
+def prepare_multitask_param_space(param_space: dict, search_mode: str) -> dict:
+    """Encodes dict parameters to JSON strings for skopt Bayesian optimization."""
+    if search_mode != "bayesian":
+        return param_space
+    out = {}
+    for key, val in param_space.items():
+        name = key.split("__")[-1]
+        if name in {"branch_filters", "branch_kernel_sizes", "branch_pool_sizes"} and isinstance(val, list) and val and isinstance(val[0], dict):
+            out[key] = [json.dumps(d, sort_keys=True) for d in val]
+        else:
+            out[key] = val
+    return out
+
+
+def prepare_bayesian_space(param_space):
+    """Convert any non-scalar Categorical category (tuple, list, dict) to a JSON string."""
+    out = {}
+    for key, space in param_space.items():
+        if isinstance(space, Categorical):
+            new_cats = []
+            for cat in space.categories:
+                if isinstance(cat, (tuple, list, dict)):
+                    new_cats.append(json.dumps(cat, sort_keys=True))
+                else:
+                    new_cats.append(cat)
+            out[key] = Categorical(new_cats)
+        else:
+            out[key] = space
+    return out

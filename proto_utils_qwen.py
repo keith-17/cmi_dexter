@@ -16,6 +16,7 @@ from typing import Tuple, Dict, Any, List, Optional
 import warnings
 warnings.filterwarnings("ignore")
 from sklearn.utils.validation import check_is_fitted
+import json
 
 # ---------------------------------------------------------------------------
 # Temporal Augmentations
@@ -658,6 +659,11 @@ class MultiHeadPrototypicalNetwork(PrototypicalBase):
             freq_keep_low: float = 0.1,
             freq_keep_high: float = 0.9,
     ):
+        if isinstance(sub_heads, str) and sub_heads.startswith(('[', '{')):
+            try:
+                sub_heads = json.loads(sub_heads)
+            except:
+                pass
         self.primary_target = primary_target
         self.sub_heads = sub_heads or ["gesture_action", "orientation", "phase"]
         super().__init__(
