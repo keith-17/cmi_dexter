@@ -15,6 +15,7 @@ from sklearn.metrics import f1_score, make_scorer
 from typing import Tuple, Dict, Any, List, Optional
 import warnings
 warnings.filterwarnings("ignore")
+from sklearn.utils.validation import check_is_fitted
 
 # ---------------------------------------------------------------------------
 # Temporal Augmentations
@@ -174,32 +175,57 @@ class BackboneBuilder:
         
         return models.Model(inp, emb, name=f"{backbone_type}_encoder")
 
-# ---------------------------------------------------------------------------
-# Prototypical Base Class
-# ---------------------------------------------------------------------------
+
+# ============================================================================
+# Prototypical Base Class (with full augmentation parameters)
+# ============================================================================
 class PrototypicalBase(ClassifierMixin, BaseEstimator):
     def __init__(
-        self,
-        n_way: int = 9,
-        n_support: int = 5,
-        n_query: int = 15,
-        backbone_type: str = "1dcnn",
-        filters: str = "64-128",
-        kernels: str = "3-3",
-        pools: str = "none",
-        lstm_units: int = 128,
-        attention_heads: int = 4,
-        embed_dim: int = 128,
-        dropout: float = 0.2,
-        learning_rate: float = 1e-3,
-        batch_size: int = 32,
-        epochs: int = 100,
-        patience: int = 15,
-        augmentor: Optional[TemporalAugmentor] = None,
-        padding_value: float = -999.0,
-        verbose: int = 0,
-        random_state: int = 42,
+            self,
+            n_way: int = 9,
+            n_support: int = 5,
+            n_query: int = 15,
+            backbone_type: str = "1dcnn",
+            filters: str = "64-128",
+            kernels: str = "3-3",
+            pools: str = "none",
+            lstm_units: int = 128,
+            attention_heads: int = 4,
+            embed_dim: int = 128,
+            dropout: float = 0.2,
+            learning_rate: float = 1e-3,
+            batch_size: int = 32,
+            epochs: int = 100,
+            patience: int = 15,
+            validation_split: float = 0.1,
+            padding_value: float = -999.0,
+            verbose: int = 1,
+            random_state: int = 42,
+            # Augmentation parameters
+            use_mixup: bool = False,
+            mixup_alpha: float = 0.4,
+            mixup_prob: float = 0.5,
+            use_time_shift: bool = False,
+            max_shift_pct: float = 0.15,
+            use_time_stretch: bool = False,
+            time_stretch_min: float = 0.8,
+            time_stretch_max: float = 1.2,
+            use_gaussian_noise: bool = False,
+            noise_std: float = 0.01,
+            use_magnitude_scaling: bool = False,
+            mag_min: float = 0.9,
+            mag_max: float = 1.1,
+            use_time_mask: bool = False,
+            time_mask_ratio: float = 0.1,
+            use_channel_dropout: bool = False,
+            channel_drop_prob: float = 0.1,
+            use_quaternion_flip: bool = False,
+            quat_flip_prob: float = 0.5,
+            use_freq_filter: bool = False,
+            freq_keep_low: float = 0.1,
+            freq_keep_high: float = 0.9,
     ):
+        # Basic parameters
         self.n_way = n_way
         self.n_support = n_support
         self.n_query = n_query
@@ -215,32 +241,83 @@ class PrototypicalBase(ClassifierMixin, BaseEstimator):
         self.batch_size = batch_size
         self.epochs = epochs
         self.patience = patience
-        self.augmentor = augmentor or TemporalAugmentor()
+        self.validation_split = validation_split
         self.padding_value = padding_value
         self.verbose = verbose
         self.random_state = random_state
+
+        # Augmentation parameters
+        self.use_mixup = use_mixup
+        self.mixup_alpha = mixup_alpha
+        self.mixup_prob = mixup_prob
+        self.use_time_shift = use_time_shift
+        self.max_shift_pct = max_shift_pct
+        self.use_time_stretch = use_time_stretch
+        self.time_stretch_min = time_stretch_min
+        self.time_stretch_max = time_stretch_max
+        self.use_gaussian_noise = use_gaussian_noise
+        self.noise_std = noise_std
+        self.use_magnitude_scaling = use_magnitude_scaling
+        self.mag_min = mag_min
+        self.mag_max = mag_max
+        self.use_time_mask = use_time_mask
+        self.time_mask_ratio = time_mask_ratio
+        self.use_channel_dropout = use_channel_dropout
+        self.channel_drop_prob = channel_drop_prob
+        self.use_quaternion_flip = use_quaternion_flip
+        self.quat_flip_prob = quat_flip_prob
+        self.use_freq_filter = use_freq_filter
+        self.freq_keep_low = freq_keep_low
+        self.freq_keep_high = freq_keep_high
+
+        # Create the augmentor internally
+        self.augmentor = TemporalAugmentor(
+            use_mixup=use_mixup,
+            mixup_alpha=mixup_alpha,
+            mixup_prob=mixup_prob,
+            use_time_shift=use_time_shift,
+            max_shift_pct=max_shift_pct,
+            use_time_stretch=use_time_stretch,
+            time_stretch_min=time_stretch_min,
+            time_stretch_max=time_stretch_max,
+            use_gaussian_noise=use_gaussian_noise,
+            noise_std=noise_std,
+            use_magnitude_scaling=use_magnitude_scaling,
+            mag_min=mag_min,
+            mag_max=mag_max,
+            use_time_mask=use_time_mask,
+            time_mask_ratio=time_mask_ratio,
+            use_channel_dropout=use_channel_dropout,
+            channel_drop_prob=channel_drop_prob,
+            use_quaternion_flip=use_quaternion_flip,
+            quat_flip_prob=quat_flip_prob,
+            use_freq_filter=use_freq_filter,
+            freq_keep_low=freq_keep_low,
+            freq_keep_high=freq_keep_high
+        )
 
     def _sample_episode(self, X: np.ndarray, y_enc: np.ndarray, class_indices: Dict[int, np.ndarray]):
         available = [c for c, idx in class_indices.items() if len(idx) >= self.n_support + self.n_query]
         if len(available) < self.n_way:
             available = list(class_indices.keys())
-        
+
         episode_classes = np.random.choice(available, min(self.n_way, len(available)), replace=False)
         sup_x, sup_y, qry_x, qry_y = [], [], [], []
-        
+
         for local_lbl, cls in enumerate(episode_classes):
             pool = class_indices[cls].copy()
             np.random.shuffle(pool)
             need = self.n_support + self.n_query
             if len(pool) < need:
                 pool = np.tile(pool, (need + len(pool) - 1) // len(pool))[:need]
-                
+
             sup_x.append(X[pool[:self.n_support]])
             sup_y.extend([local_lbl] * self.n_support)
             qry_x.append(X[pool[self.n_support:self.n_support + self.n_query]])
             qry_y.extend([local_lbl] * self.n_query)
-            
-        return np.concatenate(sup_x), np.array(sup_y, dtype=np.int32), np.concatenate(qry_x), np.array(qry_y, dtype=np.int32)
+
+        return np.concatenate(sup_x), np.array(sup_y, dtype=np.int32), np.concatenate(qry_x), np.array(qry_y,
+                                                                                                       dtype=np.int32)
 
     @staticmethod
     @tf.function
@@ -253,96 +330,402 @@ class PrototypicalBase(ClassifierMixin, BaseEstimator):
         acc = tf.reduce_mean(tf.cast(tf.equal(preds, qry_y), tf.float32))
         return loss, acc
 
-# ---------------------------------------------------------------------------
+
+# ============================================================================
 # Single Head Prototypical Network
-# ---------------------------------------------------------------------------
+# ============================================================================
 class SingleHeadPrototypicalNetwork(PrototypicalBase):
-    def __init__(self, target: str = "bfrb", **kwargs):
-        super().__init__(**kwargs)
+    def __init__(
+            self,
+            target: str = "bfrb",
+            n_way: int = 9,
+            n_support: int = 5,
+            n_query: int = 15,
+            backbone_type: str = "1dcnn",
+            filters: str = "64-128",
+            kernels: str = "3-3",
+            pools: str = "none",
+            lstm_units: int = 128,
+            attention_heads: int = 4,
+            embed_dim: int = 128,
+            dropout: float = 0.2,
+            learning_rate: float = 1e-3,
+            batch_size: int = 32,
+            epochs: int = 100,
+            patience: int = 15,
+            validation_split: float = 0.1,
+            padding_value: float = -999.0,
+            verbose: int = 1,
+            random_state: int = 42,
+            # Augmentation parameters
+            use_mixup: bool = False,
+            mixup_alpha: float = 0.4,
+            mixup_prob: float = 0.5,
+            use_time_shift: bool = False,
+            max_shift_pct: float = 0.15,
+            use_time_stretch: bool = False,
+            time_stretch_min: float = 0.8,
+            time_stretch_max: float = 1.2,
+            use_gaussian_noise: bool = False,
+            noise_std: float = 0.01,
+            use_magnitude_scaling: bool = False,
+            mag_min: float = 0.9,
+            mag_max: float = 1.1,
+            use_time_mask: bool = False,
+            time_mask_ratio: float = 0.1,
+            use_channel_dropout: bool = False,
+            channel_drop_prob: float = 0.1,
+            use_quaternion_flip: bool = False,
+            quat_flip_prob: float = 0.5,
+            use_freq_filter: bool = False,
+            freq_keep_low: float = 0.1,
+            freq_keep_high: float = 0.9,
+    ):
         self.target = target
+        super().__init__(
+            n_way=n_way,
+            n_support=n_support,
+            n_query=n_query,
+            backbone_type=backbone_type,
+            filters=filters,
+            kernels=kernels,
+            pools=pools,
+            lstm_units=lstm_units,
+            attention_heads=attention_heads,
+            embed_dim=embed_dim,
+            dropout=dropout,
+            learning_rate=learning_rate,
+            batch_size=batch_size,
+            epochs=epochs,
+            patience=patience,
+            validation_split=validation_split,
+            padding_value=padding_value,
+            verbose=verbose,
+            random_state=random_state,
+            use_mixup=use_mixup,
+            mixup_alpha=mixup_alpha,
+            mixup_prob=mixup_prob,
+            use_time_shift=use_time_shift,
+            max_shift_pct=max_shift_pct,
+            use_time_stretch=use_time_stretch,
+            time_stretch_min=time_stretch_min,
+            time_stretch_max=time_stretch_max,
+            use_gaussian_noise=use_gaussian_noise,
+            noise_std=noise_std,
+            use_magnitude_scaling=use_magnitude_scaling,
+            mag_min=mag_min,
+            mag_max=mag_max,
+            use_time_mask=use_time_mask,
+            time_mask_ratio=time_mask_ratio,
+            use_channel_dropout=use_channel_dropout,
+            channel_drop_prob=channel_drop_prob,
+            use_quaternion_flip=use_quaternion_flip,
+            quat_flip_prob=quat_flip_prob,
+            use_freq_filter=use_freq_filter,
+            freq_keep_low=freq_keep_low,
+            freq_keep_high=freq_keep_high,
+        )
 
     def fit(self, X: np.ndarray, y: pd.DataFrame):
         tf.keras.backend.clear_session()
         tf.random.set_seed(self.random_state)
         np.random.seed(self.random_state)
 
-        y_seq = y.drop_duplicates("sequence_id").sort_values("sequence_id") if "sequence_id" in y.columns else y
+        # Prepare sequence-level labels
+        if "sequence_id" in y.columns:
+            y_seq = y.drop_duplicates("sequence_id").sort_values("sequence_id")
+            # Get unique sequences from X (since X is already grouped by sequence)
+            unique_seqs = np.unique([i for i in range(len(X))])  # X is (n_sequences, maxlen, features)
+            n_seq = len(unique_seqs)
+        else:
+            y_seq = y
+            n_seq = len(X)
+
+        # Split indices for train/validation
+        indices = np.arange(n_seq)
+        np.random.shuffle(indices)
+        val_size = int(n_seq * self.validation_split)
+        val_indices = indices[:val_size]
+        train_indices = indices[val_size:]
+
+        # Encode labels
         self.label_encoder_ = LabelEncoder()
         y_enc = self.label_encoder_.fit_transform(y_seq[self.target])
         self.classes_ = self.label_encoder_.classes_
-        class_indices = {c: np.where(y_enc == c)[0] for c in range(len(self.classes_))}
 
+        # Get class indices for training sequences only
+        train_class_indices = {}
+        for c in range(len(self.classes_)):
+            train_class_indices[c] = [i for i in train_indices if y_enc[i] == c]
+
+        # Build encoder
         self.encoder_ = BackboneBuilder.build(
-            self.backbone_type, (X.shape[1], X.shape[2]),
-            filters=self.filters, kernels=self.kernels, pools=self.pools,
-            lstm_units=self.lstm_units, attention_heads=self.attention_heads,
-            embed_dim=self.embed_dim, dropout=self.dropout
+            self.backbone_type,
+            (X.shape[1], X.shape[2]),
+            filters=self.filters,
+            kernels=self.kernels,
+            pools=self.pools,
+            lstm_units=self.lstm_units,
+            attention_heads=self.attention_heads,
+            embed_dim=self.embed_dim,
+            dropout=self.dropout,
         )
-        
-        opt = optimizers.Adam(self.learning_rate)
-        best_loss, patience_cnt = np.inf, 0
-        steps = max(1, len(X) // self.batch_size)
 
-        for epoch in range(self.epochs):
-            epoch_loss, epoch_acc = 0.0, 0.0
+        opt = optimizers.Adam(self.learning_rate)
+        best_val_loss = np.inf
+        patience_cnt = 0
+        steps = max(1, len(train_indices) // self.batch_size)
+
+        # Store history
+        self.history_ = {
+            'train_loss': [], 'train_acc': [],
+            'val_loss': [], 'val_acc': []
+        }
+
+        # Progress bar setup
+        if self.verbose > 0:
+            from tqdm.auto import tqdm
+            epoch_iterator = tqdm(range(self.epochs), desc="Training", unit="epoch")
+        else:
+            epoch_iterator = range(self.epochs)
+
+        for epoch in epoch_iterator:
+            # Training phase
+            train_loss = 0.0
+            train_acc = 0.0
+
             for _ in range(steps):
-                sup_x, sup_y, qry_x, qry_y = self._sample_episode(X, y_enc, class_indices)
+                sup_x, sup_y, qry_x, qry_y = self._sample_episode(X, y_enc, train_class_indices)
                 sup_x, _ = self.augmentor(sup_x, padding_value=self.padding_value)
                 qry_x, _ = self.augmentor(qry_x, padding_value=self.padding_value)
-                
+
                 with tf.GradientTape() as tape:
                     sup_emb = self.encoder_(sup_x, training=True)
                     qry_emb = self.encoder_(qry_x, training=True)
-                    loss, acc = self._proto_loss(sup_emb, sup_y, qry_emb, qry_y, len(np.unique(sup_y)))
-                    
+                    loss, acc = self._proto_loss(
+                        sup_emb, sup_y, qry_emb, qry_y, len(np.unique(sup_y))
+                    )
+
                 grads = tape.gradient(loss, self.encoder_.trainable_variables)
                 opt.apply_gradients(zip(grads, self.encoder_.trainable_variables))
-                epoch_loss += loss.numpy()
-                epoch_acc += acc.numpy()
-                
-            epoch_loss /= steps
-            epoch_acc /= steps
-            if self.verbose: print(f"Epoch {epoch+1}/{self.epochs} - loss: {epoch_loss:.4f} - acc: {epoch_acc:.4f}")
-            
-            if epoch_loss < best_loss: best_loss, patience_cnt = epoch_loss, 0
-            else:
-                patience_cnt += 1
-                if patience_cnt >= self.patience:
-                    if self.verbose: print(f"Early stopping at epoch {epoch+1}")
-                    break
+                train_loss += loss.numpy()
+                train_acc += acc.numpy()
 
-        all_emb = self.encoder_.predict(X, verbose=0)
-        self.prototypes_ = np.array([np.mean(all_emb[y_enc == c], axis=0) for c in range(len(self.classes_))])
-        self.prototypes_ /= (np.linalg.norm(self.prototypes_, axis=1, keepdims=True) + 1e-8)
+            train_loss /= steps
+            train_acc /= steps
+
+            # Validation phase (if we have validation data)
+            val_loss = 0.0
+            val_acc = 0.0
+
+            if len(val_indices) > 0 and len(train_class_indices) > 0:
+                # Create validation class indices
+                val_class_indices = {}
+                for c in range(len(self.classes_)):
+                    val_class_indices[c] = [i for i in val_indices if y_enc[i] == c]
+
+                # Only validate if we have at least n_way classes with enough samples
+                available_val_classes = [c for c, idx in val_class_indices.items()
+                                         if len(idx) >= self.n_support + self.n_query]
+
+                if len(available_val_classes) >= min(self.n_way, len(self.classes_)):
+                    val_steps = max(1, len(val_indices) // self.batch_size)
+                    for _ in range(val_steps):
+                        sup_x, sup_y, qry_x, qry_y = self._sample_episode(X, y_enc, val_class_indices)
+                        sup_x, _ = self.augmentor(sup_x, padding_value=self.padding_value)
+                        qry_x, _ = self.augmentor(qry_x, padding_value=self.padding_value)
+
+                        sup_emb = self.encoder_(sup_x, training=False)
+                        qry_emb = self.encoder_(qry_x, training=False)
+                        loss, acc = self._proto_loss(
+                            sup_emb, sup_y, qry_emb, qry_y, len(np.unique(sup_y))
+                        )
+                        val_loss += loss.numpy()
+                        val_acc += acc.numpy()
+
+                    val_loss /= val_steps
+                    val_acc /= val_steps
+
+            # Store history
+            self.history_['train_loss'].append(train_loss)
+            self.history_['train_acc'].append(train_acc)
+            self.history_['val_loss'].append(val_loss)
+            self.history_['val_acc'].append(val_acc)
+
+            # Display progress
+            if self.verbose == 1:
+                if isinstance(epoch_iterator, tqdm):
+                    postfix = {
+                        'train_loss': f'{train_loss:.4f}',
+                        'train_acc': f'{train_acc:.4f}',
+                        'val_loss': f'{val_loss:.4f}' if val_loss > 0 else 'N/A',
+                        'val_acc': f'{val_acc:.4f}' if val_acc > 0 else 'N/A'
+                    }
+                    epoch_iterator.set_postfix(postfix)
+            elif self.verbose >= 2:
+                print(f"Epoch {epoch + 1}/{self.epochs} - "
+                      f"train_loss: {train_loss:.4f} - train_acc: {train_acc:.4f} - "
+                      f"val_loss: {val_loss:.4f} - val_acc: {val_acc:.4f}")
+
+            # Early stopping
+            if val_loss > 0:
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    patience_cnt = 0
+                else:
+                    patience_cnt += 1
+                    if patience_cnt >= self.patience:
+                        if self.verbose > 0:
+                            print(f"\nEarly stopping at epoch {epoch + 1}")
+                        break
+            else:
+                # If no validation data, use training loss
+                if train_loss < best_val_loss:
+                    best_val_loss = train_loss
+                    patience_cnt = 0
+                else:
+                    patience_cnt += 1
+                    if patience_cnt >= self.patience:
+                        if self.verbose > 0:
+                            print(f"\nEarly stopping at epoch {epoch + 1}")
+                        break
+
+        # Compute final prototypes using all training data
+        all_emb = self.encoder_.predict(X[train_indices] if len(val_indices) > 0 else X, verbose=0)
+        y_train_enc = y_enc[train_indices] if len(val_indices) > 0 else y_enc
+        self.prototypes_ = np.array(
+            [np.mean(all_emb[y_train_enc == c], axis=0) for c in range(len(self.classes_))]
+        )
+        self.prototypes_ /= np.linalg.norm(self.prototypes_, axis=1, keepdims=True) + 1e-8
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
+        from sklearn.utils.validation import check_is_fitted
         check_is_fitted(self, ["encoder_", "label_encoder_", "prototypes_"])
         emb = self.encoder_.predict(X, verbose=0)
         dist = np.sum((emb[:, None, :] - self.prototypes_[None, :, :]) ** 2, axis=2)
         return self.label_encoder_.inverse_transform(np.argmin(dist, axis=1))
 
-# ---------------------------------------------------------------------------
+
+# ============================================================================
 # Multi Head Prototypical Network
-# ---------------------------------------------------------------------------
+# ============================================================================
 class MultiHeadPrototypicalNetwork(PrototypicalBase):
-    def __init__(self, primary_target: str = "bfrb", sub_heads: Optional[List[str]] = None, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(
+            self,
+            primary_target: str = "bfrb",
+            sub_heads: Optional[List[str]] = None,
+            n_way: int = 9,
+            n_support: int = 5,
+            n_query: int = 15,
+            backbone_type: str = "1dcnn",
+            filters: str = "64-128",
+            kernels: str = "3-3",
+            pools: str = "none",
+            lstm_units: int = 128,
+            attention_heads: int = 4,
+            embed_dim: int = 128,
+            dropout: float = 0.2,
+            learning_rate: float = 1e-3,
+            batch_size: int = 32,
+            epochs: int = 100,
+            patience: int = 15,
+            validation_split: float = 0.1,
+            padding_value: float = -999.0,
+            verbose: int = 1,
+            random_state: int = 42,
+            # Augmentation parameters
+            use_mixup: bool = False,
+            mixup_alpha: float = 0.4,
+            mixup_prob: float = 0.5,
+            use_time_shift: bool = False,
+            max_shift_pct: float = 0.15,
+            use_time_stretch: bool = False,
+            time_stretch_min: float = 0.8,
+            time_stretch_max: float = 1.2,
+            use_gaussian_noise: bool = False,
+            noise_std: float = 0.01,
+            use_magnitude_scaling: bool = False,
+            mag_min: float = 0.9,
+            mag_max: float = 1.1,
+            use_time_mask: bool = False,
+            time_mask_ratio: float = 0.1,
+            use_channel_dropout: bool = False,
+            channel_drop_prob: float = 0.1,
+            use_quaternion_flip: bool = False,
+            quat_flip_prob: float = 0.5,
+            use_freq_filter: bool = False,
+            freq_keep_low: float = 0.1,
+            freq_keep_high: float = 0.9,
+    ):
         self.primary_target = primary_target
         self.sub_heads = sub_heads or ["gesture_action", "orientation", "phase"]
+        super().__init__(
+            n_way=n_way,
+            n_support=n_support,
+            n_query=n_query,
+            backbone_type=backbone_type,
+            filters=filters,
+            kernels=kernels,
+            pools=pools,
+            lstm_units=lstm_units,
+            attention_heads=attention_heads,
+            embed_dim=embed_dim,
+            dropout=dropout,
+            learning_rate=learning_rate,
+            batch_size=batch_size,
+            epochs=epochs,
+            patience=patience,
+            validation_split=validation_split,
+            padding_value=padding_value,
+            verbose=verbose,
+            random_state=random_state,
+            use_mixup=use_mixup,
+            mixup_alpha=mixup_alpha,
+            mixup_prob=mixup_prob,
+            use_time_shift=use_time_shift,
+            max_shift_pct=max_shift_pct,
+            use_time_stretch=use_time_stretch,
+            time_stretch_min=time_stretch_min,
+            time_stretch_max=time_stretch_max,
+            use_gaussian_noise=use_gaussian_noise,
+            noise_std=noise_std,
+            use_magnitude_scaling=use_magnitude_scaling,
+            mag_min=mag_min,
+            mag_max=mag_max,
+            use_time_mask=use_time_mask,
+            time_mask_ratio=time_mask_ratio,
+            use_channel_dropout=use_channel_dropout,
+            channel_drop_prob=channel_drop_prob,
+            use_quaternion_flip=use_quaternion_flip,
+            quat_flip_prob=quat_flip_prob,
+            use_freq_filter=use_freq_filter,
+            freq_keep_low=freq_keep_low,
+            freq_keep_high=freq_keep_high,
+        )
 
     def fit(self, X: np.ndarray, y: pd.DataFrame):
-        # For simplicity in episodic training, we sample based on the primary target
-        # but compute prototypes for all heads.
         tf.keras.backend.clear_session()
         tf.random.set_seed(self.random_state)
         np.random.seed(self.random_state)
 
+        # Prepare sequence-level labels
         y_seq = y.drop_duplicates("sequence_id").sort_values("sequence_id")
+        n_seq = len(y_seq)
+
+        # Split indices for train/validation
+        indices = np.arange(n_seq)
+        np.random.shuffle(indices)
+        val_size = int(n_seq * self.validation_split)
+        val_indices = indices[:val_size]
+        train_indices = indices[val_size:]
+
+        # Primary target encoder
         self.primary_encoder_ = LabelEncoder()
         y_primary = self.primary_encoder_.fit_transform(y_seq[self.primary_target])
         self.primary_classes_ = self.primary_encoder_.classes_
-        
+
+        # Sub-head encoders
         self.sub_encoders_ = {}
         self.sub_prototypes_ = {}
         for head in self.sub_heads:
@@ -351,66 +734,138 @@ class MultiHeadPrototypicalNetwork(PrototypicalBase):
                 le.fit(y_seq[head])
                 self.sub_encoders_[head] = le
 
-        class_indices = {c: np.where(y_primary == c)[0] for c in range(len(self.primary_classes_))}
+        # Get class indices for training sequences
+        train_class_indices = {}
+        for c in range(len(self.primary_classes_)):
+            train_class_indices[c] = [i for i in train_indices if y_primary[i] == c]
 
+        # Build encoder
         self.encoder_ = BackboneBuilder.build(
-            self.backbone_type, (X.shape[1], X.shape[2]),
-            filters=self.filters, kernels=self.kernels, pools=self.pools,
-            lstm_units=self.lstm_units, attention_heads=self.attention_heads,
-            embed_dim=self.embed_dim, dropout=self.dropout
+            self.backbone_type,
+            (X.shape[1], X.shape[2]),
+            filters=self.filters,
+            kernels=self.kernels,
+            pools=self.pools,
+            lstm_units=self.lstm_units,
+            attention_heads=self.attention_heads,
+            embed_dim=self.embed_dim,
+            dropout=self.dropout,
         )
-        
-        opt = optimizers.Adam(self.learning_rate)
-        best_loss, patience_cnt = np.inf, 0
-        steps = max(1, len(X) // self.batch_size)
 
-        for epoch in range(self.epochs):
-            epoch_loss = 0.0
+        opt = optimizers.Adam(self.learning_rate)
+        best_val_loss = np.inf
+        patience_cnt = 0
+        steps = max(1, len(train_indices) // self.batch_size)
+
+        # Store history
+        self.history_ = {'train_loss': [], 'val_loss': []}
+
+        # Progress bar
+        if self.verbose > 0:
+            from tqdm.auto import tqdm
+            epoch_iterator = tqdm(range(self.epochs), desc="Training", unit="epoch")
+        else:
+            epoch_iterator = range(self.epochs)
+
+        for epoch in epoch_iterator:
+            # Training phase
+            train_loss = 0.0
             for _ in range(steps):
-                sup_x, sup_y, qry_x, qry_y = self._sample_episode(X, y_primary, class_indices)
+                sup_x, sup_y, qry_x, qry_y = self._sample_episode(X, y_primary, train_class_indices)
                 sup_x, _ = self.augmentor(sup_x, padding_value=self.padding_value)
                 qry_x, _ = self.augmentor(qry_x, padding_value=self.padding_value)
-                
+
                 with tf.GradientTape() as tape:
                     sup_emb = self.encoder_(sup_x, training=True)
                     qry_emb = self.encoder_(qry_x, training=True)
-                    loss, _ = self._proto_loss(sup_emb, sup_y, qry_emb, qry_y, len(np.unique(sup_y)))
-                    
+                    loss, _ = self._proto_loss(
+                        sup_emb, sup_y, qry_emb, qry_y, len(np.unique(sup_y))
+                    )
+
                 grads = tape.gradient(loss, self.encoder_.trainable_variables)
                 opt.apply_gradients(zip(grads, self.encoder_.trainable_variables))
-                epoch_loss += loss.numpy()
-                
-            epoch_loss /= steps
-            if self.verbose: print(f"Epoch {epoch+1}/{self.epochs} - loss: {epoch_loss:.4f}")
-            
-            if epoch_loss < best_loss: best_loss, patience_cnt = epoch_loss, 0
+                train_loss += loss.numpy()
+
+            train_loss /= steps
+
+            # Validation phase
+            val_loss = 0.0
+            if len(val_indices) > 0:
+                val_class_indices = {}
+                for c in range(len(self.primary_classes_)):
+                    val_class_indices[c] = [i for i in val_indices if y_primary[i] == c]
+
+                available_val_classes = [c for c, idx in val_class_indices.items()
+                                         if len(idx) >= self.n_support + self.n_query]
+
+                if len(available_val_classes) >= min(self.n_way, len(self.primary_classes_)):
+                    val_steps = max(1, len(val_indices) // self.batch_size)
+                    for _ in range(val_steps):
+                        sup_x, sup_y, qry_x, qry_y = self._sample_episode(X, y_primary, val_class_indices)
+                        sup_x, _ = self.augmentor(sup_x, padding_value=self.padding_value)
+                        qry_x, _ = self.augmentor(qry_x, padding_value=self.padding_value)
+
+                        sup_emb = self.encoder_(sup_x, training=False)
+                        qry_emb = self.encoder_(qry_x, training=False)
+                        loss, _ = self._proto_loss(
+                            sup_emb, sup_y, qry_emb, qry_y, len(np.unique(sup_y))
+                        )
+                        val_loss += loss.numpy()
+
+                    val_loss /= val_steps
+
+            # Store history
+            self.history_['train_loss'].append(train_loss)
+            self.history_['val_loss'].append(val_loss)
+
+            # Display progress
+            if self.verbose == 1:
+                if isinstance(epoch_iterator, tqdm):
+                    postfix = {
+                        'train_loss': f'{train_loss:.4f}',
+                        'val_loss': f'{val_loss:.4f}' if val_loss > 0 else 'N/A'
+                    }
+                    epoch_iterator.set_postfix(postfix)
+            elif self.verbose >= 2:
+                print(f"Epoch {epoch + 1}/{self.epochs} - "
+                      f"train_loss: {train_loss:.4f} - val_loss: {val_loss:.4f}")
+
+            # Early stopping
+            monitor_loss = val_loss if val_loss > 0 else train_loss
+            if monitor_loss < best_val_loss:
+                best_val_loss = monitor_loss
+                patience_cnt = 0
             else:
                 patience_cnt += 1
-                if patience_cnt >= self.patience: break
+                if patience_cnt >= self.patience:
+                    if self.verbose > 0:
+                        print(f"\nEarly stopping at epoch {epoch + 1}")
+                    break
 
-        all_emb = self.encoder_.predict(X, verbose=0)
-        self.prototypes_ = np.array([np.mean(all_emb[y_primary == c], axis=0) for c in range(len(self.primary_classes_))])
-        self.prototypes_ /= (np.linalg.norm(self.prototypes_, axis=1, keepdims=True) + 1e-8)
-        
+        # Compute primary prototypes using all training data
+        all_emb = self.encoder_.predict(X[train_indices] if len(val_indices) > 0 else X, verbose=0)
+        y_train_primary = y_primary[train_indices] if len(val_indices) > 0 else y_primary
+        self.prototypes_ = np.array(
+            [np.mean(all_emb[y_train_primary == c], axis=0) for c in range(len(self.primary_classes_))]
+        )
+        self.prototypes_ /= np.linalg.norm(self.prototypes_, axis=1, keepdims=True) + 1e-8
+
         # Compute sub-head prototypes
         for head, le in self.sub_encoders_.items():
             y_head = le.transform(y_seq[head])
-            protos = np.array([np.mean(all_emb[y_head == c], axis=0) for c in range(len(le.classes_))])
-            protos /= (np.linalg.norm(protos, axis=1, keepdims=True) + 1e-8)
+            y_train_head = y_head[train_indices] if len(val_indices) > 0 else y_head
+            protos = np.array([np.mean(all_emb[y_train_head == c], axis=0) for c in range(len(le.classes_))])
+            protos /= np.linalg.norm(protos, axis=1, keepdims=True) + 1e-8
             self.sub_prototypes_[head] = protos
-            
+
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
+        from sklearn.utils.validation import check_is_fitted
         check_is_fitted(self, ["encoder_", "primary_encoder_", "prototypes_"])
         emb = self.encoder_.predict(X, verbose=0)
         dist = np.sum((emb[:, None, :] - self.prototypes_[None, :, :]) ** 2, axis=2)
         return self.primary_encoder_.inverse_transform(np.argmin(dist, axis=1))
-
-# Aliases for notebook compatibility
-BinaryPlusGesturePrototypicalNetwork = SingleHeadPrototypicalNetwork
-DynamicMultiHeadPrototypicalNetwork = MultiHeadPrototypicalNetwork
-
 # ---------------------------------------------------------------------------
 # Custom Scorer for Pipeline
 # ---------------------------------------------------------------------------

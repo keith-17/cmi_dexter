@@ -422,19 +422,25 @@ class ThermoExtractor(HoneycombBase):
                 
         return pd.concat(parts, axis=1) if parts else pd.DataFrame(index=X.index)
 
+
 class SequenceExtractor(HoneycombBase):
     """
     Orchestrates cleaning, motion filtering, and multi-domain extraction.
     Outputs a padded 3D numpy array: (n_sequences, maxlen, n_features).
+
+    Extended with Kalman and dead reckoning fine-tuning.
     """
     def __init__(
         self,
         acc_modes: AccModeStr = "raw|velocity|displacement|jerk",
         rotation_modes: RotModeStr = "quaternion",
-        tof_modes: TOFModeStr = "sensor_stats",
-        thm_modes: THMModeStr = "centered_diff",
+        tof_modes: TOFModeStr = "sensor_stats",          # FIXED: plural
+        thm_modes: THMModeStr = "centered_diff",         # FIXED: plural
         motion_filter_mode: MotionFilterMode = None,
         use_dead_reckoning: bool = False,
+        dead_reckoning_detrend: bool = False,            # NEW
+        kalman_process_noise: float = 1e-3,              # NEW
+        kalman_measurement_noise: float = 1e-2,          # NEW
         sampling_rate: int = 20,
         compute_dt: bool = True,
         window_size: int = 7,
@@ -452,6 +458,9 @@ class SequenceExtractor(HoneycombBase):
         self.thm_modes = thm_modes
         self.motion_filter_mode = motion_filter_mode
         self.use_dead_reckoning = use_dead_reckoning
+        self.dead_reckoning_detrend = dead_reckoning_detrend          # store
+        self.kalman_process_noise = kalman_process_noise              # store
+        self.kalman_measurement_noise = kalman_measurement_noise      # store
         self.sampling_rate = sampling_rate
         self.compute_dt = compute_dt
         self.window_size = window_size
@@ -463,12 +472,34 @@ class SequenceExtractor(HoneycombBase):
         self.sequence_col = sequence_col
         self.counter_col = counter_col
 
-        self.cleaner = SignalCleaner(sampling_rate, compute_dt, clip_value, interp_mode, sequence_col=sequence_col, counter_col=counter_col, window_size=window_size)
-        self.motion_filter = MotionFilter(motion_filter_mode, use_dead_reckoning=use_dead_reckoning, sequence_col=sequence_col)
-        self.imu = IMUExtractor(acc_modes, window_size=window_size, smooth_alpha=smooth_alpha, sequence_col=sequence_col)
-        self.tof = TOFExtractor(tof_modes, sequence_col=sequence_col)
-        self.thermo = ThermoExtractor(thm_modes, sequence_col=sequence_col)
+        # Create internal components with the new parameters
+        self.cleaner = SignalCleaner(
+            sampling_rate, compute_dt, clip_value, interp_mode,
+            sequence_col=sequence_col, counter_col=counter_col,
+            window_size=window_size
+        )
+        self.motion_filter = MotionFilter(
+            motion_filter_mode,
+            kalman_process_noise=kalman_process_noise,           # pass through
+            kalman_measurement_noise=kalman_measurement_noise,
+            use_dead_reckoning=use_dead_reckoning,
+            dead_reckoning_detrend=dead_reckoning_detrend,       # pass through
+            sequence_col=sequence_col
+        )
+        self.imu = IMUExtractor(
+            acc_modes, window_size=window_size, smooth_alpha=smooth_alpha,
+            sequence_col=sequence_col
+        )
+        self.tof = TOFExtractor(
+            tof_modes, sequence_col=sequence_col           # now tof_modes is plural
+        )
+        self.thermo = ThermoExtractor(
+            thm_modes, sequence_col=sequence_col           # now thm_modes is plural
+        )
         self.feature_names_in_: List[str] = []
+
+    # fit() and transform() remain exactly the same as before
+    # (no changes needed there)
 
     def fit(self, X: pd.DataFrame, y: Optional[pd.DataFrame] = None) -> 'SequenceExtractor':
         cleaned = self.cleaner.fit_transform(X)
