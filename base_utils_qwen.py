@@ -309,6 +309,8 @@ class RotationExtractor(HoneycombBase):
             elif mode == "angular_velocity" and q is not None:
                 ang_vel = df.groupby(self.sequence_col, sort=False)[self.rot_cols_].diff().div(dt, axis=0).fillna(0.0)
                 parts.append(ang_vel.add_suffix("_angvel"))
+                ang_vel_mag = np.sqrt(ang_vel.pow(2).sum(axis=1))
+                parts.append(pd.DataFrame({"ang_vel_mag": ang_vel_mag}, index=df.index))
             elif mode == "rot6d" and q is not None:
                 w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
                 R = np.zeros((len(q), 3, 3))
@@ -492,6 +494,9 @@ class SequenceExtractor(HoneycombBase):
             acc_modes, window_size=window_size, smooth_alpha=smooth_alpha,
             sequence_col=sequence_col
         )
+        self.rotation = RotationExtractor(
+            rotation_modes, sequence_col=sequence_col
+        )
         self.tof = TOFExtractor(
             tof_modes, sequence_col=sequence_col           # now tof_modes is plural
         )
@@ -499,40 +504,65 @@ class SequenceExtractor(HoneycombBase):
             thm_modes, sequence_col=sequence_col           # now thm_modes is plural
         )
         self.feature_names_in_: List[str] = []
+        self.base_feature_names_: List[str] = []
 
-    # fit() and transform() remain exactly the same as before
-    # (no changes needed there)
+    @staticmethod
+    def _global_context_feature_names(base_cols: List[str]) -> List[str]:
+        return (
+            list(base_cols)
+            + [f"{c}_global_mean" for c in base_cols]
+            + [f"{c}_global_std" for c in base_cols]
+        )
+
+    def _append_global_context(self, df: pd.DataFrame, base_cols: List[str]) -> pd.DataFrame:
+        out = df.copy()
+        grouped = out.groupby(self.sequence_col, sort=False)
+        for col in base_cols:
+            out[f"{col}_global_mean"] = grouped[col].transform("mean")
+            out[f"{col}_global_std"] = grouped[col].transform("std").fillna(0.0)
+        return out
 
     def fit(self, X: pd.DataFrame, y: Optional[pd.DataFrame] = None) -> 'SequenceExtractor':
         cleaned = self.cleaner.fit_transform(X)
         filtered = self.motion_filter.fit_transform(cleaned)
         self.imu.fit(filtered)
+        self.rotation.fit(filtered)
         self.tof.fit(filtered)
         self.thermo.fit(filtered)
 
         imu_out = self.imu.transform(filtered)
+        rot_out = self.rotation.transform(filtered)
         tof_out = self.tof.transform(filtered)
         thm_out = self.thermo.transform(filtered)
 
-        combined = pd.concat([imu_out, tof_out, thm_out], axis=1).fillna(0.0)
-        self.feature_names_in_ = list(combined.columns)
+        combined = pd.concat([imu_out, rot_out, tof_out, thm_out], axis=1).fillna(0.0)
+        base_cols = list(combined.columns)
+        self.base_feature_names_ = base_cols
+        self.feature_names_in_ = (
+            base_cols
+            + [f"{c}_global_mean" for c in base_cols]
+            + [f"{c}_global_std" for c in base_cols]
+        )
         return self
 
     def transform(self, X: pd.DataFrame) -> np.ndarray:
-        check_is_fitted(self, ["feature_names_in_"])
+        check_is_fitted(self, ["feature_names_in_", "base_feature_names_"])
 
         cleaned = self.cleaner.transform(X)
         filtered = self.motion_filter.transform(cleaned)
 
         out = pd.concat([
             self.imu.transform(filtered),
+            self.rotation.transform(filtered),
             self.tof.transform(filtered),
-            self.thermo.transform(filtered)
+            self.thermo.transform(filtered),
         ], axis=1).fillna(0.0)
 
         out[self.sequence_col] = X[self.sequence_col].values
         if self.counter_col in X.columns:
             out[self.counter_col] = X[self.counter_col].values
+
+        out = self._append_global_context(out, self.base_feature_names_)
 
         sequences = []
         for _, g in out.groupby(self.sequence_col, sort=False):

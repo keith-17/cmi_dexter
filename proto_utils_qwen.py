@@ -8,7 +8,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from tensorflow.keras import layers, models, optimizers, callbacks
+from tensorflow.keras import layers, models, optimizers, callbacks, regularizers
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import f1_score, make_scorer
@@ -117,7 +117,9 @@ class BackboneBuilder:
         lstm_units: int = 128,
         attention_heads: int = 4,
         embed_dim: int = 128,
-        dropout: float = 0.2
+        dropout: float = 0.2,
+        spatial_dropout: float = 0.1,
+        l2_reg: float = 1e-4,
     ) -> tf.keras.Model:
         inp = layers.Input(shape=input_shape, name="main_input")
         
@@ -134,13 +136,18 @@ class BackboneBuilder:
             
         x = layers.Concatenate()(branches) if len(branches) > 1 else branches[0]
 
+        l2 = regularizers.l2(l2_reg)
+        use_cnn_reg = backbone_type == "1dcnn"
+
         if backbone_type == "1dcnn":
             f_list = BackboneBuilder._parse_tuple(filters)
             k_list = BackboneBuilder._parse_tuple(kernels)
             p_list = BackboneBuilder._parse_tuple(pools)
             for i, (f, k) in enumerate(zip(f_list, k_list)):
-                x = layers.Conv1D(f, k, padding="same", activation="relu")(x)
+                x = layers.Conv1D(f, k, padding="same", activation="relu", kernel_regularizer=l2)(x)
                 x = layers.BatchNormalization()(x)
+                if spatial_dropout > 0:
+                    x = layers.SpatialDropout1D(rate=spatial_dropout)(x)
                 if i < len(p_list) and p_list[i] > 1:
                     x = layers.MaxPooling1D(p_list[i])(x)
             x = layers.GlobalAveragePooling1D()(x)
@@ -169,9 +176,10 @@ class BackboneBuilder:
         else:
             raise ValueError(f"Unknown backbone_type: {backbone_type}")
 
-        x = layers.Dense(128, activation="relu")(x)
+        dense_l2 = l2 if use_cnn_reg else None
+        x = layers.Dense(128, activation="relu", kernel_regularizer=dense_l2)(x)
         x = layers.Dropout(dropout)(x)
-        emb = layers.Dense(embed_dim, name="embedding")(x)
+        emb = layers.Dense(embed_dim, name="embedding", kernel_regularizer=dense_l2)(x)
         emb = layers.Lambda(lambda t: tf.math.l2_normalize(t, axis=-1))(emb)
         
         return models.Model(inp, emb, name=f"{backbone_type}_encoder")
@@ -194,6 +202,8 @@ class PrototypicalBase(ClassifierMixin, BaseEstimator):
             attention_heads: int = 4,
             embed_dim: int = 128,
             dropout: float = 0.2,
+            spatial_dropout: float = 0.1,
+            l2_reg: float = 1e-4,
             learning_rate: float = 1e-3,
             batch_size: int = 32,
             epochs: int = 100,
@@ -202,6 +212,7 @@ class PrototypicalBase(ClassifierMixin, BaseEstimator):
             padding_value: float = -999.0,
             verbose: int = 1,
             random_state: int = 42,
+            temperature: float = 0.1,
             # Augmentation parameters
             use_mixup: bool = False,
             mixup_alpha: float = 0.4,
@@ -238,6 +249,8 @@ class PrototypicalBase(ClassifierMixin, BaseEstimator):
         self.attention_heads = attention_heads
         self.embed_dim = embed_dim
         self.dropout = dropout
+        self.spatial_dropout = spatial_dropout
+        self.l2_reg = l2_reg
         self.learning_rate = learning_rate
         self.batch_size = batch_size
         self.epochs = epochs
@@ -246,6 +259,7 @@ class PrototypicalBase(ClassifierMixin, BaseEstimator):
         self.padding_value = padding_value
         self.verbose = verbose
         self.random_state = random_state
+        self.temperature = temperature
 
         # Augmentation parameters
         self.use_mixup = use_mixup
@@ -297,13 +311,20 @@ class PrototypicalBase(ClassifierMixin, BaseEstimator):
             freq_keep_high=freq_keep_high
         )
 
-    def _sample_episode(self, X: np.ndarray, y_enc: np.ndarray, class_indices: Dict[int, np.ndarray]):
+    def _sample_episode(
+            self,
+            X: np.ndarray,
+            y_enc: np.ndarray,
+            class_indices: Dict[int, np.ndarray],
+            return_indices: bool = False,
+    ):
         available = [c for c, idx in class_indices.items() if len(idx) >= self.n_support + self.n_query]
         if len(available) < self.n_way:
             available = list(class_indices.keys())
 
         episode_classes = np.random.choice(available, min(self.n_way, len(available)), replace=False)
         sup_x, sup_y, qry_x, qry_y = [], [], [], []
+        sup_idx, qry_idx = [], []
 
         for local_lbl, cls in enumerate(episode_classes):
             pool = class_indices[cls].copy()
@@ -312,20 +333,44 @@ class PrototypicalBase(ClassifierMixin, BaseEstimator):
             if len(pool) < need:
                 pool = np.tile(pool, (need + len(pool) - 1) // len(pool))[:need]
 
-            sup_x.append(X[pool[:self.n_support]])
+            support_pool = pool[:self.n_support]
+            query_pool = pool[self.n_support:self.n_support + self.n_query]
+            sup_x.append(X[support_pool])
             sup_y.extend([local_lbl] * self.n_support)
-            qry_x.append(X[pool[self.n_support:self.n_support + self.n_query]])
+            qry_x.append(X[query_pool])
             qry_y.extend([local_lbl] * self.n_query)
+            if return_indices:
+                sup_idx.extend(support_pool.tolist())
+                qry_idx.extend(query_pool.tolist())
 
-        return np.concatenate(sup_x), np.array(sup_y, dtype=np.int32), np.concatenate(qry_x), np.array(qry_y,
-                                                                                                       dtype=np.int32)
+        sup_x = np.concatenate(sup_x)
+        qry_x = np.concatenate(qry_x)
+        sup_y = np.array(sup_y, dtype=np.int32)
+        qry_y = np.array(qry_y, dtype=np.int32)
+        if return_indices:
+            return sup_x, sup_y, qry_x, qry_y, np.array(sup_idx, dtype=np.int32), np.array(qry_idx, dtype=np.int32)
+        return sup_x, sup_y, qry_x, qry_y
+
+    @staticmethod
+    def _remap_episode_labels(labels: np.ndarray) -> Tuple[np.ndarray, int]:
+        unique = np.sort(np.unique(labels))
+        remap = {int(v): i for i, v in enumerate(unique)}
+        local = np.array([remap[int(v)] for v in labels], dtype=np.int32)
+        return local, len(unique)
 
     @staticmethod
     @tf.function
-    def _proto_loss(sup_emb: tf.Tensor, sup_y: tf.Tensor, qry_emb: tf.Tensor, qry_y: tf.Tensor, n_way: int):
+    def _proto_loss(
+            sup_emb: tf.Tensor,
+            sup_y: tf.Tensor,
+            qry_emb: tf.Tensor,
+            qry_y: tf.Tensor,
+            n_way: int,
+            temperature: float = 0.1,
+    ):
         protos = tf.stack([tf.reduce_mean(tf.boolean_mask(sup_emb, tf.equal(sup_y, c)), axis=0) for c in range(n_way)])
         d = tf.reduce_sum((tf.expand_dims(qry_emb, 1) - tf.expand_dims(protos, 0)) ** 2, axis=2)
-        log_p = tf.nn.log_softmax(-d, axis=-1)
+        log_p = tf.nn.log_softmax(-d / temperature, axis=-1)
         loss = -tf.reduce_mean(tf.gather(log_p, qry_y, batch_dims=1))
         preds = tf.argmax(-d, axis=-1, output_type=tf.int32)
         acc = tf.reduce_mean(tf.cast(tf.equal(preds, qry_y), tf.float32))
@@ -350,6 +395,8 @@ class SingleHeadPrototypicalNetwork(PrototypicalBase):
             attention_heads: int = 4,
             embed_dim: int = 128,
             dropout: float = 0.2,
+            spatial_dropout: float = 0.1,
+            l2_reg: float = 1e-4,
             learning_rate: float = 1e-3,
             batch_size: int = 32,
             epochs: int = 100,
@@ -358,6 +405,7 @@ class SingleHeadPrototypicalNetwork(PrototypicalBase):
             padding_value: float = -999.0,
             verbose: int = 1,
             random_state: int = 42,
+            temperature: float = 0.1,
             # Augmentation parameters
             use_mixup: bool = False,
             mixup_alpha: float = 0.4,
@@ -395,6 +443,8 @@ class SingleHeadPrototypicalNetwork(PrototypicalBase):
             attention_heads=attention_heads,
             embed_dim=embed_dim,
             dropout=dropout,
+            spatial_dropout=spatial_dropout,
+            l2_reg=l2_reg,
             learning_rate=learning_rate,
             batch_size=batch_size,
             epochs=epochs,
@@ -403,6 +453,7 @@ class SingleHeadPrototypicalNetwork(PrototypicalBase):
             padding_value=padding_value,
             verbose=verbose,
             random_state=random_state,
+            temperature=temperature,
             use_mixup=use_mixup,
             mixup_alpha=mixup_alpha,
             mixup_prob=mixup_prob,
@@ -470,6 +521,8 @@ class SingleHeadPrototypicalNetwork(PrototypicalBase):
             attention_heads=self.attention_heads,
             embed_dim=self.embed_dim,
             dropout=self.dropout,
+            spatial_dropout=self.spatial_dropout,
+            l2_reg=self.l2_reg,
         )
 
         opt = optimizers.Adam(self.learning_rate)
@@ -504,7 +557,7 @@ class SingleHeadPrototypicalNetwork(PrototypicalBase):
                     sup_emb = self.encoder_(sup_x, training=True)
                     qry_emb = self.encoder_(qry_x, training=True)
                     loss, acc = self._proto_loss(
-                        sup_emb, sup_y, qry_emb, qry_y, len(np.unique(sup_y))
+                        sup_emb, sup_y, qry_emb, qry_y, len(np.unique(sup_y)), self.temperature
                     )
 
                 grads = tape.gradient(loss, self.encoder_.trainable_variables)
@@ -536,7 +589,7 @@ class SingleHeadPrototypicalNetwork(PrototypicalBase):
                         sup_emb = self.encoder_(sup_x, training=False)
                         qry_emb = self.encoder_(qry_x, training=False)
                         loss, acc = self._proto_loss(
-                            sup_emb, sup_y, qry_emb, qry_y, len(np.unique(sup_y))
+                            sup_emb, sup_y, qry_emb, qry_y, len(np.unique(sup_y)), self.temperature
                         )
                         val_loss += loss.numpy()
                         val_acc += acc.numpy()
@@ -609,6 +662,8 @@ class MultiHeadPrototypicalNetwork(PrototypicalBase):
             attention_heads: int = 4,
             embed_dim: int = 128,
             dropout: float = 0.2,
+            spatial_dropout: float = 0.1,
+            l2_reg: float = 1e-4,
             learning_rate: float = 1e-3,
             batch_size: int = 32,
             epochs: int = 100,
@@ -617,6 +672,7 @@ class MultiHeadPrototypicalNetwork(PrototypicalBase):
             padding_value: float = -999.0,
             verbose: int = 1,
             random_state: int = 42,
+            temperature: float = 0.1,
             # Augmentation parameters
             use_mixup: bool = False,
             mixup_alpha: float = 0.4,
@@ -640,6 +696,8 @@ class MultiHeadPrototypicalNetwork(PrototypicalBase):
             use_freq_filter: bool = False,
             freq_keep_low: float = 0.1,
             freq_keep_high: float = 0.9,
+            uncertainty_weighting: bool = True,
+            fixed_loss_weights: Optional[Dict[str, float]] = None,
     ):
         if isinstance(sub_heads, str) and sub_heads.startswith(('[', '{')):
             try:
@@ -648,6 +706,10 @@ class MultiHeadPrototypicalNetwork(PrototypicalBase):
                 pass
         self.primary_target = primary_target
         self.sub_heads = sub_heads or ["gesture_action", "orientation", "phase"]
+        self.uncertainty_weighting = uncertainty_weighting
+        self.fixed_loss_weights_ = dict(fixed_loss_weights or {"primary": 1.0})
+        for head in self.sub_heads:
+            self.fixed_loss_weights_.setdefault(head, 0.5)
         super().__init__(
             n_way=n_way,
             n_support=n_support,
@@ -660,6 +722,8 @@ class MultiHeadPrototypicalNetwork(PrototypicalBase):
             attention_heads=attention_heads,
             embed_dim=embed_dim,
             dropout=dropout,
+            spatial_dropout=spatial_dropout,
+            l2_reg=l2_reg,
             learning_rate=learning_rate,
             batch_size=batch_size,
             epochs=epochs,
@@ -668,6 +732,7 @@ class MultiHeadPrototypicalNetwork(PrototypicalBase):
             padding_value=padding_value,
             verbose=verbose,
             random_state=random_state,
+            temperature=temperature,
             use_mixup=use_mixup,
             mixup_alpha=mixup_alpha,
             mixup_prob=mixup_prob,
@@ -692,6 +757,97 @@ class MultiHeadPrototypicalNetwork(PrototypicalBase):
             freq_keep_high=freq_keep_high,
         )
 
+    def _head_episode_labels(
+            self,
+            support_global: np.ndarray,
+            query_global: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, int]:
+        unique = np.sort(np.unique(np.concatenate([support_global, query_global])))
+        remap = {int(v): i for i, v in enumerate(unique)}
+        sup_local = np.array([remap[int(v)] for v in support_global], dtype=np.int32)
+        qry_local = np.array([remap[int(v)] for v in query_global], dtype=np.int32)
+        return sup_local, qry_local, len(unique)
+
+    def _multitask_proto_losses(
+            self,
+            sup_emb: tf.Tensor,
+            qry_emb: tf.Tensor,
+            sup_idx: np.ndarray,
+            qry_idx: np.ndarray,
+            sup_y_primary: np.ndarray,
+            qry_y_primary: np.ndarray,
+    ) -> Tuple[Dict[str, tf.Tensor], Dict[str, tf.Tensor]]:
+        head_losses: Dict[str, tf.Tensor] = {}
+        head_accs: Dict[str, tf.Tensor] = {}
+
+        n_way_primary = len(np.unique(sup_y_primary))
+        loss_p, acc_p = self._proto_loss(
+            sup_emb, sup_y_primary, qry_emb, qry_y_primary, n_way_primary, self.temperature
+        )
+        head_losses["primary"] = loss_p
+        head_accs["primary"] = acc_p
+
+        for head, y_enc in self.y_encodings_.items():
+            if head == "primary":
+                continue
+            sup_y_h, qry_y_h, n_way_h = self._head_episode_labels(y_enc[sup_idx], y_enc[qry_idx])
+            if n_way_h < 1:
+                continue
+            loss_h, acc_h = self._proto_loss(
+                sup_emb, sup_y_h, qry_emb, qry_y_h, n_way_h, self.temperature
+            )
+            head_losses[head] = loss_h
+            head_accs[head] = acc_h
+
+        return head_losses, head_accs
+
+    def _combine_head_losses(self, head_losses: Dict[str, tf.Tensor]) -> tf.Tensor:
+        if self.uncertainty_weighting:
+            total = tf.constant(0.0, dtype=tf.float32)
+            for head, loss in head_losses.items():
+                log_var = self.log_vars_[head]
+                total += tf.exp(-log_var) * loss + log_var
+            return total
+
+        total = tf.constant(0.0, dtype=tf.float32)
+        for head, loss in head_losses.items():
+            weight = float(self.fixed_loss_weights_.get(head, 0.5))
+            total += weight * loss
+        return total
+
+    def _episode_step(
+            self,
+            X: np.ndarray,
+            class_indices: Dict[int, List[int]],
+            training: bool,
+    ) -> Tuple[float, float]:
+        sup_x, sup_y, qry_x, qry_y, sup_idx, qry_idx = self._sample_episode(
+            X, self.y_encodings_["primary"], class_indices, return_indices=True
+        )
+        sup_x, _ = self.augmentor(sup_x, padding_value=self.padding_value)
+        qry_x, _ = self.augmentor(qry_x, padding_value=self.padding_value)
+
+        if training:
+            with tf.GradientTape() as tape:
+                sup_emb = self.encoder_(sup_x, training=True)
+                qry_emb = self.encoder_(qry_x, training=True)
+                head_losses, head_accs = self._multitask_proto_losses(
+                    sup_emb, qry_emb, sup_idx, qry_idx, sup_y, qry_y
+                )
+                total_loss = self._combine_head_losses(head_losses)
+            trainable_vars = self.encoder_.trainable_variables + list(self.log_vars_.values())
+            grads = tape.gradient(total_loss, trainable_vars)
+            self.optimizer_.apply_gradients(zip(grads, trainable_vars))
+            return float(total_loss.numpy()), float(head_accs["primary"].numpy())
+
+        sup_emb = self.encoder_(sup_x, training=False)
+        qry_emb = self.encoder_(qry_x, training=False)
+        head_losses, head_accs = self._multitask_proto_losses(
+            sup_emb, qry_emb, sup_idx, qry_idx, sup_y, qry_y
+        )
+        total_loss = self._combine_head_losses(head_losses)
+        return float(total_loss.numpy()), float(head_accs["primary"].numpy())
+
     def fit(self, X: np.ndarray, y: pd.DataFrame):
         tf.keras.backend.clear_session()
         tf.random.set_seed(self.random_state)
@@ -713,14 +869,21 @@ class MultiHeadPrototypicalNetwork(PrototypicalBase):
         y_primary = self.primary_encoder_.fit_transform(y_seq[self.primary_target])
         self.primary_classes_ = self.primary_encoder_.classes_
 
-        # Sub-head encoders
+        # Sub-head encoders and per-sequence encodings for all heads
         self.sub_encoders_ = {}
         self.sub_prototypes_ = {}
+        self.y_encodings_ = {"primary": y_primary.astype(np.int32)}
         for head in self.sub_heads:
             if head in y_seq.columns:
                 le = LabelEncoder()
                 le.fit(y_seq[head])
                 self.sub_encoders_[head] = le
+                self.y_encodings_[head] = le.transform(y_seq[head]).astype(np.int32)
+
+        self.log_vars_ = {
+            head: tf.Variable(0.0, trainable=True, dtype=tf.float32, name=f"log_var_{head}")
+            for head in self.y_encodings_
+        }
 
         # Get class indices for training sequences
         train_class_indices = {}
@@ -738,9 +901,11 @@ class MultiHeadPrototypicalNetwork(PrototypicalBase):
             attention_heads=self.attention_heads,
             embed_dim=self.embed_dim,
             dropout=self.dropout,
+            spatial_dropout=self.spatial_dropout,
+            l2_reg=self.l2_reg,
         )
 
-        opt = optimizers.Adam(self.learning_rate)
+        self.optimizer_ = optimizers.Adam(self.learning_rate)
         best_val_loss = np.inf
         patience_cnt = 0
         steps = max(1, len(train_indices) // self.batch_size)
@@ -751,10 +916,12 @@ class MultiHeadPrototypicalNetwork(PrototypicalBase):
             'val_loss': [], 'val_acc': [],
         }
 
+        active_heads = [h for h in self.y_encodings_]
         if int(self.verbose) > 0:
             print(
                 f"Training for up to {self.epochs} epochs "
-                f"({steps} steps/epoch, {len(train_indices)} train / {len(val_indices)} val sequences)...",
+                f"({steps} steps/epoch, {len(train_indices)} train / {len(val_indices)} val sequences, "
+                f"heads={active_heads})...",
                 flush=True,
             )
 
@@ -763,21 +930,9 @@ class MultiHeadPrototypicalNetwork(PrototypicalBase):
             train_loss = 0.0
             train_acc = 0.0
             for _ in range(steps):
-                sup_x, sup_y, qry_x, qry_y = self._sample_episode(X, y_primary, train_class_indices)
-                sup_x, _ = self.augmentor(sup_x, padding_value=self.padding_value)
-                qry_x, _ = self.augmentor(qry_x, padding_value=self.padding_value)
-
-                with tf.GradientTape() as tape:
-                    sup_emb = self.encoder_(sup_x, training=True)
-                    qry_emb = self.encoder_(qry_x, training=True)
-                    loss, acc = self._proto_loss(
-                        sup_emb, sup_y, qry_emb, qry_y, len(np.unique(sup_y))
-                    )
-
-                grads = tape.gradient(loss, self.encoder_.trainable_variables)
-                opt.apply_gradients(zip(grads, self.encoder_.trainable_variables))
-                train_loss += loss.numpy()
-                train_acc += acc.numpy()
+                step_loss, step_acc = self._episode_step(X, train_class_indices, training=True)
+                train_loss += step_loss
+                train_acc += step_acc
 
             train_loss /= steps
             train_acc /= steps
@@ -795,17 +950,9 @@ class MultiHeadPrototypicalNetwork(PrototypicalBase):
                     val_ran = True
                     val_steps = max(1, len(val_indices) // self.batch_size)
                     for _ in range(val_steps):
-                        sup_x, sup_y, qry_x, qry_y = self._sample_episode(X, y_primary, val_class_indices)
-                        sup_x, _ = self.augmentor(sup_x, padding_value=self.padding_value)
-                        qry_x, _ = self.augmentor(qry_x, padding_value=self.padding_value)
-
-                        sup_emb = self.encoder_(sup_x, training=False)
-                        qry_emb = self.encoder_(qry_x, training=False)
-                        loss, acc = self._proto_loss(
-                            sup_emb, sup_y, qry_emb, qry_y, len(np.unique(sup_y))
-                        )
-                        val_loss += loss.numpy()
-                        val_acc += acc.numpy()
+                        step_loss, step_acc = self._episode_step(X, val_class_indices, training=False)
+                        val_loss += step_loss
+                        val_acc += step_acc
 
                     val_loss /= val_steps
                     val_acc /= val_steps
