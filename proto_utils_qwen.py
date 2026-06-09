@@ -320,16 +320,23 @@ class PrototypicalBase(ClassifierMixin, BaseEstimator):
     ):
         available = [c for c, idx in class_indices.items() if len(idx) >= self.n_support + self.n_query]
         if len(available) < self.n_way:
-            available = list(class_indices.keys())
+            available = [c for c, idx in class_indices.items() if len(idx) > 0]
+        if not available:
+            raise ValueError(
+                "No classes with samples available for episode sampling "
+                f"(n_support={self.n_support}, n_query={self.n_query})."
+            )
 
         episode_classes = np.random.choice(available, min(self.n_way, len(available)), replace=False)
         sup_x, sup_y, qry_x, qry_y = [], [], [], []
         sup_idx, qry_idx = [], []
 
         for local_lbl, cls in enumerate(episode_classes):
-            pool = class_indices[cls].copy()
+            pool = np.asarray(class_indices[cls], dtype=np.int32).copy()
             np.random.shuffle(pool)
             need = self.n_support + self.n_query
+            if len(pool) == 0:
+                continue
             if len(pool) < need:
                 pool = np.tile(pool, (need + len(pool) - 1) // len(pool))[:need]
 
@@ -707,9 +714,7 @@ class MultiHeadPrototypicalNetwork(PrototypicalBase):
         self.primary_target = primary_target
         self.sub_heads = sub_heads or ["gesture_action", "orientation", "phase"]
         self.uncertainty_weighting = uncertainty_weighting
-        self.fixed_loss_weights_ = dict(fixed_loss_weights or {"primary": 1.0})
-        for head in self.sub_heads:
-            self.fixed_loss_weights_.setdefault(head, 0.5)
+        self.fixed_loss_weights = fixed_loss_weights
         super().__init__(
             n_way=n_way,
             n_support=n_support,
@@ -801,6 +806,14 @@ class MultiHeadPrototypicalNetwork(PrototypicalBase):
 
         return head_losses, head_accs
 
+    def _effective_loss_weights(self) -> Dict[str, float]:
+        weights = {"primary": 1.0}
+        if self.fixed_loss_weights:
+            weights.update(self.fixed_loss_weights)
+        for head in self.sub_heads:
+            weights.setdefault(head, 0.5)
+        return weights
+
     def _combine_head_losses(self, head_losses: Dict[str, tf.Tensor]) -> tf.Tensor:
         if self.uncertainty_weighting:
             total = tf.constant(0.0, dtype=tf.float32)
@@ -809,9 +822,10 @@ class MultiHeadPrototypicalNetwork(PrototypicalBase):
                 total += tf.exp(-log_var) * loss + log_var
             return total
 
+        weights = self._effective_loss_weights()
         total = tf.constant(0.0, dtype=tf.float32)
         for head, loss in head_losses.items():
-            weight = float(self.fixed_loss_weights_.get(head, 0.5))
+            weight = float(weights.get(head, 0.5))
             total += weight * loss
         return total
 
