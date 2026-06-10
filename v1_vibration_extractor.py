@@ -1,238 +1,325 @@
 import numpy as np
 import pandas as pd
-from scipy import signal
+from typing import Tuple, Optional, List, Dict, Any
 from sklearn.base import BaseEstimator, TransformerMixin
-from typing import List, Dict, Tuple, Union, Optional
+from scipy.fft import fft, fftfreq
+from scipy.signal import find_peaks
+from scipy.ndimage import center_of_mass
+import warnings
 
-def compute_fft_spectrum(signal_data: np.ndarray, sampling_rate: float) -> pd.Series:
-    """
-    Computes the single-sided amplitude spectrum of a 1D signal.
-    
-    Args:
-        signal_data (np.ndarray): 1D array of signal values.
-        sampling_rate (float): Sampling rate in Hz.
-        
-    Returns:
-        pd.Series: Spectrum with frequency as index and amplitude as values.
-    """
-    n = len(signal_data)
-    fft_vals = np.fft.rfft(signal_data)
-    fft_freqs = np.fft.rfftfreq(n, d=1.0 / sampling_rate)
-    amplitude = np.abs(fft_vals) / n
-    return pd.Series(amplitude, index=fft_freqs, name='amplitude')
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+
 
 def get_moments_auc(u: np.ndarray, v: np.ndarray) -> Tuple[float, float, float, float, float]:
     """
-    Calculates the statistical moments and Area Under Curve (AUC) of a distribution.
+    Calculates the distributional moments and Area Under Curve (AUC) of a spectrum.
+    Inspired by pumpflow package spectral analysis.
     
-    Args:
-        u (np.ndarray): Independent variable (e.g., frequency).
-        v (np.ndarray): Dependent variable (e.g., amplitude/power), will be min-max scaled.
+    Parameters
+    ----------
+    u : np.ndarray
+        Frequency values (x-axis).
+    v : np.ndarray
+        Magnitude/Power values (y-axis).
         
-    Returns:
-        Tuple[float, float, float, float, float]: mean, std, skew, kurtosis, auc.
+    Returns
+    -------
+    Tuple[float, float, float, float, float]
+        (mean, std, skew, kurtosis, auc)
     """
     v_scaled = (v - np.min(v)) / (np.max(v) - np.min(v) + 1e-10)
-    w = v_scaled
-    z = u
+    w = v_scaled.reshape(-1)
+    z = u.reshape(-1)
     
-    sum_w = np.sum(w)
-    if sum_w == 0:
-        return 0.0, 0.0, 0.0, 0.0, 0.0
-        
-    mean = np.sum(w * z) / sum_w
-    variance = np.sum(w * (z - mean)**2) / sum_w
-    std = np.sqrt(variance)
-    skew = np.sum(w * (z - mean)**3) / (sum_w * (std**3 + 1e-10))
-    kurtosis = np.sum(w * (z - mean)**4) / (sum_w * (std**4 + 1e-10))
+    total_w = np.sum(w) + 1e-10
+    mean = np.sum(w * z) / total_w
+    variance = np.sum(w * (z - mean) ** 2) / total_w
+    std = np.sqrt(variance) + 1e-10
+    skew = np.sum(w * (z - mean) ** 3) / (total_w * (std ** 3))
+    kurtosis = np.sum(w * (z - mean) ** 4) / (total_w * (std ** 4))
     auc = np.sum(w)
     
     return float(mean), float(std), float(skew), float(kurtosis), float(auc)
 
-def get_freq_bands_cut_points(spectrum: pd.Series, max_no_peaks: int = 10, peaks_prominence: float = 1e-4) -> Tuple[np.ndarray, np.ndarray]:
+
+def get_freq_bands_cut_points(spectrum: pd.Series, max_no_peaks: int = 10, prominence: float = 1e-4) -> np.ndarray:
     """
-    Identifies peak frequencies in a spectrum and computes cut points for frequency bands.
+    Obtains frequency band cut points from peaks in the aggregated spectrum.
     
-    Args:
-        spectrum (pd.Series): Spectrum data with frequency as index.
-        max_no_peaks (int): Maximum number of peaks to consider.
-        peaks_prominence (float): Minimum prominence for a peak to be considered.
+    Parameters
+    ----------
+    spectrum : pd.Series
+        Spectrum with frequency as index and magnitude as values.
+    max_no_peaks : int
+        Maximum number of peaks to consider.
+    prominence : float
+        Prominence threshold for peak detection.
         
-    Returns:
-        Tuple[np.ndarray, np.ndarray]: Array of cut points and array of peak frequencies.
+    Returns
+    -------
+    np.ndarray
+        Array of frequency cut points for binning.
     """
-    idx_peaks, _ = signal.find_peaks(spectrum.values, prominence=peaks_prominence)
+    idx_peaks, _ = find_peaks(spectrum.values, prominence=prominence)
     freq_peaks = spectrum.iloc[idx_peaks].index.values
     
     if len(freq_peaks) > max_no_peaks:
-        peak_amps = spectrum.iloc[idx_peaks].values
-        top_indices = np.argsort(peak_amps)[-max_no_peaks:]
-        freq_peaks = np.sort(freq_peaks[top_indices])
+        # Sort by magnitude and take top N
+        peak_mags = spectrum.iloc[idx_peaks].values
+        top_idx = np.argsort(peak_mags)[-max_no_peaks:]
+        freq_peaks = np.sort(freq_peaks[top_idx])
         
     if len(freq_peaks) < 2:
-        return np.array([spectrum.index.min(), spectrum.index.max()]), freq_peaks
+        return np.array([0.0, spectrum.index.max()])
         
     between_peaks = np.abs(np.diff(freq_peaks)) / 2.0
     midpoints = freq_peaks[:-1] + between_peaks
     
-    cut_points = np.concatenate([
-        [spectrum.index.min()],
-        midpoints,
-        [spectrum.index.max()]
-    ])
-    
-    return cut_points, freq_peaks
+    cut_points = np.concatenate([[0.0], midpoints, [spectrum.index.max()]])
+    return np.unique(cut_points)
 
-def extract_band_features(spectrum: pd.Series, cut_points: np.ndarray, band_prefix: str) -> pd.Series:
+
+def extract_spectral_band_features(signal: np.ndarray, sampling_rate: float, axis_name: str) -> Dict[str, float]:
     """
-    Extracts peak and distributional features for each frequency band.
+    Extracts peak coordinates and distributional/AUC features per frequency band for a 1D signal.
     
-    Args:
-        spectrum (pd.Series): Spectrum data.
-        cut_points (np.ndarray): Array of frequency band boundaries.
-        band_prefix (str): Prefix for feature names (e.g., 'acc_x').
+    Parameters
+    ----------
+    signal : np.ndarray
+        1D time-series signal.
+    sampling_rate : float
+        Sampling rate in Hz.
+    axis_name : str
+        Name of the sensor axis (e.g., 'acc_x').
         
-    Returns:
-        pd.Series: Flattened series of extracted features.
+    Returns
+    -------
+    Dict[str, float]
+        Dictionary of extracted spectral features.
     """
     features = {}
-    spectrum_reset = spectrum.reset_index()
-    spectrum_reset.columns = ['freq', 'power']
+    n = len(signal)
+    if n < 4:
+        return features
+        
+    fft_vals = np.abs(fft(signal))[:n // 2]
+    freqs = fftfreq(n, d=1.0 / sampling_rate)[:n // 2]
     
-    spectrum_reset['band'] = pd.cut(spectrum_reset['freq'], bins=cut_points, include_lowest=True)
+    spectrum = pd.Series(fft_vals, index=freqs)
+    cut_points = get_freq_bands_cut_points(spectrum, max_no_peaks=8, prominence=1e-4)
     
-    for i, (band_interval, group) in enumerate(spectrum_reset.groupby('band', observed=True)):
-        band_name = f"{band_prefix}_b{i+1}"
-        
-        idx_max = group['power'].idxmax()
-        features[f"{band_name}_peak_freq"] = float(group.loc[idx_max, 'freq'])
-        features[f"{band_name}_peak_power"] = float(group.loc[idx_max, 'power'])
-        
-        mean, std, skew, kurt, auc = get_moments_auc(group['freq'].values, group['power'].values)
-        features[f"{band_name}_mean"] = mean
-        features[f"{band_name}_std"] = std
-        features[f"{band_name}_skew"] = skew
-        features[f"{band_name}_kurt"] = kurt
-        features[f"{band_name}_auc"] = auc
-        
-    return pd.Series(features)
+    # Global peak
+    peak_idx = np.argmax(fft_vals)
+    features[f'{axis_name}_peak_freq'] = float(freqs[peak_idx])
+    features[f'{axis_name}_peak_mag'] = float(fft_vals[peak_idx])
+    features[f'{axis_name}_total_energy'] = float(np.sum(fft_vals ** 2))
+    
+    # Band features
+    for i in range(len(cut_points) - 1):
+        low, high = cut_points[i], cut_points[i + 1]
+        mask = (freqs >= low) & (freqs < high)
+        if np.any(mask):
+            band_freqs = freqs[mask]
+            band_mags = fft_vals[mask]
+            mean, std, skew, kurt, auc = get_moments_auc(band_freqs, band_mags)
+            
+            features[f'{axis_name}_b{i+1}_mean'] = mean
+            features[f'{axis_name}_b{i+1}_std'] = std
+            features[f'{axis_name}_b{i+1}_skew'] = skew
+            features[f'{axis_name}_b{i+1}_kurt'] = kurt
+            features[f'{axis_name}_b{i+1}_auc'] = auc
+            
+    return features
 
-class SensorFeatureExtractor(BaseEstimator, TransformerMixin):
+
+def extract_thermopile_spatial_features(thm_df: pd.DataFrame) -> Dict[str, float]:
     """
-    Scikit-learn compatible feature extractor for IMU, ToF, and Thermo sensor data.
-    Inspired by spectral feature extraction pipelines (e.g., PFSpectraFeatExtr).
+    Extracts spatial and temporal statistics from thermopile sensors.
+    
+    Parameters
+    ----------
+    thm_df : pd.DataFrame
+        DataFrame containing thermopile sensor columns.
+        
+    Returns
+    -------
+    Dict[str, float]
+        Dictionary of thermopile features.
+    """
+    features = {}
+    all_values = thm_df.values.flatten()
+    all_values = all_values[np.isfinite(all_values)]
+    
+    if len(all_values) == 0:
+        return {f'thm_all_{stat}': 0.0 for stat in ['mean', 'std', 'min', 'max']}
+        
+    features['thm_all_mean'] = float(np.mean(all_values))
+    features['thm_all_std'] = float(np.std(all_values))
+    features['thm_all_min'] = float(np.min(all_values))
+    features['thm_all_max'] = float(np.max(all_values))
+    
+    # Per-sensor stats
+    for col in thm_df.columns:
+        vals = thm_df[col].dropna().values
+        if len(vals) > 0:
+            features[f'{col}_mean'] = float(np.mean(vals))
+            features[f'{col}_std'] = float(np.std(vals))
+            features[f'{col}_diff_mean'] = float(np.mean(np.diff(vals))) if len(vals) > 1 else 0.0
+            
+    # Spatial asymmetry (assuming ordered sensors)
+    sensor_means = thm_df.mean(axis=0).values
+    if len(sensor_means) >= 2:
+        mid = len(sensor_means) // 2
+        features['thm_left_right_diff'] = float(np.mean(sensor_means[:mid]) - np.mean(sensor_means[mid:]))
+        features['thm_sensor_mean_std'] = float(np.std(sensor_means))
+        
+    return features
+
+
+def extract_tof_spatial_features(tof_df: pd.DataFrame) -> Dict[str, float]:
+    """
+    Extracts spatial features from Time-of-Flight (ToF) data, treating 64 values as an 8x8 grid.
+    
+    Parameters
+    ----------
+    tof_df : pd.DataFrame
+        DataFrame containing ToF sensor columns (e.g., tof_1_v0 to tof_1_v63).
+        
+    Returns
+    -------
+    Dict[str, float]
+        Dictionary of ToF spatial features.
+    """
+    features = {}
+    sensor_prefixes = sorted(list(set([c.split('_v')[0] for c in tof_df.columns if '_v' in c])))
+    
+    for sensor in sensor_prefixes:
+        s_cols = [c for c in tof_df.columns if c.startswith(f"{sensor}_v")]
+        s_cols = sorted(s_cols, key=lambda x: int(x.split('_v')[-1]))
+        
+        if len(s_cols) != 64:
+            continue
+            
+        # Aggregate over time for stability, or take mean frame
+        mean_frame = tof_df[s_cols].mean(axis=0).values.astype(float)
+        mean_frame = np.where((mean_frame <= 0) | (mean_frame >= 4000), np.nan, mean_frame)
+        
+        if np.all(np.isnan(mean_frame)):
+            continue
+            
+        frame = mean_frame.reshape(8, 8)
+        valid_mask = np.isfinite(frame)
+        valid_ratio = np.sum(valid_mask) / 64.0
+        
+        if valid_ratio > 0:
+            median_val = np.nanmedian(frame[valid_mask])
+            frame = np.nan_to_num(frame, nan=median_val)
+        else:
+            frame = np.zeros((8, 8))
+            
+        features[f'{sensor}_valid_ratio'] = float(valid_ratio)
+        features[f'{sensor}_mean'] = float(np.mean(frame))
+        features[f'{sensor}_std'] = float(np.std(frame))
+        
+        # Quadrants
+        features[f'{sensor}_q1_mean'] = float(np.mean(frame[:4, :4]))
+        features[f'{sensor}_q2_mean'] = float(np.mean(frame[:4, 4:]))
+        features[f'{sensor}_q3_mean'] = float(np.mean(frame[4:, :4]))
+        features[f'{sensor}_q4_mean'] = float(np.mean(frame[4:, 4:]))
+        
+        # Center vs Edge
+        center = frame[2:6, 2:6]
+        edge = np.concatenate([frame[:2, :], frame[6:, :], frame[:, :2], frame[:, 6:]])
+        features[f'{sensor}_center_mean'] = float(np.mean(center))
+        features[f'{sensor}_edge_mean'] = float(np.mean(edge))
+        
+        # Center of Mass
+        weights = np.maximum(0, 4000.0 - frame)
+        if np.sum(weights) > 0:
+            com_r, com_c = center_of_mass(weights)
+            features[f'{sensor}_com_r'] = float(com_r)
+            features[f'{sensor}_com_c'] = float(com_c)
+        else:
+            features[f'{sensor}_com_r'] = 4.0
+            features[f'{sensor}_com_c'] = 4.0
+            
+    return features
+
+
+class V1CargoExtractor(BaseEstimator, TransformerMixin):
+    """
+    Tabular feature extractor for cargo behavior data (IMU, Rotation, Thermopile, ToF).
+    Heavily inspired by spectral moment extraction and spatial grid analysis.
     """
     def __init__(
         self,
+        imu_cols: Optional[List[str]] = None,
+        rot_cols: Optional[List[str]] = None,
+        thm_cols: Optional[List[str]] = None,
+        tof_cols: Optional[List[str]] = None,
         sampling_rate: float = 100.0,
-        max_no_peaks: int = 10,
-        peaks_prominence: float = 1e-4,
-        imu_channels: List[str] = ['acc_x', 'acc_y', 'acc_z', 'rot_x', 'rot_y', 'rot_z'],
-        tof_channels: List[str] = ['tof'],
-        thermo_channels: List[str] = ['thermo'],
-        apply_spectral_to_low_freq: bool = False
+        disable_tqdm: bool = True
     ):
+        self.imu_cols = imu_cols or ['acc_x', 'acc_y', 'acc_z']
+        self.rot_cols = rot_cols or ['rot_w', 'rot_x', 'rot_y', 'rot_z']
+        self.thm_cols = thm_cols or ['thm_1', 'thm_2', 'thm_3', 'thm_4', 'thm_5']
+        self.tof_cols = tof_cols
         self.sampling_rate = sampling_rate
-        self.max_no_peaks = max_no_peaks
-        self.peaks_prominence = peaks_prominence
-        self.imu_channels = imu_channels
-        self.tof_channels = tof_channels
-        self.thermo_channels = thermo_channels
-        self.apply_spectral_to_low_freq = apply_spectral_to_low_freq
-        
-        self.cut_points_ = {}
-        self.peaks_ = {}
-        self.feature_names_out_ = []
+        self.disable_tqdm = disable_tqdm
 
-    def fit(self, X: pd.DataFrame, y: Optional[pd.Series] = None) -> 'SensorFeatureExtractor':
-        """
-        Fits the extractor by determining global frequency band cut points for each channel.
-        """
-        all_channels = self.imu_channels + self.tof_channels + self.thermo_channels
-        
-        for ch in all_channels:
-            if ch not in X.columns:
-                continue
-            if 'sequence_id' in X.columns:
-                agg_signal = X.groupby('sequence_id')[ch].apply(lambda x: np.mean(np.abs(np.fft.rfft(x))) / len(x)).values
-            else:
-                agg_signal = X[ch].values
-                
-            spectrum = compute_fft_spectrum(agg_signal, self.sampling_rate)
-            cut_points, freq_peaks = get_freq_bands_cut_points(
-                spectrum, max_no_peaks=self.max_no_peaks, peaks_prominence=self.peaks_prominence
-            )
-            self.cut_points_[ch] = cut_points
-            self.peaks_[ch] = freq_peaks
-            
-        self._generate_feature_names()
+    def fit(self, X: pd.DataFrame, y: Optional[pd.DataFrame] = None) -> 'V1CargoExtractor':
         return self
 
-    def _generate_feature_names(self):
-        """Generates the list of expected output feature names."""
-        names = []
-        low_freq_channels = (self.tof_channels if self.apply_spectral_to_low_freq else []) + \
-                            (self.thermo_channels if self.apply_spectral_to_low_freq else [])
-        all_spectral_channels = self.imu_channels + low_freq_channels
-        
-        for ch in all_spectral_channels:
-            if ch in self.cut_points_:
-                n_bands = len(self.cut_points_[ch]) - 1
-                for i in range(1, n_bands + 1):
-                    names.extend([
-                        f"{ch}_b{i}_peak_freq", f"{ch}_b{i}_peak_power",
-                        f"{ch}_b{i}_mean", f"{ch}_b{i}_std", 
-                        f"{ch}_b{i}_skew", f"{ch}_b{i}_kurt", f"{ch}_b{i}_auc"
-                    ])
-                    
-        if not self.apply_spectral_to_low_freq:
-            for ch in self.tof_channels + self.thermo_channels:
-                names.extend([f"{ch}_mean", f"{ch}_std", f"{ch}_min", f"{ch}_max", f"{ch}_trend"])
-                
-        self.feature_names_out_ = names
-
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        """
-        Transforms input data into a flat feature matrix.
-        """
-        if 'sequence_id' not in X.columns:
-            raise ValueError("Input DataFrame must contain a 'sequence_id' column for segmentation.")
-            
-        transformed_data = []
-        all_channels = self.imu_channels + self.tof_channels + self.thermo_channels
+        sequence_list = []
+        sequence_ids = X['sequence_id'].unique()
         
-        for seq_id, group in X.groupby('sequence_id'):
-            seq_features = {}
+        for seq_id in sequence_ids:
+            seq_df = X[X['sequence_id'] == seq_id]
+            record = {'sequence_id': seq_id}
             
-            for ch in all_channels:
-                if ch not in group.columns or ch not in self.cut_points_:
-                    continue
-                    
-                signal_data = group[ch].dropna().values
-                if len(signal_data) < 10:
-                    continue
-                    
-                if ch in self.imu_channels or self.apply_spectral_to_low_freq:
-                    spectrum = compute_fft_spectrum(signal_data, self.sampling_rate)
-                    band_feats = extract_band_features(spectrum, self.cut_points_[ch], band_prefix=ch)
-                    seq_features.update(band_feats.to_dict())
-                else:
-                    seq_features[f"{ch}_mean"] = float(np.mean(signal_data))
-                    seq_features[f"{ch}_std"] = float(np.std(signal_data))
-                    seq_features[f"{ch}_min"] = float(np.min(signal_data))
-                    seq_features[f"{ch}_max"] = float(np.max(signal_data))
-                    if len(signal_data) > 1:
-                        trend = np.polyfit(np.arange(len(signal_data)), signal_data, 1)[0]
-                        seq_features[f"{ch}_trend"] = float(trend)
-                    else:
-                        seq_features[f"{ch}_trend"] = 0.0
+            # 1. IMU Spectral Features
+            if self.imu_cols:
+                imu_df = seq_df[self.imu_cols].dropna()
+                if not imu_df.empty:
+                    for col in self.imu_cols:
+                        record.update(extract_spectral_band_features(
+                            imu_df[col].values, self.sampling_rate, col
+                        ))
                         
-            seq_features['sequence_id'] = seq_id
-            transformed_data.append(seq_features)
+            # 2. Rotation Spectral Features (on delta/derivative)
+            if self.rot_cols:
+                rot_df = seq_df[self.rot_cols].dropna()
+                if not rot_df.empty:
+                    # Convert quaternion to euler or just use delta of existing
+                    rot_delta = rot_df.diff().fillna(0.0)
+                    for col in rot_delta.columns:
+                        record.update(extract_spectral_band_features(
+                            rot_delta[col].values, self.sampling_rate, f"rot_{col}"
+                        ))
+                        
+            # 3. Thermopile Spatial Features
+            thm_available = [c for c in self.thm_cols if c in seq_df.columns]
+            if thm_available:
+                thm_df = seq_df[thm_available].dropna()
+                if not thm_df.empty:
+                    record.update(extract_thermopile_spatial_features(thm_df))
+                    
+            # 4. ToF Spatial Features
+            if self.tof_cols:
+                tof_available = [c for c in self.tof_cols if c in seq_df.columns]
+                if tof_available:
+                    tof_df = seq_df[tof_available].dropna()
+                    if not tof_df.empty:
+                        record.update(extract_tof_spatial_features(tof_df))
+                        
+            # 5. Metadata / Category
+            for cat_col in ['subject', 'gesture', 'sequence_type']:
+                if cat_col in seq_df.columns:
+                    record[cat_col] = seq_df[cat_col].iloc[0]
+                    
+            sequence_list.append(record)
             
-        out_df = pd.DataFrame(transformed_data)
-        for col in self.feature_names_out_:
-            if col not in out_df.columns:
-                out_df[col] = 0.0
-                
-        return out_df[['sequence_id'] + self.feature_names_out_]
+        final_df = pd.DataFrame(sequence_list)
+        final_df = final_df.set_index('sequence_id').fillna(0.0)
+        return final_df
