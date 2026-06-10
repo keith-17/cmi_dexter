@@ -11,13 +11,12 @@ import tensorflow as tf
 from tensorflow.keras import layers, models, optimizers, callbacks, regularizers
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import f1_score, make_scorer
 from typing import Tuple, Dict, Any, List, Optional
 import warnings
 warnings.filterwarnings("ignore")
 from sklearn.utils.validation import check_is_fitted
 import json
-
-from base_utils_qwen import competition_scorer, make_competition_scorer
 
 # ---------------------------------------------------------------------------
 # Temporal Augmentations
@@ -1025,3 +1024,35 @@ class MultiHeadPrototypicalNetwork(PrototypicalBase):
         emb = self.encoder_.predict(X, verbose=0)
         dist = np.sum((emb[:, None, :] - self.prototypes_[None, :, :]) ** 2, axis=2)
         return self.primary_encoder_.inverse_transform(np.argmin(dist, axis=1))
+# ---------------------------------------------------------------------------
+# Custom Scorer for Pipeline
+# ---------------------------------------------------------------------------
+def make_competition_scorer(target_col='bfrb'):
+    """
+    Custom scorer that handles the mismatch between row-level y_true
+    (from CV splitter) and sequence-level y_pred (from the model).
+    Evaluates Binary F1 + Macro F1 (with non-targets collapsed).
+    """
+    def _score(y_true, y_pred):
+        if isinstance(y_true, pd.DataFrame):
+            y_true_seq = y_true.drop_duplicates(subset=['sequence_id']).sort_values('sequence_id')
+            y_true_binary = y_true_seq['is_target'].astype(int).values
+            y_true_gesture = y_true_seq[target_col].values
+        else:
+            y_true_binary = np.array(y_true)
+            y_true_gesture = np.array(y_true)
+
+        y_pred = np.array(y_pred)
+
+        # Binary F1 (target vs non-target)
+        y_pred_binary = (y_pred != 'non_bfrb').astype(int)
+        binary_f1 = f1_score(y_true_binary, y_pred_binary, zero_division=0)
+
+        # Macro F1 (non-targets are already collapsed into 'non_bfrb' in y_pred and y_true_gesture)
+        macro_f1 = f1_score(y_true_gesture, y_pred, average='macro', zero_division=0)
+
+        return (binary_f1 + macro_f1) / 2
+
+    return make_scorer(_score, response_method='predict')
+
+competition_scorer = make_competition_scorer('bfrb')

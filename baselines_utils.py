@@ -287,6 +287,49 @@ class TabularSequenceExtractor(BaseEstimator, TransformerMixin):
         grouped.index.name = self.sequence_col
         return grouped.fillna(0.0)
 
+    def __sklearn_clone__(self):
+        """
+        Override sklearn.clone to safely handle mutable honeycomb_kwargs dict.
+        sklearn.clone validates that constructor parameters are identical after
+        reconstruction, which fails for dicts (value comparison). This method
+        explicitly constructs a new instance with identical parameters.
+        """
+        return TabularSequenceExtractor(
+            mode=self.mode,
+            agg_funcs=self.agg_funcs,
+            sequence_col=self.sequence_col,
+            honeycomb_kwargs=self.honeycomb_kwargs,
+        )
+
+    def set_params(self, **params):
+        """
+        Override set_params to handle nested honeycomb_kwargs__* parameters.
+        GridSearchCV will try to set parameters like honeycomb_kwargs__sampling_rate,
+        which need special handling since honeycomb_kwargs is a dict, not an estimator.
+        """
+        honeycomb_updates = {}
+        other_params = {}
+        
+        for key, value in params.items():
+            if key.startswith("honeycomb_kwargs__"):
+                # Extract the nested key (e.g., "sampling_rate" from "honeycomb_kwargs__sampling_rate")
+                nested_key = key.split("honeycomb_kwargs__", 1)[1]
+                honeycomb_updates[nested_key] = value
+            else:
+                other_params[key] = value
+        
+        # Update honeycomb_kwargs dict with new values
+        if honeycomb_updates:
+            if self.honeycomb_kwargs is None:
+                self.honeycomb_kwargs = {}
+            self.honeycomb_kwargs.update(honeycomb_updates)
+        
+        # Set regular parameters using parent's set_params
+        if other_params:
+            super().set_params(**other_params)
+        
+        return self
+
 
 # ==============================================================================
 # TEMPORAL FEATURE EXTRACTION
