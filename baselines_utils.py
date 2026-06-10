@@ -243,7 +243,6 @@ class TabularSequenceExtractor(BaseEstimator, TransformerMixin):
     """
     Simple tabular aggregation (legacy-compatible) or Honeycomb-backed extraction.
     """
-
     def __init__(
         self,
         mode: str = "simple",
@@ -254,14 +253,18 @@ class TabularSequenceExtractor(BaseEstimator, TransformerMixin):
         self.mode = mode
         self.agg_funcs = agg_funcs
         self.sequence_col = sequence_col
-        self.honeycomb_kwargs = honeycomb_kwargs or {}
+        # CRITICAL FIX: Store exactly what was passed. Do NOT use `or {}` here!
+        self.honeycomb_kwargs = honeycomb_kwargs 
 
     def fit(self, X, y=None):
         if self.mode == "honeycomb":
+            # Handle the None case here instead of in __init__
+            hc_kwargs = self.honeycomb_kwargs if self.honeycomb_kwargs is not None else {}
+            
             self.inner_ = HoneycombTabularExtractor(
                 agg_funcs=self.agg_funcs,
                 sequence_col=self.sequence_col,
-                **self.honeycomb_kwargs,
+                **hc_kwargs,
             )
             self.inner_.fit(X, y)
             self.feature_cols_ = self.inner_.feature_cols_
@@ -278,6 +281,7 @@ class TabularSequenceExtractor(BaseEstimator, TransformerMixin):
         check_is_fitted(self, ["feature_cols_"])
         if self.mode == "honeycomb":
             return self.inner_.transform(X)
+            
         grouped = X.groupby(self.sequence_col, sort=False)[self.feature_cols_].agg(list(self.agg_funcs))
         grouped.columns = ["_".join(c) for c in grouped.columns]
         grouped.index.name = self.sequence_col
