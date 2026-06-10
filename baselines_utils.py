@@ -164,6 +164,10 @@ class HoneycombTabularExtractor(HoneycombBase):
         tof_modes: str = "sensor_stats",
         thm_modes: str = "centered_diff",
         motion_filter_mode=None,
+        use_dead_reckoning: bool = False,
+        dead_reckoning_detrend: bool = False,
+        kalman_process_noise: float = 1e-3,
+        kalman_measurement_noise: float = 1e-2,
         sampling_rate: int = 20,
         window_size: int = 7,
         clip_value: Optional[float] = None,
@@ -177,6 +181,10 @@ class HoneycombTabularExtractor(HoneycombBase):
         self.tof_modes = tof_modes
         self.thm_modes = thm_modes
         self.motion_filter_mode = motion_filter_mode
+        self.use_dead_reckoning = use_dead_reckoning
+        self.dead_reckoning_detrend = dead_reckoning_detrend
+        self.kalman_process_noise = kalman_process_noise
+        self.kalman_measurement_noise = kalman_measurement_noise
         self.sampling_rate = sampling_rate
         self.window_size = window_size
         self.clip_value = clip_value
@@ -194,7 +202,12 @@ class HoneycombTabularExtractor(HoneycombBase):
             window_size=window_size,
         )
         self.motion_filter = MotionFilter(
-            motion_filter_mode=motion_filter_mode, sequence_col=sequence_col
+            motion_filter_mode=motion_filter_mode,
+            kalman_process_noise=kalman_process_noise,
+            kalman_measurement_noise=kalman_measurement_noise,
+            use_dead_reckoning=use_dead_reckoning,
+            dead_reckoning_detrend=dead_reckoning_detrend,
+            sequence_col=sequence_col,
         )
         self.imu = IMUExtractor(acc_modes=acc_modes, window_size=window_size, sequence_col=sequence_col)
         self.rotation = RotationExtractor(rotation_modes=rotation_modes, sequence_col=sequence_col)
@@ -249,19 +262,68 @@ class TabularSequenceExtractor(BaseEstimator, TransformerMixin):
         mode: str = "simple",
         agg_funcs: Tuple[str, ...] = ("mean", "std", "max", "min"),
         sequence_col: str = "sequence_id",
-        honeycomb_kwargs: Optional[dict] = None,
+        acc_modes: Optional[str] = None,
+        rotation_modes: Optional[str] = None,
+        tof_modes: Optional[str] = None,
+        thm_modes: Optional[str] = None,
+        motion_filter_mode: Optional[str] = None,
+        use_dead_reckoning: bool = False,
+        dead_reckoning_detrend: bool = False,
+        kalman_process_noise: float = 1e-3,
+        kalman_measurement_noise: float = 1e-2,
+        sampling_rate: int = 20,
+        window_size: int = 7,
+        clip_value: Optional[float] = None,
+        interp_mode: str = "linear",
+        counter_col: str = "sequence_counter",
     ):
         self.mode = mode
         self.agg_funcs = agg_funcs
         self.sequence_col = sequence_col
-        self.honeycomb_kwargs = honeycomb_kwargs or {}
+        self.acc_modes = acc_modes
+        self.rotation_modes = rotation_modes
+        self.tof_modes = tof_modes
+        self.thm_modes = thm_modes
+        self.motion_filter_mode = motion_filter_mode
+        self.use_dead_reckoning = use_dead_reckoning
+        self.dead_reckoning_detrend = dead_reckoning_detrend
+        self.kalman_process_noise = kalman_process_noise
+        self.kalman_measurement_noise = kalman_measurement_noise
+        self.sampling_rate = sampling_rate
+        self.window_size = window_size
+        self.clip_value = clip_value
+        self.interp_mode = interp_mode
+        self.counter_col = counter_col
 
     def fit(self, X, y=None):
         if self.mode == "honeycomb":
+            # Collect honeycomb kwargs from all non-None parameters
+            kwargs = {}
+            if self.acc_modes is not None:
+                kwargs["acc_modes"] = self.acc_modes
+            if self.rotation_modes is not None:
+                kwargs["rotation_modes"] = self.rotation_modes
+            if self.tof_modes is not None:
+                kwargs["tof_modes"] = self.tof_modes
+            if self.thm_modes is not None:
+                kwargs["thm_modes"] = self.thm_modes
+            if self.motion_filter_mode is not None:
+                kwargs["motion_filter_mode"] = self.motion_filter_mode
+            kwargs["use_dead_reckoning"] = self.use_dead_reckoning
+            kwargs["dead_reckoning_detrend"] = self.dead_reckoning_detrend
+            kwargs["kalman_process_noise"] = self.kalman_process_noise
+            kwargs["kalman_measurement_noise"] = self.kalman_measurement_noise
+            kwargs["sampling_rate"] = self.sampling_rate
+            kwargs["window_size"] = self.window_size
+            if self.clip_value is not None:
+                kwargs["clip_value"] = self.clip_value
+            kwargs["interp_mode"] = self.interp_mode
+            kwargs["sequence_col"] = self.sequence_col
+            kwargs["counter_col"] = self.counter_col
+            
             self.inner_ = HoneycombTabularExtractor(
                 agg_funcs=self.agg_funcs,
-                sequence_col=self.sequence_col,
-                **self.honeycomb_kwargs,
+                **kwargs,
             )
             self.inner_.fit(X, y)
             self.feature_cols_ = self.inner_.feature_cols_
@@ -293,9 +355,9 @@ class SequenceTensorExtractor(BaseEstimator, TransformerMixin):
     def __init__(self, sequence_col: str = "sequence_id", **extractor_kwargs):
         self.sequence_col = sequence_col
         self.extractor_kwargs = extractor_kwargs
-        self.extractor_ = SequenceExtractor(sequence_col=sequence_col, **extractor_kwargs)
 
     def fit(self, X, y=None):
+        self.extractor_ = SequenceExtractor(sequence_col=self.sequence_col, **self.extractor_kwargs)
         self.extractor_.fit(X, y)
         self.n_features_in_ = len(self.extractor_.feature_names_in_)
         return self
@@ -795,14 +857,16 @@ def build_feature_extractor(
         "dead_reckoning_detrend", "kalman_process_noise", "kalman_measurement_noise",
         "compute_dt", "smooth_alpha", "counter_col", "sequence_col",
     }
-    tabular_keys = {"agg_funcs", "sequence_col", "mode", "honeycomb_kwargs"}
+    tabular_keys = {"agg_funcs", "sequence_col", "mode"}
+    
     if feature_mode == "tabular_simple":
         simple_kw = {k: v for k, v in kwargs.items() if k in tabular_keys or k not in honeycomb_keys}
         return TabularSequenceExtractor(mode="simple", **simple_kw)
     if feature_mode == "tabular_honeycomb":
+        # Pass all honeycomb keys directly to TabularSequenceExtractor
         hc_kw = {k: v for k, v in kwargs.items() if k in honeycomb_keys}
         other = {k: v for k, v in kwargs.items() if k in tabular_keys}
-        return TabularSequenceExtractor(mode="honeycomb", honeycomb_kwargs=hc_kw, **other)
+        return TabularSequenceExtractor(mode="honeycomb", **{**other, **hc_kw})
     if feature_mode == "temporal_honeycomb":
         return SequenceTensorExtractor(**kwargs)
     if feature_mode == "temporal_raw":
