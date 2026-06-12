@@ -145,7 +145,7 @@ class HierarchicalMultiRocketEnsemble(BaseEstimator, ClassifierMixin):
         
         self.random_state = random_state
         self.padding_value = padding_value
-        self.ensemble_models = ensemble_models or {}
+        self.ensemble_models = ensemble_models
 
     def _build_layer(self, num_kernels, alpha, fs_percentile, class_weight='balanced'):
         clf_params = {}
@@ -170,12 +170,19 @@ class HierarchicalMultiRocketEnsemble(BaseEstimator, ClassifierMixin):
         )
 
     def fit(self, X: np.ndarray, y: pd.DataFrame):
+        # Align y with sequence-level X output by SequenceExtractor
+        if "sequence_id" in y.columns:
+            y = y.drop_duplicates("sequence_id").sort_values("sequence_id").reset_index(drop=True)
+
+        # Handle None safely for sklearn cloning rules
+        _models = self.ensemble_models if self.ensemble_models is not None else {}
+
         # Layer 1: Binary
         self.le_l1_ = LabelEncoder()
         y_l1 = self.le_l1_.fit_transform(y['is_target'].values)
-        
-        if 'l1' in self.ensemble_models:
-            self.model_l1_ = self.ensemble_models['l1']
+
+        if 'l1' in _models:
+            self.model_l1_ = _models['l1']
         else:
             self.model_l1_ = self._build_layer(self.l1_num_kernels, self.l1_alpha, self.l1_feature_selection_percentile, self.l1_class_weight)
             self.model_l1_.fit(X, y_l1)
@@ -191,8 +198,8 @@ class HierarchicalMultiRocketEnsemble(BaseEstimator, ClassifierMixin):
         self.le_l2_ = LabelEncoder()
         y_l2 = self.le_l2_.fit_transform(y_targ[self.orientation_col].values)
         
-        if 'l2' in self.ensemble_models:
-            self.model_l2_ = self.ensemble_models['l2']
+        if 'l2' in _models:
+            self.model_l2_ = _models['l2']
         else:
             self.model_l2_ = self._build_layer(self.l2_num_kernels, self.l2_alpha, self.l2_feature_selection_percentile, self.l2_class_weight)
             self.model_l2_.fit(X_targ, y_l2)
@@ -213,8 +220,8 @@ class HierarchicalMultiRocketEnsemble(BaseEstimator, ClassifierMixin):
                 self.le_l3_encoders_[orient] = le_l3
                 
                 layer_name = f"l3_{i+1}"
-                if layer_name in self.ensemble_models:
-                    model = self.ensemble_models[layer_name]
+                if layer_name in _models:
+                    model = _models[layer_name]
                 else:
                     num_k = getattr(self, f"{layer_name}_num_kernels")
                     alp = getattr(self, f"{layer_name}_alpha")
@@ -279,8 +286,12 @@ class FlexibleMultiRocketClassifier(BaseEstimator, ClassifierMixin):
         self.class_weight = class_weight
         self.random_state = random_state
         self.padding_value = padding_value
-        
+
     def _slice_data(self, X: np.ndarray, y: pd.DataFrame):
+        # Align y with sequence-level X output by SequenceExtractor
+        if "sequence_id" in y.columns:
+            y = y.drop_duplicates("sequence_id").sort_values("sequence_id").reset_index(drop=True)
+
         mask = np.ones(len(y), dtype=bool)
         if self.slice_by_orientation is not None and self.orientation_col in y.columns:
             mask &= y[self.orientation_col].isin(self.slice_by_orientation).values
