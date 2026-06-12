@@ -13,14 +13,14 @@ class HierarchicalBFRBEnsemble(BaseEstimator, ClassifierMixin):
     def __init__(
         self,
         # Layer 1: Binary
-        l1_num_kernels=1000, l1_alpha=1.0, l1_class_weight="balanced",
+        l1_num_kernels=1000, l1_alpha=1.0, l1_class_weight="balanced", l1_feature_selection_percentile=None,
         # Layer 2: Orientation
-        l2_num_kernels=1000, l2_alpha=1.0, l2_class_weight="balanced",
+        l2_num_kernels=1000, l2_alpha=1.0, l2_class_weight="balanced", l2_feature_selection_percentile=None,
         # Layer 3: BFRB Gesture per orientation (Models 1 to 4)
-        l3_1_num_kernels=1000, l3_1_alpha=1.0,
-        l3_2_num_kernels=1000, l3_2_alpha=1.0,
-        l3_3_num_kernels=1000, l3_3_alpha=1.0,
-        l3_4_num_kernels=1000, l3_4_alpha=1.0,
+        l3_1_num_kernels=1000, l3_1_alpha=1.0, l3_1_feature_selection_percentile=None,
+        l3_2_num_kernels=1000, l3_2_alpha=1.0, l3_2_feature_selection_percentile=None,
+        l3_3_num_kernels=1000, l3_3_alpha=1.0, l3_3_feature_selection_percentile=None,
+        l3_4_num_kernels=1000, l3_4_alpha=1.0, l3_4_feature_selection_percentile=None,
         l3_class_weight="balanced",
         # Metadata
         orientation_col="orientation",
@@ -32,21 +32,31 @@ class HierarchicalBFRBEnsemble(BaseEstimator, ClassifierMixin):
         self.l1_num_kernels = l1_num_kernels
         self.l1_alpha = l1_alpha
         self.l1_class_weight = l1_class_weight
+        self.l1_feature_selection_percentile = l1_feature_selection_percentile
         
         # Layer 2
         self.l2_num_kernels = l2_num_kernels
         self.l2_alpha = l2_alpha
         self.l2_class_weight = l2_class_weight
+        self.l2_feature_selection_percentile = l2_feature_selection_percentile
         
         # Layer 3
         self.l3_1_num_kernels = l3_1_num_kernels
         self.l3_1_alpha = l3_1_alpha
+        self.l3_1_feature_selection_percentile = l3_1_feature_selection_percentile
+        
         self.l3_2_num_kernels = l3_2_num_kernels
         self.l3_2_alpha = l3_2_alpha
+        self.l3_2_feature_selection_percentile = l3_2_feature_selection_percentile
+        
         self.l3_3_num_kernels = l3_3_num_kernels
         self.l3_3_alpha = l3_3_alpha
+        self.l3_3_feature_selection_percentile = l3_3_feature_selection_percentile
+        
         self.l3_4_num_kernels = l3_4_num_kernels
         self.l3_4_alpha = l3_4_alpha
+        self.l3_4_feature_selection_percentile = l3_4_feature_selection_percentile
+        
         self.l3_class_weight = l3_class_weight
         
         self.orientation_col = orientation_col
@@ -65,6 +75,7 @@ class HierarchicalBFRBEnsemble(BaseEstimator, ClassifierMixin):
         y_l1 = (y_seq[self.target_col] != 'non_bfrb').astype(int)
         self.l1_model_ = RidgeRocketClassifier(
             num_kernels=self.l1_num_kernels, alpha=self.l1_alpha, 
+            feature_selection_percentile=self.l1_feature_selection_percentile, # ADDED
             class_weight=self.l1_class_weight, random_state=self.random_state
         )
         self.l1_model_.fit(X, y_l1)
@@ -74,6 +85,7 @@ class HierarchicalBFRBEnsemble(BaseEstimator, ClassifierMixin):
         y_l2 = y_seq[self.orientation_col]
         self.l2_model_ = RidgeRocketClassifier(
             num_kernels=self.l2_num_kernels, alpha=self.l2_alpha,
+            feature_selection_percentile=self.l2_feature_selection_percentile, # ADDED
             class_weight=self.l2_class_weight, random_state=self.random_state
         )
         self.l2_model_.fit(X, y_l2)
@@ -97,12 +109,15 @@ class HierarchicalBFRBEnsemble(BaseEstimator, ClassifierMixin):
                 if orient in l3_dict:
                     nk = l3_dict[orient].get('num_kernels', getattr(self, f'{param_suffix}_num_kernels'))
                     al = l3_dict[orient].get('alpha', getattr(self, f'{param_suffix}_alpha'))
+                    fsp = l3_dict[orient].get('feature_selection_percentile', getattr(self, f'{param_suffix}_feature_selection_percentile', None)) # ADDED
                 else:
                     nk = getattr(self, f'{param_suffix}_num_kernels')
                     al = getattr(self, f'{param_suffix}_alpha')
+                    fsp = getattr(self, f'{param_suffix}_feature_selection_percentile', None) # ADDED
                 
                 model = RidgeRocketClassifier(
                     num_kernels=nk, alpha=al, 
+                    feature_selection_percentile=fsp, # ADDED
                     class_weight=self.l3_class_weight, random_state=self.random_state
                 )
                 model.fit(X_l3, y_l3)
