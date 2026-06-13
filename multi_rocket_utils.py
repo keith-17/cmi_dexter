@@ -50,13 +50,14 @@ class RocketClassifierLayer(BaseEstimator, ClassifierMixin):
         else:
             X_sk = X
             
+        # 1. Enforce 0.0 padding to prevent NaN/Inf convolutions
         X_sk = np.where(X_sk == self.padding_value, 0.0, X_sk)
         X_sk = np.nan_to_num(X_sk, nan=0.0, posinf=0.0, neginf=0.0)
         
         n_instances, n_channels, n_timepoints = X_sk.shape
         
-        # PCA Safeguard to prevent OOM crashes on high-dim sensor data
-        if n_channels > self.max_channels:
+        # 2. PCA Safeguard to prevent OOM crashes on high-dim sensor data
+        if self.max_channels is not None and n_channels > self.max_channels:
             X_reshaped = X_sk.transpose(0, 2, 1).reshape(-1, n_channels)
             self.pca_ = PCA(n_components=self.max_channels, random_state=self.random_state)
             X_pca = self.pca_.fit_transform(X_reshaped)
@@ -141,14 +142,14 @@ class HierarchicalMultiRocketEnsemble(BaseEstimator, ClassifierMixin):
         
         self.l1_num_kernels, self.l1_alpha, self.l1_feature_selection_percentile, self.l1_max_channels = l1_num_kernels, l1_alpha, l1_feature_selection_percentile, l1_max_channels
         self.l2_num_kernels, self.l2_alpha, self.l2_feature_selection_percentile, self.l2_max_channels = l2_num_kernels, l2_alpha, l2_feature_selection_percentile, l2_max_channels
-        self.l3_1_num_kernels, self.l1_alpha, self.l3_1_feature_selection_percentile, self.l3_1_max_channels = l3_1_num_kernels, l3_1_alpha, l3_1_feature_selection_percentile, l3_1_max_channels
+        self.l3_1_num_kernels, self.l3_1_alpha, self.l3_1_feature_selection_percentile, self.l3_1_max_channels = l3_1_num_kernels, l3_1_alpha, l3_1_feature_selection_percentile, l3_1_max_channels
         self.l3_2_num_kernels, self.l3_2_alpha, self.l3_2_feature_selection_percentile, self.l3_2_max_channels = l3_2_num_kernels, l3_2_alpha, l3_2_feature_selection_percentile, l3_2_max_channels
         self.l3_3_num_kernels, self.l3_3_alpha, self.l3_3_feature_selection_percentile, self.l3_3_max_channels = l3_3_num_kernels, l3_3_alpha, l3_3_feature_selection_percentile, l3_3_max_channels
         self.l3_4_num_kernels, self.l3_4_alpha, self.l3_4_feature_selection_percentile, self.l3_4_max_channels = l3_4_num_kernels, l3_4_alpha, l3_4_feature_selection_percentile, l3_4_max_channels
         
         self.random_state = random_state
         self.padding_value = padding_value
-        self.ensemble_models = ensemble_models  # Strict assignment for sklearn clone()
+        self.ensemble_models = ensemble_models
 
     def _build_layer(self, num_kernels, alpha, fs_percentile, max_channels):
         clf_params = {}
@@ -174,7 +175,6 @@ class HierarchicalMultiRocketEnsemble(BaseEstimator, ClassifierMixin):
         )
 
     def fit(self, X: np.ndarray, y: pd.DataFrame):
-        # Align y with sequence-level X output by SequenceExtractor
         if isinstance(y, pd.DataFrame) and "sequence_id" in y.columns:
             y = y.drop_duplicates("sequence_id").sort_values("sequence_id").reset_index(drop=True)
 
