@@ -545,7 +545,7 @@ class SequenceExtractor(HoneycombBase):
         )
         return self
 
-    def transform(self, X: pd.DataFrame) -> np.ndarray:
+    def transform(self, X: pd.DataFrame) -> dict:
         check_is_fitted(self, ["feature_names_in_", "base_feature_names_"])
 
         cleaned = self.cleaner.transform(X)
@@ -565,7 +565,8 @@ class SequenceExtractor(HoneycombBase):
         out = self._append_global_context(out, self.base_feature_names_)
 
         sequences = []
-        for _, g in out.groupby(self.sequence_col, sort=False):
+        seq_ids = []
+        for seq_id, g in out.groupby(self.sequence_col, sort=False):
             if self.counter_col in g.columns:
                 g = g.sort_values(self.counter_col)
             arr = g[self.feature_names_in_].to_numpy(dtype=np.float32)
@@ -577,8 +578,12 @@ class SequenceExtractor(HoneycombBase):
                 arr = np.vstack([arr, pad])
 
             sequences.append(arr)
+            seq_ids.append(seq_id)
 
-        return np.stack(sequences, axis=0)
+        return {
+            'X': np.stack(sequences, axis=0),
+            'sequence_ids': np.array(seq_ids)
+        }
 
 
 def prepare_multitask_param_space(param_space: dict, search_mode: str) -> dict:
