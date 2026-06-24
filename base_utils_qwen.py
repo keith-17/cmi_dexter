@@ -523,8 +523,43 @@ class SequenceExtractor(HoneycombBase):
         return out
 
     def fit(self, X: pd.DataFrame, y: Optional[pd.DataFrame] = None) -> 'SequenceExtractor':
+        # 🚨 CRITICAL FIX: Re-instantiate sub-components here!
+        # When GridSearchCV updates parameters, it only updates the top-level 
+        # SequenceExtractor attributes. It DOES NOT update the sub-components 
+        # that were already created in __init__. We must recreate them now 
+        # so they actually use the parameters GridSearchCV is testing.
+        
+        self.cleaner = SignalCleaner(
+            self.sampling_rate, self.compute_dt, self.clip_value, self.interp_mode,
+            sequence_col=self.sequence_col, counter_col=self.counter_col,
+            window_size=self.window_size
+        )
+        self.motion_filter = MotionFilter(
+            self.motion_filter_mode,
+            kalman_process_noise=self.kalman_process_noise,
+            kalman_measurement_noise=self.kalman_measurement_noise,
+            use_dead_reckoning=self.use_dead_reckoning,
+            dead_reckoning_detrend=self.dead_reckoning_detrend,
+            sequence_col=self.sequence_col
+        )
+        self.imu = IMUExtractor(
+            self.acc_modes, window_size=self.window_size, smooth_alpha=self.smooth_alpha,
+            sequence_col=self.sequence_col
+        )
+        self.rotation = RotationExtractor(
+            self.rotation_modes, sequence_col=self.sequence_col
+        )
+        self.tof = TOFExtractor(
+            self.tof_modes, sequence_col=self.sequence_col
+        )
+        self.thermo = ThermoExtractor(
+            self.thm_modes, sequence_col=self.sequence_col
+        )
+
+        # --- Original fit logic continues below ---
         cleaned = self.cleaner.fit_transform(X)
         filtered = self.motion_filter.fit_transform(cleaned)
+        
         self.imu.fit(filtered)
         self.rotation.fit(filtered)
         self.tof.fit(filtered)
