@@ -280,25 +280,46 @@ class KerasContrastiveSiameseClassifier(ClassifierMixin, BaseEstimator):
         return self
 
     def predict_proba(self, X):
-        X_pad, _ = self._unpack_X(X)
+        X_pad, seq_ids = self._unpack_X(X)
         _, logits = self.model_.predict(X_pad, verbose=0)
-        return tf.nn.softmax(logits).numpy()
+        probs = tf.nn.softmax(logits).numpy() # Shape: (num_chunks, num_classes)
+
+        if seq_ids is not None and len(seq_ids) > 0:
+            # Aggregate chunk probabilities back to sequence-level
+            df = pd.DataFrame(probs)
+            df['seq_id'] = seq_ids
+            agg_probs = df.groupby('seq_id').mean().values
+            unique_ids = df.groupby('seq_id').mean().index.values
+            return agg_probs, unique_ids
+        return probs, None
 
     def predict(self, X):
-        proba = self.predict_proba(X)
-        return self.le_.inverse_transform(np.argmax(proba, axis=1))
+        agg_probs, unique_ids = self.predict_proba(X)
+        pred_idx = np.argmax(agg_probs, axis=1)
+        preds = self.le_.inverse_transform(pred_idx)
+        
+        if unique_ids is not None:
+            # Return as a Pandas Series indexed by sequence_id for perfect alignment with y
+            return pd.Series(preds, index=unique_ids, name=self.target)
+        return preds
 
     def score(self, X, y):
-        preds = self.predict(X)
+        preds_series = self.predict(X)
+        
         if isinstance(y, pd.DataFrame) and "sequence_id" in y.columns:
-            y_seq = y.drop_duplicates("sequence_id").sort_values("sequence_id")
+            y_seq = y.drop_duplicates("sequence_id").set_index("sequence_id")
+            # Align predictions with ground truth using the index
+            y_aligned = y_seq.loc[preds_series.index, self.target].values
+            preds_aligned = preds_series.values
+            
             if self.target == "bfrb" and "is_target" in y_seq.columns and competition_score is not None:
                 return competition_score(
-                    y_seq[self.target].values,
-                    preds,
-                    y_true_binary=y_seq["is_target"].astype(int).values,
+                    y_aligned, preds_aligned,
+                    y_true_binary=y_seq.loc[preds_series.index, "is_target"].astype(int).values,
                     target_only_macro=True,
                 )
-            return f1_score(y_seq[self.target].values, preds, average="macro", zero_division=0)
+            return f1_score(y_aligned, preds_aligned, average="macro", zero_division=0)
+            
+        # Fallback for non-DataFrame y
         y_seq = self._collapse_y(None, y)
-        return f1_score(y_seq.to_numpy(), preds, average="macro", zero_division=0)
+        return f1_score(y_seq.to_numpy(), preds_series.to_numpy() if hasattr(preds_series, 'to_numpy') else preds_series, average="macro", zero_division=0)

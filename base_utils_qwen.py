@@ -13,6 +13,7 @@ import warnings
 warnings.filterwarnings("ignore")
 import json
 from skopt.space import Categorical
+from scipy.signal import resample
 
 # --- Type Aliases ---
 AccModeStr = str  # e.g., "raw|velocity|displacement|jerk"
@@ -455,6 +456,10 @@ class SequenceExtractor(HoneycombBase):
         padding_value: float = -999.0,
         sequence_col: str = "sequence_id",
         counter_col: str = "sequence_counter",
+        native_sampling_rate: int = 20,
+        target_sampling_rate: int = 20,
+        chunk_window_size: int = 128,
+        chunk_stride: int = 64,
     ):
         self.acc_modes = acc_modes
         self.rotation_modes = rotation_modes
@@ -475,6 +480,10 @@ class SequenceExtractor(HoneycombBase):
         self.padding_value = padding_value
         self.sequence_col = sequence_col
         self.counter_col = counter_col
+        self.native_sampling_rate = native_sampling_rate
+        self.target_sampling_rate = target_sampling_rate
+        self.chunk_window_size = chunk_window_size
+        self.chunk_stride = chunk_stride
 
         # Create internal components with the new parameters
         self.cleaner = SignalCleaner(
@@ -601,19 +610,40 @@ class SequenceExtractor(HoneycombBase):
 
         sequences = []
         seq_ids = []
+        
         for seq_id, g in out.groupby(self.sequence_col, sort=False):
             if self.counter_col in g.columns:
                 g = g.sort_values(self.counter_col)
             arr = g[self.feature_names_in_].to_numpy(dtype=np.float32)
 
-            if len(arr) >= self.maxlen:
-                arr = arr[:self.maxlen]
-            else:
-                pad = np.full((self.maxlen - len(arr), arr.shape[1]), self.padding_value, dtype=np.float32)
-                arr = np.vstack([arr, pad])
+            # 1. RESAMPLING MATH
+            if self.target_sampling_rate != self.native_sampling_rate and len(arr) > 1:
+                num_samples = int(np.round(len(arr) * self.target_sampling_rate / self.native_sampling_rate))
+                if num_samples > 0:
+                    arr = resample(arr, num_samples, axis=0)
 
-            sequences.append(arr)
-            seq_ids.append(seq_id)
+            # 2. SLIDING WINDOW CHUNKING
+            L = len(arr)
+            W = self.chunk_window_size
+            S = self.chunk_stride
+
+            if L <= W:
+                # Sequence is shorter than window: pad it
+                pad = np.full((W - L, arr.shape[1]), self.padding_value, dtype=np.float32)
+                arr = np.vstack([arr, pad])
+                sequences.append(arr)
+                seq_ids.append(seq_id)
+            else:
+                # Generate window starts
+                starts = np.arange(0, L - W + 1, S)
+                # CRITICAL: Force the last window to grab the very end of the sequence (the gesture!)
+                if len(starts) == 0 or starts[-1] + W < L:
+                    starts = np.append(starts, L - W)
+
+                for start in starts:
+                    chunk = arr[start : start + W]
+                    sequences.append(chunk)
+                    seq_ids.append(seq_id)
 
         return {
             'X': np.stack(sequences, axis=0),
