@@ -5,7 +5,7 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import f1_score
 
 try:
-    from base_utils_qwen import competition_score
+    from src.base_utils_qwen import competition_score
 except ImportError:
     competition_score = None
 import tensorflow as tf

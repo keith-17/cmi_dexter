@@ -17,7 +17,7 @@ warnings.filterwarnings("ignore")
 from sklearn.utils.validation import check_is_fitted
 import json
 
-from base_utils_qwen import competition_scorer, make_competition_scorer
+from src.base_utils_qwen import competition_scorer, make_competition_scorer
 
 # ---------------------------------------------------------------------------
 # Temporal Augmentations
