@@ -37,7 +37,7 @@ class SignalCleaner(HoneycombBase):
     """Handles interpolation, dt computation, clipping, and masking."""
     def __init__(
         self,
-        sampling_rate: int = 20,
+        native_sampling_rate: int = 20,
         compute_dt: bool = True,
         clip_value: Optional[float] = None,
         interp_mode: InterpMode = "linear",
@@ -47,7 +47,7 @@ class SignalCleaner(HoneycombBase):
         sequence_col: str = "sequence_id",
         counter_col: str = "sequence_counter",
     ):
-        self.sampling_rate = sampling_rate
+        self.sampling_rate = native_sampling_rate
         self.compute_dt = compute_dt
         self.clip_value = clip_value
         self.interp_mode = interp_mode
@@ -446,7 +446,6 @@ class SequenceExtractor(HoneycombBase):
         dead_reckoning_detrend: bool = False,            # NEW
         kalman_process_noise: float = 1e-3,              # NEW
         kalman_measurement_noise: float = 1e-2,          # NEW
-        sampling_rate: int = 20,
         compute_dt: bool = True,
         window_size: int = 7,
         smooth_alpha: Optional[float] = None,
@@ -470,7 +469,6 @@ class SequenceExtractor(HoneycombBase):
         self.dead_reckoning_detrend = dead_reckoning_detrend          # store
         self.kalman_process_noise = kalman_process_noise              # store
         self.kalman_measurement_noise = kalman_measurement_noise      # store
-        self.sampling_rate = sampling_rate
         self.compute_dt = compute_dt
         self.window_size = window_size
         self.smooth_alpha = smooth_alpha
@@ -487,7 +485,7 @@ class SequenceExtractor(HoneycombBase):
 
         # Create internal components with the new parameters
         self.cleaner = SignalCleaner(
-            sampling_rate, compute_dt, clip_value, interp_mode,
+            self.native_sampling_rate, compute_dt, clip_value, interp_mode,
             sequence_col=sequence_col, counter_col=counter_col,
             window_size=window_size
         )
@@ -539,7 +537,7 @@ class SequenceExtractor(HoneycombBase):
         # so they actually use the parameters GridSearchCV is testing.
         
         self.cleaner = SignalCleaner(
-            self.sampling_rate, self.compute_dt, self.clip_value, self.interp_mode,
+            self.native_sampling_rate, self.compute_dt, self.clip_value, self.interp_mode,
             sequence_col=self.sequence_col, counter_col=self.counter_col,
             window_size=self.window_size
         )
