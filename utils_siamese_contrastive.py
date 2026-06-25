@@ -182,29 +182,58 @@ class KerasContrastiveSiameseClassifier(ClassifierMixin, BaseEstimator):
 
         seq_len = int(maxlen if maxlen is not None else self.maxlen)
         inp = keras.Input(shape=(seq_len, n_features))
-        # Masking layer ensures RNNs and Attention ignore padded timesteps!
-        x = layers.Masking(mask_value=self.padding_value)(inp)
-        
+
+        # Compute the padding mask ONCE, directly from padding_value, and thread it
+        # through explicitly. Conv1D/BatchNorm do NOT support automatic mask
+        # propagation (supports_masking=False), so the mask produced by a
+        # Masking() layer would otherwise silently die after the first Conv1D,
+        # and GRU/Attention/GlobalAveragePooling1D downstream would all process
+        # the padded timesteps as if they were real signal.
+        is_real = layers.Lambda(
+            lambda t: tf.reduce_any(tf.not_equal(t, self.padding_value), axis=-1),
+            name="padding_mask",
+        )(inp)  # (batch, seq_len) bool
+        mask_f = layers.Lambda(
+            lambda m: tf.cast(m, tf.float32)[..., None], name="padding_mask_float"
+        )(is_real)  # (batch, seq_len, 1)
+
+        x = inp
         filters = self._to_tuple(self.backbone_filters)
         kernels = self._align(self.kernel_sizes, len(filters))
         for f, k in zip(filters, kernels):
             x = layers.Conv1D(f, k, padding='same', activation='relu')(x)
+            # Re-zero padded timesteps after the conv: 'same' padding lets a
+            # padded neighbor leak one timestep into the real region at the
+            # boundary, and BatchNorm's activation statistics would otherwise
+            # be computed over padded zeros too.
+            x = layers.Multiply()([x, mask_f])
             x = layers.BatchNormalization()(x)
+            x = layers.Multiply()([x, mask_f])
             x = layers.SpatialDropout1D(0.1)(x)
-            
+
         if self.temporal_mode == 'gru':
-            x = layers.Bidirectional(layers.GRU(64, return_sequences=False))(x)
+            # mask=is_real makes the GRU skip padded timesteps in BOTH directions
+            x = layers.Bidirectional(layers.GRU(64, return_sequences=False))(x, mask=is_real)
         elif self.temporal_mode == 'attention':
-            attn = layers.MultiHeadAttention(num_heads=2, key_dim=32)(x, x)
+            attn_mask = layers.Lambda(
+                lambda m: m[:, :, None] & m[:, None, :],
+                output_shape=lambda s: (s[1], s[1]),
+                name="attention_mask",
+            )(is_real)
+            attn = layers.MultiHeadAttention(num_heads=2, key_dim=32)(x, x, attention_mask=attn_mask)
+            attn = layers.Multiply()([attn, mask_f])
             x = layers.Add()([x, attn])
             x = layers.LayerNormalization()(x)
+            x = layers.Multiply()([x, mask_f])
             ffn = layers.Dense(64, activation='relu')(x)
             ffn = layers.Dense(x.shape[-1])(ffn)
+            ffn = layers.Multiply()([ffn, mask_f])
             x = layers.Add()([x, ffn])
             x = layers.LayerNormalization()(x)
-            x = layers.GlobalAveragePooling1D()(x)
+            x = layers.Multiply()([x, mask_f])
+            x = layers.GlobalAveragePooling1D()(x, mask=is_real)
         else:
-            x = layers.GlobalAveragePooling1D()(x)
+            x = layers.GlobalAveragePooling1D()(x, mask=is_real)
         backbone = keras.Model(inp, x, name="backbone")
         
         proj_inp = keras.Input(shape=(x.shape[-1],))

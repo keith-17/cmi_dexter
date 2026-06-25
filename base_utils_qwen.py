@@ -281,7 +281,7 @@ class RotationExtractor(HoneycombBase):
         parts = []
         dt = df["dt"].astype(float)
         
-        q = df[self.rot_cols_].to_numpy(dtype=float) if self.rot_cols_ else None
+        q = df[self.rot_cols_].to_numpy(dtype=float, copy=True) if self.rot_cols_ else None
         if q is not None and self.fix_quaternion_sign:
             for seq_id, idx in df.groupby(self.sequence_col, sort=False).groups.items():
                 pos = df.index.get_indexer(idx)
