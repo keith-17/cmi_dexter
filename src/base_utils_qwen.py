@@ -432,20 +432,19 @@ class SequenceExtractor(HoneycombBase):
     """
     Orchestrates cleaning, motion filtering, and multi-domain extraction.
     Outputs a padded 3D numpy array: (n_sequences, maxlen, n_features).
-
-    Extended with Kalman and dead reckoning fine-tuning.
+    Supports independent native/target sampling rates for all 4 modalities.
     """
     def __init__(
         self,
         acc_modes: AccModeStr = "raw|velocity|displacement|jerk",
         rotation_modes: RotModeStr = "quaternion",
-        tof_modes: TOFModeStr = "sensor_stats",          # FIXED: plural
-        thm_modes: THMModeStr = "centered_diff",         # FIXED: plural
+        tof_modes: TOFModeStr = "sensor_stats",
+        thm_modes: THMModeStr = "centered_diff",
         motion_filter_mode: MotionFilterMode = None,
         use_dead_reckoning: bool = False,
-        dead_reckoning_detrend: bool = False,            # NEW
-        kalman_process_noise: float = 1e-3,              # NEW
-        kalman_measurement_noise: float = 1e-2,          # NEW
+        dead_reckoning_detrend: bool = False,
+        kalman_process_noise: float = 1e-3,
+        kalman_measurement_noise: float = 1e-2,
         compute_dt: bool = True,
         window_size: int = 7,
         smooth_alpha: Optional[float] = None,
@@ -455,8 +454,15 @@ class SequenceExtractor(HoneycombBase):
         padding_value: float = -999.0,
         sequence_col: str = "sequence_id",
         counter_col: str = "sequence_counter",
-        native_sampling_rate: int = 20,
-        target_sampling_rate: int = 20,
+        # --- NEW: Independent Sampling Rates for all 4 Modalities ---
+        imu_native_sampling_rate: int = 20,
+        imu_target_sampling_rate: int = 20,
+        rot_native_sampling_rate: int = 20,
+        rot_target_sampling_rate: int = 20,
+        tof_native_sampling_rate: int = 5,
+        tof_target_sampling_rate: int = 5,
+        thm_native_sampling_rate: int = 5,
+        thm_target_sampling_rate: int = 5,
         chunk_window_size: int = 128,
         chunk_stride: int = 64,
     ):
@@ -466,9 +472,9 @@ class SequenceExtractor(HoneycombBase):
         self.thm_modes = thm_modes
         self.motion_filter_mode = motion_filter_mode
         self.use_dead_reckoning = use_dead_reckoning
-        self.dead_reckoning_detrend = dead_reckoning_detrend          # store
-        self.kalman_process_noise = kalman_process_noise              # store
-        self.kalman_measurement_noise = kalman_measurement_noise      # store
+        self.dead_reckoning_detrend = dead_reckoning_detrend
+        self.kalman_process_noise = kalman_process_noise
+        self.kalman_measurement_noise = kalman_measurement_noise
         self.compute_dt = compute_dt
         self.window_size = window_size
         self.smooth_alpha = smooth_alpha
@@ -478,104 +484,87 @@ class SequenceExtractor(HoneycombBase):
         self.padding_value = padding_value
         self.sequence_col = sequence_col
         self.counter_col = counter_col
-        self.native_sampling_rate = native_sampling_rate
-        self.target_sampling_rate = target_sampling_rate
+        
+        self.imu_native_sampling_rate = imu_native_sampling_rate
+        self.imu_target_sampling_rate = imu_target_sampling_rate
+        self.rot_native_sampling_rate = rot_native_sampling_rate
+        self.rot_target_sampling_rate = rot_target_sampling_rate
+        self.tof_native_sampling_rate = tof_native_sampling_rate
+        self.tof_target_sampling_rate = tof_target_sampling_rate
+        self.thm_native_sampling_rate = thm_native_sampling_rate
+        self.thm_target_sampling_rate = thm_target_sampling_rate
+        
         self.chunk_window_size = chunk_window_size
         self.chunk_stride = chunk_stride
 
-        # Create internal components with the new parameters
         self.cleaner = SignalCleaner(
-            self.native_sampling_rate, compute_dt, clip_value, interp_mode,
-            sequence_col=sequence_col, counter_col=counter_col,
-            window_size=window_size
+            imu_native_sampling_rate, compute_dt, clip_value, interp_mode,
+            sequence_col=sequence_col, counter_col=counter_col, window_size=window_size
         )
         self.motion_filter = MotionFilter(
-            motion_filter_mode,
-            kalman_process_noise=kalman_process_noise,           # pass through
-            kalman_measurement_noise=kalman_measurement_noise,
-            use_dead_reckoning=use_dead_reckoning,
-            dead_reckoning_detrend=dead_reckoning_detrend,       # pass through
-            sequence_col=sequence_col
+            motion_filter_mode, kalman_process_noise, kalman_measurement_noise,
+            use_dead_reckoning, dead_reckoning_detrend, sequence_col
         )
-        self.imu = IMUExtractor(
-            acc_modes, window_size=window_size, smooth_alpha=smooth_alpha,
-            sequence_col=sequence_col
-        )
-        self.rotation = RotationExtractor(
-            rotation_modes, sequence_col=sequence_col
-        )
-        self.tof = TOFExtractor(
-            tof_modes, sequence_col=sequence_col           # now tof_modes is plural
-        )
-        self.thermo = ThermoExtractor(
-            thm_modes, sequence_col=sequence_col           # now thm_modes is plural
-        )
+        self.imu = IMUExtractor(acc_modes, window_size=window_size, smooth_alpha=smooth_alpha, sequence_col=sequence_col)
+        self.rotation = RotationExtractor(rotation_modes, sequence_col=sequence_col)
+        self.tof = TOFExtractor(tof_modes, sequence_col=sequence_col)
+        self.thermo = ThermoExtractor(thm_modes, sequence_col=sequence_col)
+        
         self.feature_names_in_: List[str] = []
         self.base_feature_names_: List[str] = []
 
-    @staticmethod
-    def _global_context_feature_names(base_cols: List[str]) -> List[str]:
-        return (
-            list(base_cols)
-            + [f"{c}_global_mean" for c in base_cols]
-            + [f"{c}_global_std" for c in base_cols]
-        )
-
-    def _append_global_context(self, df: pd.DataFrame, base_cols: List[str]) -> pd.DataFrame:
-        out = df.copy()
-        grouped = out.groupby(self.sequence_col, sort=False)
-        for col in base_cols:
-            out[f"{col}_global_mean"] = grouped[col].transform("mean")
-            out[f"{col}_global_std"] = grouped[col].transform("std").fillna(0.0)
-        return out
+    def _resample_modality_cols(self, g: pd.DataFrame, cols: List[str], native_rate: int, target_rate: int) -> pd.DataFrame:
+        if native_rate == target_rate or not cols:
+            return g[cols]
+        num_samples = int(np.round(len(g) * target_rate / native_rate))
+        if num_samples <= 0:
+            return pd.DataFrame(columns=cols)
+        resampled = resample(g[cols].values, num_samples, axis=0)
+        return pd.DataFrame(resampled, columns=cols)
 
     def fit(self, X: pd.DataFrame, y: Optional[pd.DataFrame] = None) -> 'SequenceExtractor':
-        # 🚨 CRITICAL FIX: Re-instantiate sub-components here!
-        # When GridSearchCV updates parameters, it only updates the top-level 
-        # SequenceExtractor attributes. It DOES NOT update the sub-components 
-        # that were already created in __init__. We must recreate them now 
-        # so they actually use the parameters GridSearchCV is testing.
-        
-        self.cleaner = SignalCleaner(
-            self.native_sampling_rate, self.compute_dt, self.clip_value, self.interp_mode,
-            sequence_col=self.sequence_col, counter_col=self.counter_col,
-            window_size=self.window_size
-        )
-        self.motion_filter = MotionFilter(
-            self.motion_filter_mode,
-            kalman_process_noise=self.kalman_process_noise,
-            kalman_measurement_noise=self.kalman_measurement_noise,
-            use_dead_reckoning=self.use_dead_reckoning,
-            dead_reckoning_detrend=self.dead_reckoning_detrend,
-            sequence_col=self.sequence_col
-        )
-        self.imu = IMUExtractor(
-            self.acc_modes, window_size=self.window_size, smooth_alpha=self.smooth_alpha,
-            sequence_col=self.sequence_col
-        )
-        self.rotation = RotationExtractor(
-            self.rotation_modes, sequence_col=self.sequence_col
-        )
-        self.tof = TOFExtractor(
-            self.tof_modes, sequence_col=self.sequence_col
-        )
-        self.thermo = ThermoExtractor(
-            self.thm_modes, sequence_col=self.sequence_col
-        )
+        # Re-instantiate sub-components to capture any GridSearchCV param updates
+        self.cleaner = SignalCleaner(self.imu_native_sampling_rate, self.compute_dt, self.clip_value, self.interp_mode, sequence_col=self.sequence_col, counter_col=self.counter_col, window_size=self.window_size)
+        self.motion_filter = MotionFilter(self.motion_filter_mode, self.kalman_process_noise, self.kalman_measurement_noise, self.use_dead_reckoning, self.dead_reckoning_detrend, self.sequence_col)
+        self.imu = IMUExtractor(self.acc_modes, window_size=self.window_size, smooth_alpha=self.smooth_alpha, sequence_col=self.sequence_col)
+        self.rotation = RotationExtractor(self.rotation_modes, sequence_col=self.sequence_col)
+        self.tof = TOFExtractor(self.tof_modes, sequence_col=self.sequence_col)
+        self.thermo = ThermoExtractor(self.thm_modes, sequence_col=self.sequence_col)
 
-        # --- Original fit logic continues below ---
         cleaned = self.cleaner.fit_transform(X)
         filtered = self.motion_filter.fit_transform(cleaned)
         
-        self.imu.fit(filtered)
-        self.rotation.fit(filtered)
-        self.tof.fit(filtered)
-        self.thermo.fit(filtered)
+        # We fit the extractors on a dummy resampled batch to get the correct feature names
+        dummy_resampled = []
+        for seq_id, g in filtered.groupby(self.sequence_col, sort=False):
+            g_new = g.copy()
+            imu_cols = [c for c in g.columns if c.startswith("acc_") and not c.startswith("lin_acc")]
+            rot_cols = [c for c in g.columns if c.startswith("rot_")]
+            tof_cols = [c for c in g.columns if c.startswith("tof_")]
+            thm_cols = [c for c in g.columns if c.startswith("thm_")]
+            
+            if self.imu_native_sampling_rate != self.imu_target_sampling_rate:
+                g_new[imu_cols] = self._resample_modality_cols(g, imu_cols, self.imu_native_sampling_rate, self.imu_target_sampling_rate).values
+                g_new["dt"] = 1.0 / float(self.imu_target_sampling_rate)
+            if self.rot_native_sampling_rate != self.rot_target_sampling_rate:
+                g_new[rot_cols] = self._resample_modality_cols(g, rot_cols, self.rot_native_sampling_rate, self.rot_target_sampling_rate).values
+            if self.tof_native_sampling_rate != self.tof_target_sampling_rate:
+                g_new[tof_cols] = self._resample_modality_cols(g, tof_cols, self.tof_native_sampling_rate, self.tof_target_sampling_rate).values
+            if self.thm_native_sampling_rate != self.thm_target_sampling_rate:
+                g_new[thm_cols] = self._resample_modality_cols(g, thm_cols, self.thm_native_sampling_rate, self.thm_target_sampling_rate).values
+            dummy_resampled.append(g_new)
+        
+        filtered_resampled = pd.concat(dummy_resampled)
 
-        imu_out = self.imu.transform(filtered)
-        rot_out = self.rotation.transform(filtered)
-        tof_out = self.tof.transform(filtered)
-        thm_out = self.thermo.transform(filtered)
+        self.imu.fit(filtered_resampled)
+        self.rotation.fit(filtered_resampled)
+        self.tof.fit(filtered_resampled)
+        self.thermo.fit(filtered_resampled)
+
+        imu_out = self.imu.transform(filtered_resampled)
+        rot_out = self.rotation.transform(filtered_resampled)
+        tof_out = self.tof.transform(filtered_resampled)
+        thm_out = self.thermo.transform(filtered_resampled)
 
         combined = pd.concat([imu_out, rot_out, tof_out, thm_out], axis=1).fillna(0.0)
         base_cols = list(combined.columns)
@@ -593,6 +582,28 @@ class SequenceExtractor(HoneycombBase):
         cleaned = self.cleaner.transform(X)
         filtered = self.motion_filter.transform(cleaned)
 
+        # Per-modality resampling
+        resampled_groups = []
+        for seq_id, g in filtered.groupby(self.sequence_col, sort=False):
+            g_new = g.copy()
+            imu_cols = [c for c in g.columns if c.startswith("acc_") and not c.startswith("lin_acc")]
+            rot_cols = [c for c in g.columns if c.startswith("rot_")]
+            tof_cols = [c for c in g.columns if c.startswith("tof_")]
+            thm_cols = [c for c in g.columns if c.startswith("thm_")]
+            
+            if self.imu_native_sampling_rate != self.imu_target_sampling_rate:
+                g_new[imu_cols] = self._resample_modality_cols(g, imu_cols, self.imu_native_sampling_rate, self.imu_target_sampling_rate).values
+                g_new["dt"] = 1.0 / float(self.imu_target_sampling_rate)
+            if self.rot_native_sampling_rate != self.rot_target_sampling_rate:
+                g_new[rot_cols] = self._resample_modality_cols(g, rot_cols, self.rot_native_sampling_rate, self.rot_target_sampling_rate).values
+            if self.tof_native_sampling_rate != self.tof_target_sampling_rate:
+                g_new[tof_cols] = self._resample_modality_cols(g, tof_cols, self.tof_native_sampling_rate, self.tof_target_sampling_rate).values
+            if self.thm_native_sampling_rate != self.thm_target_sampling_rate:
+                g_new[thm_cols] = self._resample_modality_cols(g, thm_cols, self.thm_native_sampling_rate, self.thm_target_sampling_rate).values
+            resampled_groups.append(g_new)
+            
+        filtered = pd.concat(resampled_groups)
+
         out = pd.concat([
             self.imu.transform(filtered),
             self.rotation.transform(filtered),
@@ -600,9 +611,9 @@ class SequenceExtractor(HoneycombBase):
             self.thermo.transform(filtered),
         ], axis=1).fillna(0.0)
 
-        out[self.sequence_col] = X[self.sequence_col].values
-        if self.counter_col in X.columns:
-            out[self.counter_col] = X[self.counter_col].values
+        out[self.sequence_col] = filtered[self.sequence_col].values
+        if self.counter_col in filtered.columns:
+            out[self.counter_col] = filtered[self.counter_col].values
 
         out = self._append_global_context(out, self.base_feature_names_)
 
@@ -614,27 +625,21 @@ class SequenceExtractor(HoneycombBase):
                 g = g.sort_values(self.counter_col)
             arr = g[self.feature_names_in_].to_numpy(dtype=np.float32)
 
-            # 1. RESAMPLING MATH
-            if self.target_sampling_rate != self.native_sampling_rate and len(arr) > 1:
-                num_samples = int(np.round(len(arr) * self.target_sampling_rate / self.native_sampling_rate))
-                if num_samples > 0:
-                    arr = resample(arr, num_samples, axis=0)
-
-            # 2. SLIDING WINDOW CHUNKING
             L = len(arr)
             W = self.chunk_window_size
             S = self.chunk_stride
 
+            if S >= W:
+                W = S
+                print('Warning: chunk_stride must be smaller than chunk_window_size -> Changed.')
+
             if L <= W:
-                # Sequence is shorter than window: pad it
                 pad = np.full((W - L, arr.shape[1]), self.padding_value, dtype=np.float32)
                 arr = np.vstack([arr, pad])
                 sequences.append(arr)
                 seq_ids.append(seq_id)
             else:
-                # Generate window starts
                 starts = np.arange(0, L - W + 1, S)
-                # CRITICAL: Force the last window to grab the very end of the sequence (the gesture!)
                 if len(starts) == 0 or starts[-1] + W < L:
                     starts = np.append(starts, L - W)
 
@@ -647,6 +652,19 @@ class SequenceExtractor(HoneycombBase):
             'X': np.stack(sequences, axis=0),
             'sequence_ids': np.array(seq_ids)
         }
+    
+    def _append_global_context(self, out: pd.DataFrame, base_cols: List[str]) -> pd.DataFrame:
+        """
+        Calculates sequence-level global mean and standard deviation for each base feature 
+        and appends them as new columns to the dataframe.
+        """
+        for col in base_cols:
+            if col in out.columns:
+                # Calculate mean and std per sequence and broadcast back to each row
+                out[f"{col}_global_mean"] = out.groupby(self.sequence_col)[col].transform('mean')
+                # Fill NaN std (which happens if a sequence only has 1 row) with 0.0
+                out[f"{col}_global_std"] = out.groupby(self.sequence_col)[col].transform('std').fillna(0.0)
+        return out
 
 
 def prepare_multitask_param_space(param_space: dict, search_mode: str) -> dict:
