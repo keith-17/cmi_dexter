@@ -1,0 +1,38 @@
+{
+	"folders": [
+		{
+			"path": ".",
+			"name": "CMI Dexter - ML Project"
+		}
+	],
+	"settings": {
+		"codeium.enableCodebase": true,
+		"codeium.codebaseMaxFiles": 1000,
+		"codeium.codebaseMaxTokens": 80000,
+		"codeium.enableSearch": true,
+		"codeium.enableSymbols": true,
+		"codeium.enableProblems": true,
+		"codeium.workspaceContext": true,
+		"codeium.indexing.enabled": true,
+		"codeium.codebaseExclude": [
+			"**/__pycache__/**",
+			"**/.idea/**",
+			"**/*.pyc",
+			"**/model_runs/**",
+			"**/temp_calculations/**"
+		],
+		"python.analysis.extraPaths": [
+			"./src"
+		],
+		"python.defaultInterpreterPath": "python3",
+		"files.associations": {
+			"*.ipynb": "jupyter-notebook"
+		}
+	},
+	"extensions": {
+		"recommendations": [
+			"ms-python.python",
+			"ms-toolsai.jupyter"
+		]
+	}
+}
