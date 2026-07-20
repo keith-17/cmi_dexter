@@ -530,42 +530,58 @@ class SequenceExtractor(HoneycombBase):
         self.rotation = RotationExtractor(self.rotation_modes, sequence_col=self.sequence_col)
         self.tof = TOFExtractor(self.tof_modes, sequence_col=self.sequence_col)
         self.thermo = ThermoExtractor(self.thm_modes, sequence_col=self.sequence_col)
-
+        
         cleaned = self.cleaner.fit_transform(X)
         filtered = self.motion_filter.fit_transform(cleaned)
         
-        # We fit the extractors on a dummy resampled batch to get the correct feature names
+        # --- FIXED RESAMPLING BLOCK ---
         dummy_resampled = []
         for seq_id, g in filtered.groupby(self.sequence_col, sort=False):
-            g_new = g.copy()
             imu_cols = [c for c in g.columns if c.startswith("acc_") and not c.startswith("lin_acc")]
             rot_cols = [c for c in g.columns if c.startswith("rot_")]
             tof_cols = [c for c in g.columns if c.startswith("tof_")]
             thm_cols = [c for c in g.columns if c.startswith("thm_")]
             
-            if self.imu_native_sampling_rate != self.imu_target_sampling_rate:
-                g_new[imu_cols] = self._resample_modality_cols(g, imu_cols, self.imu_native_sampling_rate, self.imu_target_sampling_rate).values
-                g_new["dt"] = 1.0 / float(self.imu_target_sampling_rate)
-            if self.rot_native_sampling_rate != self.rot_target_sampling_rate:
-                g_new[rot_cols] = self._resample_modality_cols(g, rot_cols, self.rot_native_sampling_rate, self.rot_target_sampling_rate).values
-            if self.tof_native_sampling_rate != self.tof_target_sampling_rate:
-                g_new[tof_cols] = self._resample_modality_cols(g, tof_cols, self.tof_native_sampling_rate, self.tof_target_sampling_rate).values
-            if self.thm_native_sampling_rate != self.thm_target_sampling_rate:
-                g_new[thm_cols] = self._resample_modality_cols(g, thm_cols, self.thm_native_sampling_rate, self.thm_target_sampling_rate).values
-            dummy_resampled.append(g_new)
-        
-        filtered_resampled = pd.concat(dummy_resampled)
+            # Calculate target lengths for each modality
+            len_imu = int(np.round(len(g) * self.imu_target_sampling_rate / self.imu_native_sampling_rate)) if imu_cols else len(g)
+            len_rot = int(np.round(len(g) * self.rot_target_sampling_rate / self.rot_native_sampling_rate)) if rot_cols else len(g)
+            len_tof = int(np.round(len(g) * self.tof_target_sampling_rate / self.tof_native_sampling_rate)) if tof_cols else len(g)
+            len_thm = int(np.round(len(g) * self.thm_target_sampling_rate / self.thm_native_sampling_rate)) if thm_cols else len(g)
+            
+            # Align all modalities to the maximum target length to prevent shape mismatches
+            max_len = max(len_imu, len_rot, len_tof, len_thm, len(g))
+            
+            new_data = {self.sequence_col: g[self.sequence_col].iloc[0]}
+            if self.counter_col in g.columns:
+                new_data[self.counter_col] = np.arange(max_len)
+            
+            for cols in [imu_cols, rot_cols, tof_cols, thm_cols]:
+                if cols:
+                    resampled = resample(g[cols].values, max_len, axis=0)
+                    for i, c in enumerate(cols):
+                        new_data[c] = resampled[:, i]
+                        
+            new_data["dt"] = 1.0 / float(max(self.imu_target_sampling_rate, self.rot_target_sampling_rate, self.tof_target_sampling_rate, self.thm_target_sampling_rate, self.imu_native_sampling_rate))
+            if "mask" in g.columns:
+                new_data["mask"] = 1.0
+                
+            dummy_resampled.append(pd.DataFrame(new_data))
+            
+        # CRITICAL FIX: ignore_index=True ensures a unique, monotonic index 
+        # which prevents InvalidIndexError in RotationExtractor's get_indexer
+        filtered_resampled = pd.concat(dummy_resampled, ignore_index=True)
+        # --- END FIXED RESAMPLING BLOCK ---
 
         self.imu.fit(filtered_resampled)
         self.rotation.fit(filtered_resampled)
         self.tof.fit(filtered_resampled)
         self.thermo.fit(filtered_resampled)
-
+        
         imu_out = self.imu.transform(filtered_resampled)
         rot_out = self.rotation.transform(filtered_resampled)
         tof_out = self.tof.transform(filtered_resampled)
         thm_out = self.thermo.transform(filtered_resampled)
-
+        
         combined = pd.concat([imu_out, rot_out, tof_out, thm_out], axis=1).fillna(0.0)
         base_cols = list(combined.columns)
         self.base_feature_names_ = base_cols
@@ -578,31 +594,43 @@ class SequenceExtractor(HoneycombBase):
 
     def transform(self, X: pd.DataFrame) -> dict:
         check_is_fitted(self, ["feature_names_in_", "base_feature_names_"])
-
         cleaned = self.cleaner.transform(X)
         filtered = self.motion_filter.transform(cleaned)
-
-        # Per-modality resampling
+        
+        # --- FIXED RESAMPLING BLOCK ---
         resampled_groups = []
         for seq_id, g in filtered.groupby(self.sequence_col, sort=False):
-            g_new = g.copy()
             imu_cols = [c for c in g.columns if c.startswith("acc_") and not c.startswith("lin_acc")]
             rot_cols = [c for c in g.columns if c.startswith("rot_")]
             tof_cols = [c for c in g.columns if c.startswith("tof_")]
             thm_cols = [c for c in g.columns if c.startswith("thm_")]
             
-            if self.imu_native_sampling_rate != self.imu_target_sampling_rate:
-                g_new[imu_cols] = self._resample_modality_cols(g, imu_cols, self.imu_native_sampling_rate, self.imu_target_sampling_rate).values
-                g_new["dt"] = 1.0 / float(self.imu_target_sampling_rate)
-            if self.rot_native_sampling_rate != self.rot_target_sampling_rate:
-                g_new[rot_cols] = self._resample_modality_cols(g, rot_cols, self.rot_native_sampling_rate, self.rot_target_sampling_rate).values
-            if self.tof_native_sampling_rate != self.tof_target_sampling_rate:
-                g_new[tof_cols] = self._resample_modality_cols(g, tof_cols, self.tof_native_sampling_rate, self.tof_target_sampling_rate).values
-            if self.thm_native_sampling_rate != self.thm_target_sampling_rate:
-                g_new[thm_cols] = self._resample_modality_cols(g, thm_cols, self.thm_native_sampling_rate, self.thm_target_sampling_rate).values
-            resampled_groups.append(g_new)
+            len_imu = int(np.round(len(g) * self.imu_target_sampling_rate / self.imu_native_sampling_rate)) if imu_cols else len(g)
+            len_rot = int(np.round(len(g) * self.rot_target_sampling_rate / self.rot_native_sampling_rate)) if rot_cols else len(g)
+            len_tof = int(np.round(len(g) * self.tof_target_sampling_rate / self.tof_native_sampling_rate)) if tof_cols else len(g)
+            len_thm = int(np.round(len(g) * self.thm_target_sampling_rate / self.thm_native_sampling_rate)) if thm_cols else len(g)
             
-        filtered = pd.concat(resampled_groups)
+            max_len = max(len_imu, len_rot, len_tof, len_thm, len(g))
+            
+            new_data = {self.sequence_col: g[self.sequence_col].iloc[0]}
+            if self.counter_col in g.columns:
+                new_data[self.counter_col] = np.arange(max_len)
+            
+            for cols in [imu_cols, rot_cols, tof_cols, thm_cols]:
+                if cols:
+                    resampled = resample(g[cols].values, max_len, axis=0)
+                    for i, c in enumerate(cols):
+                        new_data[c] = resampled[:, i]
+                        
+            new_data["dt"] = 1.0 / float(max(self.imu_target_sampling_rate, self.rot_target_sampling_rate, self.tof_target_sampling_rate, self.thm_target_sampling_rate, self.imu_native_sampling_rate))
+            if "mask" in g.columns:
+                new_data["mask"] = 1.0
+                
+            resampled_groups.append(pd.DataFrame(new_data))
+            
+        # CRITICAL FIX: ignore_index=True ensures a unique, monotonic index
+        filtered = pd.concat(resampled_groups, ignore_index=True)
+        # --- END FIXED RESAMPLING BLOCK ---
 
         out = pd.concat([
             self.imu.transform(filtered),
@@ -610,29 +638,24 @@ class SequenceExtractor(HoneycombBase):
             self.tof.transform(filtered),
             self.thermo.transform(filtered),
         ], axis=1).fillna(0.0)
-
+        
         out[self.sequence_col] = filtered[self.sequence_col].values
         if self.counter_col in filtered.columns:
             out[self.counter_col] = filtered[self.counter_col].values
-
+            
         out = self._append_global_context(out, self.base_feature_names_)
-
         sequences = []
         seq_ids = []
-        
         for seq_id, g in out.groupby(self.sequence_col, sort=False):
             if self.counter_col in g.columns:
                 g = g.sort_values(self.counter_col)
             arr = g[self.feature_names_in_].to_numpy(dtype=np.float32)
-
             L = len(arr)
             W = self.chunk_window_size
             S = self.chunk_stride
-
             if S >= W:
                 W = S
                 print('Warning: chunk_stride must be smaller than chunk_window_size -> Changed.')
-
             if L <= W:
                 pad = np.full((W - L, arr.shape[1]), self.padding_value, dtype=np.float32)
                 arr = np.vstack([arr, pad])
@@ -642,12 +665,10 @@ class SequenceExtractor(HoneycombBase):
                 starts = np.arange(0, L - W + 1, S)
                 if len(starts) == 0 or starts[-1] + W < L:
                     starts = np.append(starts, L - W)
-
                 for start in starts:
                     chunk = arr[start : start + W]
                     sequences.append(chunk)
                     seq_ids.append(seq_id)
-
         return {
             'X': np.stack(sequences, axis=0),
             'sequence_ids': np.array(seq_ids)
