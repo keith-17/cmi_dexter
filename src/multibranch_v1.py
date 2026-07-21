@@ -11,7 +11,8 @@ import tensorflow as tf
 from tensorflow.keras.layers import (Input, Conv1D, Conv2D, BatchNormalization, Activation, 
                                      Concatenate, Multiply, Reshape, GlobalAveragePooling1D, 
                                      Bidirectional, GRU, Dense, Dropout, SpatialDropout1D, 
-                                     Lambda, MultiHeadAttention, LayerNormalization, Add, Attention)
+                                     Lambda, MultiHeadAttention, LayerNormalization, Add, Attention,
+                                     Masking)
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
@@ -111,8 +112,14 @@ class KerasFlexibleMultiBranchClassifier(BaseEstimator, ClassifierMixin):
             x = Conv2D(32, (3, 3), padding="same", activation="relu")(x)
             if self.use_batch_norm: x = BatchNormalization()(x)
             x = Conv2D(64, (3, 3), padding="same", activation="relu")(x)
-            # FIXED: Use dynamic shape (tf.shape(t)[1]) instead of hardcoded self.maxlen
-            x = Lambda(lambda t: tf.reshape(t, (tf.shape(t)[0], tf.shape(t)[1], -1)))(x)
+            # FIXED: the previous tf.reshape(..., tf.shape(t)[0], tf.shape(t)[1], -1)
+            # used a fully dynamic shape for every axis, which erases the static
+            # channel dimension downstream (x.shape[-1] becomes None), which then
+            # breaks `_se_block`'s `channels // se_ratio`. seq_len/feature/filter
+            # counts are all static here (padding="same" preserves spatial dims),
+            # so use a plain Reshape with static ints instead.
+            time_dim, feat_dim, ch_dim = x.shape[1], x.shape[2], x.shape[3]
+            x = Reshape((time_dim, feat_dim * ch_dim))(x)
             return x
         elif self.backbone_type == "attention":
             attn_out = MultiHeadAttention(num_heads=self.attention_heads, key_dim=x.shape[-1])(x, x)
@@ -140,17 +147,27 @@ class KerasFlexibleMultiBranchClassifier(BaseEstimator, ClassifierMixin):
     def _build_model(self, seq_len, total_features, branch_indices, num_classes):
         # FIXED: Use dynamic seq_len instead of hardcoded self.maxlen
         inputs = Input(shape=(seq_len, total_features), name="main_input")
+        # Mark padded timesteps (== padding_value across ALL features) so masking
+        # propagates through mask-aware layers (GRU/Bidirectional/Attention/Dense/etc.)
+        # instead of every padded timestep being treated as a real -999.0 signal.
+        masked_inputs = Masking(mask_value=self.padding_value, name="pad_mask")(inputs)
         branch_tensors = []
         for b_name in ["acc", "rot", "tof", "thm"]:
             if b_name in branch_indices and len(branch_indices[b_name]) > 0:
                 idx = branch_indices[b_name]
-                b_tensor = Lambda(lambda x: tf.gather(x, indices=idx, axis=-1), name=f"{b_name}_slice")(inputs)
+                # NOTE: tf.gather via Lambda drops the propagated mask for CNN/attention
+                # branches (Lambda has no compute_mask). GRU-backbone branches keep it.
+                # Re-derive the mask for those branches explicitly below via merged_se.
+                # FIXED: bind idx as a default arg to avoid the late-binding closure bug
+                # (without this, every branch's Lambda re-reads the loop variable `idx`
+                # at call time and all branches silently gather the LAST branch's indices).
+                b_tensor = Lambda(lambda x, idx=idx: tf.gather(x, indices=idx, axis=-1), name=f"{b_name}_slice")(masked_inputs)
                 b_out = self._build_branch(b_tensor, b_name)
                 branch_tensors.append(b_out)
         if len(branch_tensors) > 1:
             merged = Concatenate(axis=-1, name="concat_branches")(branch_tensors)
         else:
-            merged = branch_tensors[0] if branch_tensors else inputs
+            merged = branch_tensors[0] if branch_tensors else masked_inputs
         merged_se = self._se_block(merged, name="fusion")
         if self.use_post_bigru:
             merged_se = Bidirectional(GRU(self.post_gru_units, return_sequences=True))(merged_se)
@@ -172,12 +189,25 @@ class KerasFlexibleMultiBranchClassifier(BaseEstimator, ClassifierMixin):
             X_arr = X['X']
         else:
             X_arr = X
-            
+
+        # GridSearchCV's y must stay the SAME object end-to-end for both fit() and
+        # the scorer: make_competition_scorer needs a DataFrame (sequence_id,
+        # is_target, target_col) to correctly dedupe/align against predict()'s
+        # per-sequence output, but a plain label array is needed here for training.
+        # Passing y_train as just X_train[TARGET_COL] (a bare Series) satisfies
+        # fit() but starves the scorer of sequence_id/is_target, which silently
+        # produces mismatched-length y_true/y_pred inside competition_score() and,
+        # combined with error_score=0.0, reports every candidate as a score of 0.0.
+        if isinstance(y, pd.DataFrame):
+            y_labels = y[self.primary_target].values
+        else:
+            y_labels = y
+
         self.seq_len_ = X_arr.shape[1]
         self.total_features_ = X_arr.shape[-1]
         self.branch_indices_ = get_branch_indices(feature_names)
         self.label_encoder_ = LabelEncoder()
-        y_enc = self.label_encoder_.fit_transform(y)
+        y_enc = self.label_encoder_.fit_transform(y_labels)
         num_classes = len(self.label_encoder_.classes_)
         
         self.model_ = self._build_model(self.seq_len_, self.total_features_, self.branch_indices_, num_classes)
@@ -203,10 +233,40 @@ class KerasFlexibleMultiBranchClassifier(BaseEstimator, ClassifierMixin):
         return self
 
     def predict_proba(self, X):
+        """
+        Returns class probabilities. If X came from SequenceExtractor.transform()
+        (a dict with 'X' and 'sequence_ids'), a sequence longer than
+        chunk_window_size may have been split into multiple overlapping chunks.
+        Those chunk-level rows are mean-pooled back into ONE row per sequence_id
+        here, so len(predict_proba(X)) == number of unique sequences, not
+        number of chunks.
+        """
         check_is_fitted(self, "model_")
-        if isinstance(X, dict): X_arr = X['X']
-        else: X_arr = X
-        return self.model_.predict(X_arr, verbose=0)
+        if isinstance(X, dict):
+            X_arr = X['X']
+            seq_ids = X.get('sequence_ids', None)
+        else:
+            X_arr = X
+            seq_ids = None
+
+        proba = self.model_.predict(X_arr, verbose=0)
+
+        if seq_ids is not None:
+            proba = self._aggregate_chunks_to_sequences(proba, seq_ids)
+
+        return proba
+
+    def _aggregate_chunks_to_sequences(self, proba: np.ndarray, seq_ids: np.ndarray) -> np.ndarray:
+        """
+        Mean-pool chunk-level probability rows onto their parent sequence_id.
+        Sorted ascending by sequence_id to match evaluate_holdout's
+        `y_test_seq = y_test_df.drop_duplicates(...).sort_values("sequence_id")`.
+        """
+        seq_ids = np.asarray(seq_ids)
+        df = pd.DataFrame(proba)
+        df["__seq_id__"] = seq_ids
+        agg = df.groupby("__seq_id__", sort=True).mean()
+        return agg.to_numpy()
 
     def predict(self, X):
         proba = self.predict_proba(X)
@@ -219,8 +279,11 @@ class FeatureAwarePipeline(Pipeline):
         Xt = X
         for name, transform in self.steps[:-1]:
             Xt = transform.fit_transform(Xt, y)
-            if hasattr(transform, 'feature_names_'):
-                fit_params[f'{self.steps[-1][0]}__feature_names'] = transform.feature_names_
+            # NOTE: SequenceExtractor stores this as `feature_names_in_`, not
+            # `feature_names_`. Check both so branch routing actually receives names.
+            names = getattr(transform, 'feature_names_in_', None) or getattr(transform, 'feature_names_', None)
+            if names is not None:
+                fit_params[f'{self.steps[-1][0]}__feature_names'] = names
         
         final_name, final_estimator = self.steps[-1]
         # Pass extracted params to the final estimator
