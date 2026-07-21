@@ -168,13 +168,11 @@ class KerasFlexibleMultiBranchClassifier(BaseEstimator, ClassifierMixin):
 
     def fit(self, X, y, feature_names=None, **kwargs):
         tf.random.set_seed(self.random_state)
-        # Handle dict output from SequenceExtractor
         if isinstance(X, dict):
             X_arr = X['X']
         else:
             X_arr = X
-        
-        # FIXED: Dynamically infer sequence length from the actual input data
+            
         self.seq_len_ = X_arr.shape[1]
         self.total_features_ = X_arr.shape[-1]
         self.branch_indices_ = get_branch_indices(feature_names)
@@ -182,17 +180,17 @@ class KerasFlexibleMultiBranchClassifier(BaseEstimator, ClassifierMixin):
         y_enc = self.label_encoder_.fit_transform(y)
         num_classes = len(self.label_encoder_.classes_)
         
-        # Pass the dynamically inferred seq_len_ to _build_model
         self.model_ = self._build_model(self.seq_len_, self.total_features_, self.branch_indices_, num_classes)
         
-        # Masking for Padding
         mask = np.any(X_arr != self.padding_value, axis=-1).astype(np.float32)
         sample_weights = np.mean(mask, axis=-1)
         cbs = [
             EarlyStopping(monitor="val_loss", patience=self.patience, restore_best_weights=True),
             ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=5, min_lr=1e-6)
         ]
-        self.model_.fit(
+        
+        # --- FIX: Capture and save the history object ---
+        history = self.model_.fit(
             X_arr, y_enc,
             sample_weight=sample_weights,
             batch_size=self.batch_size,
@@ -201,6 +199,7 @@ class KerasFlexibleMultiBranchClassifier(BaseEstimator, ClassifierMixin):
             callbacks=cbs,
             verbose=self.verbose
         )
+        self.history_ = history.history  # Save for plotting curves
         return self
 
     def predict_proba(self, X):
