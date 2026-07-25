@@ -46,7 +46,15 @@ except ImportError:
         competition_score = None
 
 
-DEFAULT_BRANCH_CONFIG: Dict[str, Tuple[str, ...]] = {
+def _history_to_dict(history: Any) -> Dict[str, List[float]]:
+    """Normalize Keras History objects to a plain dict for plotting."""
+    if history is None:
+        return {}
+    if isinstance(history, dict):
+        return history
+    if hasattr(history, "history"):
+        return dict(history.history)
+    return {}
     "acc": ("acc_", "lin_acc_"),
     "rot": ("rot_", "delta_rot_", "ang_vel_", "rot6d_"),
     "tof": ("tof_",),
@@ -489,6 +497,23 @@ class KerasFlexibleMultiBranchClassifier(BaseEstimator, ClassifierMixin):
             "val_accuracy": [1.0],
         }
 
+    def get_history_dict(self) -> Dict[str, List[float]]:
+        return _history_to_dict(getattr(self, "history_", {}))
+
+    def summarize_model(self) -> None:
+        model = getattr(self, "model_", None)
+        if model is None:
+            print("No fitted model found.")
+            return
+        if getattr(self, "fallback_used_", False):
+            print(f"Fallback estimator: {type(model).__name__}")
+            print(model)
+            return
+        if hasattr(model, "summary"):
+            model.summary()
+        else:
+            print(model)
+
     def _predict_fallback_proba(self, X_arr: np.ndarray, seq_ids: Optional[np.ndarray]) -> np.ndarray:
         probs = self.model_.predict_proba(self._build_fallback_features(X_arr))
         if seq_ids is None:
@@ -560,7 +585,7 @@ class KerasFlexibleMultiBranchClassifier(BaseEstimator, ClassifierMixin):
                 restore_best_weights=True,
             )
         ]
-        self.history_ = self.model_.fit(
+        fit_history = self.model_.fit(
             X_arr,
             y_enc,
             batch_size=int(self.batch_size),
@@ -570,10 +595,26 @@ class KerasFlexibleMultiBranchClassifier(BaseEstimator, ClassifierMixin):
             verbose=int(self.verbose),
             shuffle=True,
         )
+        self.history_ = _history_to_dict(fit_history)
         return self
 
     def _predict_chunk_logits(self, X_arr: np.ndarray) -> np.ndarray:
         return self.model_.predict(X_arr, verbose=0)
+
+    def _sequence_predictions(
+        self,
+        probs: np.ndarray,
+        seq_ids: Optional[np.ndarray],
+    ):
+        pred_idx = np.argmax(probs, axis=1)
+        preds = self.le_.inverse_transform(pred_idx)
+
+        if seq_ids is None:
+            return preds
+
+        unique_ids = pd.Series(seq_ids).drop_duplicates(keep="first").to_numpy()
+        pred_series = pd.Series(preds, index=unique_ids, name=self.primary_target)
+        return pred_series.sort_index()
 
     def predict_proba(self, X):
         X_arr, seq_ids, _ = self._unpack_X(X)
@@ -592,15 +633,12 @@ class KerasFlexibleMultiBranchClassifier(BaseEstimator, ClassifierMixin):
         return df.groupby("sequence_id", sort=False).mean().to_numpy()
 
     def predict(self, X):
-        X_arr, seq_ids, _ = self._unpack_X(X)
         probs = self.predict_proba(X)
-        pred_idx = np.argmax(probs, axis=1)
-        preds = self.le_.inverse_transform(pred_idx)
-
-        if seq_ids is not None:
-            unique_ids = pd.Series(seq_ids).drop_duplicates(keep="first").to_numpy()
-            return pd.Series(preds, index=unique_ids, name=self.primary_target)
-        return preds
+        _, seq_ids, _ = self._unpack_X(X)
+        pred_series = self._sequence_predictions(probs, seq_ids)
+        if isinstance(pred_series, pd.Series):
+            return pred_series
+        return pred_series
 
     def score(self, X, y):
         preds = self.predict(X)
