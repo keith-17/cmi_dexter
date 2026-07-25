@@ -55,11 +55,14 @@ def _history_to_dict(history: Any) -> Dict[str, List[float]]:
     if hasattr(history, "history"):
         return dict(history.history)
     return {}
-    "acc": ("acc_", "lin_acc_"),
-    "rot": ("rot_", "delta_rot_", "ang_vel_", "rot6d_"),
-    "tof": ("tof_",),
-    "thm": ("thm_",),
-}
+
+
+DEFAULT_BRANCH_CONFIG = {
+        "acc": ("acc_", "lin_acc_"),
+        "rot": ("rot_", "delta_rot_", "ang_vel_", "rot6d_"),
+        "tof": ("tof_",),
+        "thm": ("thm_",),
+    }
 
 DEFAULT_BRANCH_FILTERS: Dict[str, str] = {
     "acc": "64-128",
