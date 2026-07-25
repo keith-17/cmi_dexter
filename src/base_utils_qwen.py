@@ -671,7 +671,8 @@ class SequenceExtractor(HoneycombBase):
                     seq_ids.append(seq_id)
         return {
             'X': np.stack(sequences, axis=0),
-            'sequence_ids': np.array(seq_ids)
+            'sequence_ids': np.array(seq_ids),
+            'feature_names': list(self.feature_names_in_),
         }
     
     def _append_global_context(self, out: pd.DataFrame, base_cols: List[str]) -> pd.DataFrame:
