@@ -2058,7 +2058,7 @@ class STFTExtractor(HoneycombBase):
         nperseg: int = 32,
         noverlap: Optional[int] = None,
         window_type: str = "hann",
-        scaling: str = "density",  # 'density' or 'spectrum'
+        scaling: str = "density",  # 'density' or 'spectrum' or 'psd'
         detrend: str = "constant",
         use_log_scale: bool = True,
         frequency_bands: Optional[Dict[str, Tuple[float, float]]] = None,
@@ -2094,13 +2094,19 @@ class STFTExtractor(HoneycombBase):
         """Compute STFT and extract features from spectrogram."""
         if stft is None:
             raise ImportError("STFTExtractor requires SciPy. Install with: pip install scipy")
-        
+
         signal = np.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0)
-        
+
         if len(signal) < self.nperseg:
             # Pad signal if too short
             signal = np.pad(signal, (0, self.nperseg - len(signal)), mode='constant')
-        
+
+        scipy_scaling = self.scaling.lower()
+        if scipy_scaling == 'density':
+            scipy_scaling = 'psd'
+        elif scipy_scaling not in {'spectrum', 'psd'}:
+            raise ValueError(f"Unsupported STFT scaling '{self.scaling}'. Use 'density', 'spectrum', or 'psd'.")
+
         # Compute STFT
         f, t, Zxx = stft(
             signal,
@@ -2111,14 +2117,14 @@ class STFTExtractor(HoneycombBase):
             nfft=None,
             detrend=self.detrend,
             return_onesided=True,
-            scaling=self.scaling,
+            scaling=scipy_scaling,
             axis=-1,
             boundary=None,
             padded=False,
         )
-        
+
         # Power spectrogram (magnitude squared)
-        if self.scaling == 'density':
+        if self.scaling.lower() == 'density':
             Pxx = np.abs(Zxx) ** 2  # Power spectral density
         else:
             Pxx = np.abs(Zxx)  # Amplitude spectrum

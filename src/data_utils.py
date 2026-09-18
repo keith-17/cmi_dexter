@@ -24,7 +24,7 @@ def find_data_root(local_dir: str = 'data', kaggle_root: str = '/kaggle/input') 
     exact_path = Path(local_dir)
     if exact_path.exists() and exact_path.is_dir():
         if all((exact_path / f).exists() for f in required_files):
-            print(f'✅ Using exact path: {exact_path.resolve()}')
+            print(f'Using exact path: {exact_path.resolve()}')
             return exact_path
 
     # Gather starting points for upward search
@@ -62,7 +62,7 @@ def find_data_root(local_dir: str = 'data', kaggle_root: str = '/kaggle/input') 
         for parent in [current] + list(current.parents):
             res = check_dir(parent)
             if res:
-                print(f'✅ Found data folder: {res}')
+                print(f'Found data folder: {res}')
                 return res
 
     # 3. Check Kaggle environment
@@ -70,12 +70,12 @@ def find_data_root(local_dir: str = 'data', kaggle_root: str = '/kaggle/input') 
     if kaggle_path.exists():
         for candidate in kaggle_path.rglob('train.csv'):
             target_dir = candidate.parent
-            print(f'✅ Using Kaggle data folder: {target_dir}')
+            print(f'Using Kaggle data folder: {target_dir}')
             return target_dir
 
     # 4. Fallback / Error
     raise FileNotFoundError(
-        f'❌ Could not find the dataset.\n'
+        f'Could not find the dataset.\n'
         f'Searched upwards from: {[str(p) for p in unique_starts]}\n'
         f'Looked for a folder named "{local_dir}" containing {required_files}.\n'
         f'Current directory: {Path.cwd()}\n'
