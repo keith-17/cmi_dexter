@@ -47,6 +47,91 @@ except Exception:
     Categorical = None
 
 
+class InvalidExtractorParams(ValueError):
+    """Raised when extractor hyperparameters cannot produce valid features."""
+
+
+def _positive_int(value: Any, *, default: Optional[int] = None, name: str = "parameter") -> int:
+    if value is None:
+        if default is None:
+            raise InvalidExtractorParams(f"{name} must be set")
+        value = default
+
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise InvalidExtractorParams(f"{name} must be an integer, got {value!r}") from exc
+
+    if parsed <= 0:
+        raise InvalidExtractorParams(f"{name} must be > 0, got {parsed}")
+
+    return parsed
+
+
+def validate_sequence_extractor_params(
+    params: Dict[str, Any],
+    *,
+    for_frame_output: bool = True,
+) -> None:
+    """
+    Fail fast on extractor configs that are known to break CV trials.
+
+    Raises InvalidExtractorParams so GridSearchCV / BayesSearchCV can assign
+    error_score and continue with the next candidate.
+    """
+
+    output = str(params.get("output_format", "frame")).lower()
+    if for_frame_output and output not in {"frame"}:
+        raise InvalidExtractorParams(
+            f"Sequence frame classifiers require output_format='frame', got {output!r}"
+        )
+
+    if params.get("window_size") is not None:
+        _positive_int(params.get("window_size"), name="window_size")
+
+    if params.get("maxlen") is not None:
+        _positive_int(params.get("maxlen"), name="maxlen")
+
+    resample_modalities = bool(params.get("resample_modalities", False))
+
+    rate_specs = [
+        ("imu_native_sampling_rate", "imu_target_sampling_rate"),
+        ("rot_native_sampling_rate", "rot_target_sampling_rate"),
+        ("tof_native_sampling_rate", "tof_target_sampling_rate"),
+        ("thm_native_sampling_rate", "thm_target_sampling_rate"),
+    ]
+
+    for native_key, target_key in rate_specs:
+        native = _positive_int(params.get(native_key, 20), name=native_key)
+        target = _positive_int(
+            params.get(target_key, native),
+            name=target_key,
+        )
+
+        if resample_modalities:
+            if resample is None:
+                raise InvalidExtractorParams(
+                    "resample_modalities=True requires scipy.signal.resample"
+                )
+
+            ratio = target / float(native)
+            if ratio > 25 or ratio < 0.04:
+                raise InvalidExtractorParams(
+                    f"{target_key}/{native_key} ratio {ratio:.3f} is outside safe bounds"
+                )
+
+    if not for_frame_output:
+        chunk_window = params.get("chunk_window_size")
+        chunk_stride = params.get("chunk_stride")
+        if chunk_window is not None and chunk_stride is not None:
+            win = _positive_int(chunk_window, name="chunk_window_size")
+            stride = _positive_int(chunk_stride, name="chunk_stride")
+            if stride > win:
+                raise InvalidExtractorParams(
+                    "chunk_stride must be <= chunk_window_size"
+                )
+
+
 # ---------------------------------------------------------------------------
 # Base
 # ---------------------------------------------------------------------------
@@ -936,6 +1021,14 @@ class SequenceExtractor(HoneycombBase):
         if not self.resample_modalities or resample is None:
             return df
 
+        try:
+            return self._maybe_resample_inner(df)
+        except InvalidExtractorParams:
+            raise
+        except Exception as exc:
+            raise InvalidExtractorParams(f"Multimodal resampling failed: {exc}") from exc
+
+    def _maybe_resample_inner(self, df: pd.DataFrame) -> pd.DataFrame:
         rows = []
 
         rate_map = {
@@ -981,11 +1074,21 @@ class SequenceExtractor(HoneycombBase):
                 if len(s) != max_len:
                     old_index = np.linspace(0.0, 1.0, len(s))
                     new_index = np.linspace(0.0, 1.0, max_len)
+                    s = s.copy()
                     s.index = pd.Index(old_index)
                     s = s.reindex(new_index)
                     s = s.interpolate(method="linear", limit_direction="both").ffill().bfill()
 
-                new_df[cols] = s.to_numpy()
+                if len(s) != max_len:
+                    raise InvalidExtractorParams(
+                        f"Resampling {prefix} columns failed to align to sequence length"
+                    )
+
+                for col in cols:
+                    if col in s.columns:
+                        new_df[col] = s[col].to_numpy()
+                    else:
+                        new_df[col] = 0.0
 
             if "dt" in g.columns:
                 new_df["dt"] = float(np.nanmean(g["dt"].fillna(1.0 / 20.0)))
@@ -1091,6 +1194,11 @@ class SequenceExtractor(HoneycombBase):
     # ----------------------------- fit -----------------------------
 
     def fit(self, X: pd.DataFrame, y: Optional[pd.DataFrame] = None):
+        validate_sequence_extractor_params(
+            self.get_params(),
+            for_frame_output=str(self.output_format).lower() == "frame",
+        )
+
         self.cleaner = SignalCleaner(
             native_sampling_rate=self.imu_native_sampling_rate,
             compute_dt=self.compute_dt,
@@ -1417,15 +1525,9 @@ class RandomForestSequenceClassifier(BaseEstimator, ClassifierMixin):
 
         raise ValueError("Could not align y to sequence_ids.")
 
-    def fit(self, X: pd.DataFrame, y: Any = None, **fit_params):
-        if y is None:
-            raise ValueError("RandomForestSequenceClassifier requires y.")
-
-        self.extractor_ = (
-            clone(self.extractor)
-            if self.extractor is not None
-            else self._default_extractor()
-        )
+    def _validate_rf_extractor(self) -> None:
+        if self.extractor_ is None:
+            return
 
         if hasattr(self.extractor_, "output_format"):
             try:
@@ -1433,6 +1535,12 @@ class RandomForestSequenceClassifier(BaseEstimator, ClassifierMixin):
             except Exception:
                 pass
 
+        validate_sequence_extractor_params(
+            self.extractor_.get_params(),
+            for_frame_output=True,
+        )
+
+    def _fit_inner(self, X: pd.DataFrame, y: Any) -> pd.DataFrame:
         self.extractor_.fit(X)
 
         if hasattr(self.extractor_, "transform_frame"):
@@ -1441,7 +1549,19 @@ class RandomForestSequenceClassifier(BaseEstimator, ClassifierMixin):
             frame = self.extractor_.transform(X)
 
         if not isinstance(frame, pd.DataFrame):
-            raise ValueError("Extractor did not return a pandas DataFrame for frame output.")
+            raise InvalidExtractorParams(
+                "Extractor did not return a pandas DataFrame for frame output."
+            )
+
+        if frame.empty:
+            raise InvalidExtractorParams(
+                "Feature extraction produced zero sequences."
+            )
+
+        if not np.isfinite(frame.to_numpy(dtype=float, copy=False)).all():
+            raise InvalidExtractorParams(
+                "Feature extraction produced non-finite values."
+            )
 
         y_aligned = self._align_y(frame.index, y)
 
@@ -1458,6 +1578,28 @@ class RandomForestSequenceClassifier(BaseEstimator, ClassifierMixin):
         )
 
         self.estimator_.fit(frame, y_enc)
+        return frame
+
+    def fit(self, X: pd.DataFrame, y: Any = None, **fit_params):
+        if y is None:
+            raise ValueError("RandomForestSequenceClassifier requires y.")
+
+        self.extractor_ = (
+            clone(self.extractor)
+            if self.extractor is not None
+            else self._default_extractor()
+        )
+
+        self._validate_rf_extractor()
+
+        try:
+            self._fit_inner(X, y)
+        except InvalidExtractorParams:
+            raise
+        except Exception as exc:
+            raise InvalidExtractorParams(
+                f"RandomForestSequenceClassifier fit failed: {exc}"
+            ) from exc
 
         self.history_ = {
             "loss": [0.0],
@@ -1469,13 +1611,25 @@ class RandomForestSequenceClassifier(BaseEstimator, ClassifierMixin):
     def _transform_frame(self, X: pd.DataFrame) -> pd.DataFrame:
         check_is_fitted(self, ["extractor_"])
 
-        if hasattr(self.extractor_, "transform_frame"):
-            frame = self.extractor_.transform_frame(X)
-        else:
-            frame = self.extractor_.transform(X)
+        try:
+            if hasattr(self.extractor_, "transform_frame"):
+                frame = self.extractor_.transform_frame(X)
+            else:
+                frame = self.extractor_.transform(X)
+        except Exception as exc:
+            raise InvalidExtractorParams(
+                f"RandomForestSequenceClassifier transform failed: {exc}"
+            ) from exc
 
         if not isinstance(frame, pd.DataFrame):
-            raise ValueError("Extractor did not return a pandas DataFrame for frame output.")
+            raise InvalidExtractorParams(
+                "Extractor did not return a pandas DataFrame for frame output."
+            )
+
+        if frame.empty:
+            raise InvalidExtractorParams(
+                "Feature extraction produced zero sequences."
+            )
 
         return frame
 
