@@ -2,3 +2,34 @@ data/
 __pycache__/
 .idea/inspectionProfiles/profiles_settings.xml
 
+context/
+results/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Build & generated
+kaggle_build/
+siamese_template_run.ipynb
+siamese_output.ipynb
+
+# Results
+results/
+*.csv
+*.txt
+*.log
+*.html
+
+# Data (if you don't want to commit large files)
+data/
+!data/.gitkeep
+
+# IDE
+.idea/
+.vscode/
