@@ -37,8 +37,16 @@ from sklearn.metrics import classification_report, f1_score, make_scorer
 warnings.filterwarnings("ignore")
 
 try:
-    from scipy.signal import resample
+    from scipy.signal import argrelextrema, resample, stft
 except Exception:
+    resample = None
+    stft = None
+    argrelextrema = None
+
+try:
+    from pywt import cwt
+except Exception:
+    cwt = None
     resample = None
 
 try:
@@ -903,6 +911,14 @@ class SequenceExtractor(HoneycombBase):
         frame_stats: str = "mean,std,min,max,last",
         add_global_context: bool = False,
         resample_modalities: bool = False,
+        stft_nperseg: int = 32,
+        stft_noverlap: Optional[int] = None,
+        stft_window_type: str = "hann",
+        stft_use_log_scale: bool = True,
+        cwt_wavelet: str = "morl",
+        cwt_max_scale: int = 128,
+        cwt_n_scales: int = 32,
+        cwt_use_log_scale: bool = True,
     ):
         self.acc_modes = acc_modes
         self.rotation_modes = rotation_modes
@@ -938,6 +954,15 @@ class SequenceExtractor(HoneycombBase):
         self.frame_stats = frame_stats
         self.add_global_context = add_global_context
         self.resample_modalities = resample_modalities
+
+        self.stft_nperseg = stft_nperseg
+        self.stft_noverlap = stft_noverlap
+        self.stft_window_type = stft_window_type
+        self.stft_use_log_scale = stft_use_log_scale
+        self.cwt_wavelet = cwt_wavelet
+        self.cwt_max_scale = cwt_max_scale
+        self.cwt_n_scales = cwt_n_scales
+        self.cwt_use_log_scale = cwt_use_log_scale
 
         self.cleaner = SignalCleaner(
             native_sampling_rate=self.imu_native_sampling_rate,
@@ -979,6 +1004,26 @@ class SequenceExtractor(HoneycombBase):
             thm_modes=self.thm_modes,
             sequence_col=self.sequence_col,
         )
+
+
+        self.stft_extractor = STFTExtractor(
+            nperseg=self.stft_nperseg,
+            noverlap=self.stft_noverlap,
+            window_type=self.stft_window_type,
+            use_log_scale=self.stft_use_log_scale,
+            sampling_rate=self.imu_native_sampling_rate,
+            sequence_col=self.sequence_col,
+        )
+        
+        self.cwt_extractor = CWTExtractor(
+            wavelet=self.cwt_wavelet,
+            max_scale=self.cwt_max_scale,
+            n_scales=self.cwt_n_scales,
+            use_log_scale=self.cwt_use_log_scale,
+            sampling_rate=self.imu_native_sampling_rate,
+            sequence_col=self.sequence_col,
+        )
+        
 
     # ----------------------------- helpers -----------------------------
 
@@ -1106,7 +1151,7 @@ class SequenceExtractor(HoneycombBase):
     def _combine_feature_outputs(self, processed: pd.DataFrame, add_context: bool = False) -> pd.DataFrame:
         outs = []
 
-        for est in (self.imu, self.rotation, self.tof, self.thermo):
+        for est in (self.imu, self.rotation, self.tof, self.thermo, self.stft_extractor, self.cwt_extractor):
             out = est.transform(processed)
             if out is not None and not out.empty:
                 outs.append(out)
@@ -1248,6 +1293,8 @@ class SequenceExtractor(HoneycombBase):
         self.rotation.fit(processed)
         self.tof.fit(processed)
         self.thermo.fit(processed)
+        self.stft_extractor.fit(processed)
+        self.cwt_extractor.fit(processed)
 
         combined = self._combine_feature_outputs(processed, add_context=False)
 
@@ -1994,3 +2041,394 @@ def prepare_bayesian_space(param_space: Dict[str, Any]) -> Dict[str, Any]:
             out[key] = space
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# STFT Time-Frequency Features
+# ---------------------------------------------------------------------------
+class STFTExtractor(HoneycombBase):
+    """
+    Short-Time Fourier Transform feature extractor.
+    Extracts time-frequency domain features using STFT.
+    Produces sequence-level statistics from spectrogram.
+    """
+    def __init__(
+        self,
+        acc_modes: str = "raw",
+        nperseg: int = 32,
+        noverlap: Optional[int] = None,
+        window_type: str = "hann",
+        scaling: str = "density",  # 'density' or 'spectrum'
+        detrend: str = "constant",
+        use_log_scale: bool = True,
+        frequency_bands: Optional[Dict[str, Tuple[float, float]]] = None,
+        sampling_rate: int = 20,
+        sequence_col: str = "sequence_id",
+    ):
+        self.acc_modes = acc_modes
+        self.nperseg = nperseg
+        self.noverlap = noverlap
+        self.window_type = window_type
+        self.scaling = scaling
+        self.detrend = detrend
+        self.use_log_scale = use_log_scale
+        self.frequency_bands = frequency_bands or {
+            "ultra_low": (0.0, 1.0),
+            "low": (1.0, 3.0),
+            "mid": (3.0, 6.0),
+            "high": (6.0, 10.0),
+        }
+        self.sampling_rate = sampling_rate
+        self.sequence_col = sequence_col
+
+    def fit(self, X: pd.DataFrame, y=None):
+        self.acc_cols_ = [
+            c for c in X.columns 
+            if c.startswith("acc_") and not c.endswith(("_vel", "_disp", "_jerk", "_mag", "_dr_vel", "_dr_pos"))
+        ]
+        if self.noverlap is None:
+            self.noverlap = self.nperseg // 2
+        return self
+
+    def _compute_stft_features(self, signal: np.ndarray) -> Dict[str, np.ndarray]:
+        """Compute STFT and extract features from spectrogram."""
+        if stft is None:
+            raise ImportError("STFTExtractor requires SciPy. Install with: pip install scipy")
+        
+        signal = np.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        if len(signal) < self.nperseg:
+            # Pad signal if too short
+            signal = np.pad(signal, (0, self.nperseg - len(signal)), mode='constant')
+        
+        # Compute STFT
+        f, t, Zxx = stft(
+            signal,
+            fs=self.sampling_rate,
+            window=self.window_type,
+            nperseg=self.nperseg,
+            noverlap=self.noverlap,
+            nfft=None,
+            detrend=self.detrend,
+            return_onesided=True,
+            scaling=self.scaling,
+            axis=-1,
+            boundary=None,
+            padded=False,
+        )
+        
+        # Power spectrogram (magnitude squared)
+        if self.scaling == 'density':
+            Pxx = np.abs(Zxx) ** 2  # Power spectral density
+        else:
+            Pxx = np.abs(Zxx)  # Amplitude spectrum
+        
+        if self.use_log_scale:
+            Pxx = np.log1p(Pxx)  # log(1 + Pxx) to avoid log(0)
+        
+        features = {}
+        
+        # Global spectrogram statistics
+        features['stft_mean_power'] = np.mean(Pxx)
+        features['stft_std_power'] = np.std(Pxx)
+        features['stft_max_power'] = np.max(Pxx)
+        features['stft_min_power'] = np.min(Pxx)
+        features['stft_median_power'] = np.median(Pxx)
+        features['stft_total_power'] = np.sum(Pxx)
+        
+        # Temporal evolution (statistics across time frames)
+        time_mean = np.mean(Pxx, axis=0)  # Mean power at each time frame
+        features['stft_temporal_mean'] = np.mean(time_mean)
+        features['stft_temporal_std'] = np.std(time_mean)
+        features['stft_temporal_slope'] = np.polyfit(np.arange(len(time_mean)), time_mean, 1)[0] if len(time_mean) > 1 else 0.0
+        
+        # Spectral evolution (statistics across frequencies)
+        freq_mean = np.mean(Pxx, axis=1)  # Mean power at each frequency
+        features['stft_spectral_centroid'] = np.sum(f * freq_mean) / (np.sum(freq_mean) + 1e-10)
+        features['stft_spectral_spread'] = np.sqrt(
+            np.sum(((f - features['stft_spectral_centroid']) ** 2) * freq_mean) / (np.sum(freq_mean) + 1e-10)
+        )
+        features['stft_spectral_entropy'] = self._compute_entropy(freq_mean)
+        
+        # Frequency band energy
+        for band_name, (f_low, f_high) in self.frequency_bands.items():
+            band_mask = (f >= f_low) & (f < f_high)
+            if np.any(band_mask):
+                band_power = Pxx[band_mask, :]
+                features[f'stft_band_{band_name}_mean'] = np.mean(band_power)
+                features[f'stft_band_{band_name}_total'] = np.sum(band_power)
+                features[f'stft_band_{band_name}_ratio'] = (
+                    np.sum(band_power) / (np.sum(Pxx) + 1e-10)
+                )
+        
+        # Peak detection in spectrogram
+        max_idx = np.unravel_index(np.argmax(Pxx), Pxx.shape)
+        features['stft_peak_freq'] = f[max_idx[0]]
+        features['stft_peak_time'] = t[max_idx[1]] if len(t) > max_idx[1] else 0.0
+        features['stft_peak_power'] = Pxx[max_idx]
+        
+        # Spectral flux (change in spectrum over time)
+        if Pxx.shape[1] > 1:
+            spectral_diff = np.diff(Pxx, axis=1)
+            features['stft_spectral_flux_mean'] = np.mean(np.abs(spectral_diff))
+            features['stft_spectral_flux_std'] = np.std(np.abs(spectral_diff))
+            features['stft_spectral_flux_max'] = np.max(np.abs(spectral_diff))
+        else:
+            features['stft_spectral_flux_mean'] = 0.0
+            features['stft_spectral_flux_std'] = 0.0
+            features['stft_spectral_flux_max'] = 0.0
+        
+        return features
+
+    def _compute_entropy(self, x: np.ndarray) -> float:
+        """Compute Shannon entropy of normalized signal."""
+        x = np.abs(x)
+        total = np.sum(x)
+        if total == 0:
+            return 0.0
+        p = x / total
+        p = p[p > 0]  # Remove zeros to avoid log(0)
+        return -np.sum(p * np.log2(p + 1e-10))
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        check_is_fitted(self, ["acc_cols_"])
+        df = X.copy()
+        parts = []
+        
+        for col in self.acc_cols_:
+            feat_dict = {}
+            
+            # Process per sequence
+            for seq_id, group in df.groupby(self.sequence_col, sort=False):
+                signal = group[col].to_numpy(dtype=float)
+                seq_features = self._compute_stft_features(signal)
+                
+                for feat_name, value in seq_features.items():
+                    if feat_name not in feat_dict:
+                        feat_dict[feat_name] = []
+                    feat_dict[feat_name].append(value)
+            
+            # Create sequence-level features
+            seq_ids = df[self.sequence_col].values
+            unique_seqs = pd.unique(seq_ids)
+            
+            for feat_name, values in feat_dict.items():
+                seq_to_val = dict(zip(unique_seqs, values))
+                df[f"{col}_{feat_name}"] = [seq_to_val[sid] for sid in seq_ids]
+            
+            # Add column-specific features to parts
+            feat_cols = [f"{col}_{k}" for k in feat_dict.keys()]
+            parts.append(df[feat_cols])
+        
+        if not parts:
+            return pd.DataFrame(index=df.index)
+        
+        return pd.concat(parts, axis=1)
+    
+
+
+# ---------------------------------------------------------------------------
+# CWT Wavelet Features
+# ---------------------------------------------------------------------------
+class CWTExtractor(HoneycombBase):
+    """
+    Continuous Wavelet Transform feature extractor.
+    Extracts time-scale domain features using CWT.
+    Produces sequence-level statistics from scalogram.
+    """
+    def __init__(
+        self,
+        acc_modes: str = "raw",
+        wavelet: str = "morl",  # 'morl', 'mexh', 'gaus1', etc.
+        widths: Optional[np.ndarray] = None,
+        max_scale: int = 128,
+        n_scales: int = 32,
+        use_log_scale: bool = True,
+        sampling_rate: int = 20,
+        sequence_col: str = "sequence_id",
+    ):
+        self.acc_modes = acc_modes
+        self.wavelet = wavelet
+        self.widths = widths
+        self.max_scale = max_scale
+        self.n_scales = n_scales
+        self.use_log_scale = use_log_scale
+        self.sampling_rate = sampling_rate
+        self.sequence_col = sequence_col
+
+    def fit(self, X: pd.DataFrame, y=None):
+        self.acc_cols_ = [
+            c for c in X.columns 
+            if c.startswith("acc_") and not c.endswith(("_vel", "_disp", "_jerk", "_mag", "_dr_vel", "_dr_pos"))
+        ]
+        
+        # Generate scales if not provided
+        if self.widths is None:
+            # Logarithmically spaced scales
+            self.widths_ = np.logspace(
+                np.log10(1), 
+                np.log10(self.max_scale), 
+                self.n_scales
+            )
+        else:
+            self.widths_ = np.asarray(self.widths)
+        
+        return self
+
+    def _compute_cwt_features(self, signal: np.ndarray) -> Dict[str, np.ndarray]:
+        """Compute CWT and extract features from scalogram."""
+        if cwt is None:
+            raise ImportError("CWTExtractor requires PyWavelets. Install with: pip install PyWavelets")
+        
+        signal = np.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        if len(signal) < 4:
+            # Return zeros if signal too short
+            return self._empty_features()
+        
+        # Compute CWT
+        try:
+            coefficients, frequencies = cwt(
+                signal, 
+                self.wavelet, 
+                self.widths_
+            )
+        except Exception:
+            return self._empty_features()
+        
+        # Scalogram (magnitude of coefficients)
+        scalogram = np.abs(coefficients)
+        
+        if self.use_log_scale:
+            scalogram = np.log1p(scalogram)
+        
+        features = {}
+        
+        # Global scalogram statistics
+        features['cwt_mean_power'] = np.mean(scalogram)
+        features['cwt_std_power'] = np.std(scalogram)
+        features['cwt_max_power'] = np.max(scalogram)
+        features['cwt_min_power'] = np.min(scalogram)
+        features['cwt_median_power'] = np.median(scalogram)
+        features['cwt_total_power'] = np.sum(scalogram)
+        
+        # Scale-wise statistics
+        scale_mean = np.mean(scalogram, axis=1)  # Mean power at each scale
+        scale_std = np.std(scalogram, axis=1)
+        
+        features['cwt_scale_mean_max'] = np.max(scale_mean)
+        features['cwt_scale_mean_min'] = np.min(scale_mean)
+        features['cwt_scale_mean_std'] = np.std(scale_mean)
+        
+        # Dominant scale (scale with maximum energy)
+        dominant_scale_idx = np.argmax(scale_mean)
+        features['cwt_dominant_scale'] = self.widths_[dominant_scale_idx]
+        features['cwt_dominant_scale_power'] = scale_mean[dominant_scale_idx]
+        
+        # Scale entropy
+        features['cwt_scale_entropy'] = self._compute_entropy(scale_mean)
+        
+        # Time-wise statistics (across samples)
+        time_mean = np.mean(scalogram, axis=0)  # Mean power at each time point
+        features['cwt_temporal_mean'] = np.mean(time_mean)
+        features['cwt_temporal_std'] = np.std(time_mean)
+        features['cwt_temporal_entropy'] = self._compute_entropy(time_mean)
+        
+        # Temporal evolution
+        if len(time_mean) > 1:
+            features['cwt_temporal_slope'] = np.polyfit(np.arange(len(time_mean)), time_mean, 1)[0]
+        else:
+            features['cwt_temporal_slope'] = 0.0
+        
+        # Energy distribution across scales
+        total_energy = np.sum(scalogram)
+        n_thirds = len(self.widths_) // 3
+        
+        if n_thirds > 0:
+            low_scale_energy = np.sum(scalogram[:n_thirds, :]) / (total_energy + 1e-10)
+            mid_scale_energy = np.sum(scalogram[n_thirds:2*n_thirds, :]) / (total_energy + 1e-10)
+            high_scale_energy = np.sum(scalogram[2*n_thirds:, :]) / (total_energy + 1e-10)
+            
+            features['cwt_low_scale_ratio'] = low_scale_energy  # High frequency
+            features['cwt_mid_scale_ratio'] = mid_scale_energy
+            features['cwt_high_scale_ratio'] = high_scale_energy  # Low frequency
+        
+        # Ridge detection (local maxima across scales at each time)
+        ridge_energy = []
+        for t_idx in range(scalogram.shape[1]):
+            col = scalogram[:, t_idx]
+            # Find local maxima
+            if len(col) > 2:
+                maxima_idx = argrelextrema(col, np.greater)[0] if argrelextrema is not None else []
+                if len(maxima_idx) > 0:
+                    ridge_energy.extend(col[maxima_idx])
+        
+        if ridge_energy:
+            features['cwt_ridge_mean'] = np.mean(ridge_energy)
+            features['cwt_ridge_std'] = np.std(ridge_energy)
+            features['cwt_ridge_count'] = len(ridge_energy) / max(len(time_mean), 1)
+        else:
+            features['cwt_ridge_mean'] = 0.0
+            features['cwt_ridge_std'] = 0.0
+            features['cwt_ridge_count'] = 0.0
+        
+        # Wavelet coherence-like measure (variance across scales)
+        features['cwt_variance_ratio'] = np.var(scale_mean) / (np.mean(scale_mean) + 1e-10)
+        
+        return features
+
+    def _empty_features(self) -> Dict[str, float]:
+        """Return empty feature dict with zeros."""
+        return {
+            'cwt_mean_power': 0.0, 'cwt_std_power': 0.0, 'cwt_max_power': 0.0,
+            'cwt_min_power': 0.0, 'cwt_median_power': 0.0, 'cwt_total_power': 0.0,
+            'cwt_scale_mean_max': 0.0, 'cwt_scale_mean_min': 0.0, 'cwt_scale_mean_std': 0.0,
+            'cwt_dominant_scale': 0.0, 'cwt_dominant_scale_power': 0.0,
+            'cwt_scale_entropy': 0.0, 'cwt_temporal_mean': 0.0, 'cwt_temporal_std': 0.0,
+            'cwt_temporal_entropy': 0.0, 'cwt_temporal_slope': 0.0,
+            'cwt_low_scale_ratio': 0.0, 'cwt_mid_scale_ratio': 0.0, 'cwt_high_scale_ratio': 0.0,
+            'cwt_ridge_mean': 0.0, 'cwt_ridge_std': 0.0, 'cwt_ridge_count': 0.0,
+            'cwt_variance_ratio': 0.0,
+        }
+
+    def _compute_entropy(self, x: np.ndarray) -> float:
+        """Compute Shannon entropy of normalized signal."""
+        x = np.abs(x)
+        total = np.sum(x)
+        if total == 0:
+            return 0.0
+        p = x / total
+        p = p[p > 0]
+        return -np.sum(p * np.log2(p + 1e-10))
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        check_is_fitted(self, ["acc_cols_", "widths_"])
+        df = X.copy()
+        parts = []
+        
+        for col in self.acc_cols_:
+            feat_dict = {}
+            
+            for seq_id, group in df.groupby(self.sequence_col, sort=False):
+                signal = group[col].to_numpy(dtype=float)
+                seq_features = self._compute_cwt_features(signal)
+                
+                for feat_name, value in seq_features.items():
+                    if feat_name not in feat_dict:
+                        feat_dict[feat_name] = []
+                    feat_dict[feat_name].append(value)
+            
+            seq_ids = df[self.sequence_col].values
+            unique_seqs = pd.unique(seq_ids)
+            
+            for feat_name, values in feat_dict.items():
+                seq_to_val = dict(zip(unique_seqs, values))
+                df[f"{col}_{feat_name}"] = [seq_to_val[sid] for sid in seq_ids]
+            
+            feat_cols = [f"{col}_{k}" for k in feat_dict.keys()]
+            parts.append(df[feat_cols])
+        
+        if not parts:
+            return pd.DataFrame(index=df.index)
+        
+        return pd.concat(parts, axis=1)
