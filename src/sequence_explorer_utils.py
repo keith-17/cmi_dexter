@@ -1,21 +1,27 @@
 """
 sequence_explorer_utils.py
 
-Interactive explorer for the CMI sensor data. Four panels, all callbacks are
-bound methods so notebooks stay function-free:
+Interactive explorer for the CMI sensor data, built directly on the
+SignalCleaner / MotionFilter / IMUExtractor / RotationExtractor /
+SequenceExtractor pipeline in base_utils_qwen.py. All widget callbacks are
+bound methods so notebooks stay function-free.
 
-  1. Sequence   - filter by subject/gesture/orientation/type, or paste a
-                  sequence_id, plot raw channels, build a sequence catalog.
-  2. Features   - before/after for any SequenceExtractor parameter set.
-  3. Spectrum   - Hann rFFT / Welch PSD / spectrogram of raw vs processed.
-  4. Clusters   - frame-level features -> scale -> reduce -> cluster.
-
-Depends on SequenceExtractor from base_utils_qwen.
+Tabs:
+  1. Catalogue  - filter by subject/gesture/orientation/... and build up a
+                  working set of sequence_ids one selection at a time
+                  (single add, or add-all-filtered). Small-multiples view
+                  of whatever is currently catalogued.
+  2. Features   - before/after on one sequence, run through the real
+                  SequenceExtractor with every constructor parameter exposed.
+  3. Spectrum   - FFT / PSD / spectrogram of the raw -> velocity ->
+                  displacement -> jerk chain, computed via
+                  SignalCleaner -> MotionFilter -> IMUExtractor exactly as
+                  SequenceExtractor.fit does it internally.
+  4. Clusters   - frame-level features -> scale -> reduce -> cluster, over
+                  either the catalogue built in tab 1 or the current filter
+                  selection (subject / orientation / ...).
 """
 from __future__ import annotations
-
-import inspect
-from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -30,7 +36,12 @@ from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import silhouette_score, adjusted_rand_score
 
-from base_utils_qwen import SequenceExtractor
+from base_utils_qwen import (
+    SequenceExtractor,
+    SignalCleaner,
+    MotionFilter,
+    IMUExtractor,
+)
 
 try:
     from umap import UMAP
@@ -44,29 +55,23 @@ try:
 except Exception:
     _HDBSCAN = False
 
-ACC_MODES = [
-    "raw",
-    "raw|velocity",
-    "raw|velocity|jerk",
-    "raw|velocity|displacement|jerk",
-    "smoothed|velocity|jerk",
-]
-ROT_MODES = [
-    "quaternion",
-    "quaternion|euler",
-    "quaternion|angular_velocity",
-    "quaternion|euler|angular_velocity",
-    "quaternion|delta_euler|angular_velocity",
-]
-TOF_MODES = ["pooled_stats", "sensor_stats", "pooled_stats|sensor_stats"]
-THM_MODES = ["centered", "diff", "centered_diff"]
-INTERP_MODES = ["linear", "ffill"]
-FRAME_STATS = ["mean", "mean,std", "mean,std,min,max", "mean,std,min,max,last"]
+ACC_MODE_OPTS = ["raw", "smoothed", "velocity", "displacement", "jerk"]
+ROT_MODE_OPTS = ["quaternion", "euler", "delta_euler", "angular_velocity", "rot6d"]
+TOF_MODE_OPTS = ["raw", "sensor_stats", "pooled_stats", "pooled"]
+THM_MODE_OPTS = ["raw", "centered", "diff", "centered_diff"]
+FRAME_STAT_OPTS = ["mean", "std", "min", "max", "first", "last", "median", "rms", "abs_mean"]
+IMU_DOMAIN_CHAIN = ["raw", "velocity", "displacement", "jerk"]
 
-_FEATURE_SUFFIXES = (
-    "_centered_diff", "_centered", "_smooth", "_angvel", "_delta",
-    "_quat", "_raw", "_vel", "_disp", "_jerk", "_dr_vel", "_dr_pos",
-)
+
+def _center_zero(ax, *arrays, pad=1.1):
+    """Symmetric y-limits about 0 and a dashed reference line, so drift and
+    offset are visible at a glance."""
+    vals = [np.nanmax(np.abs(a)) for a in arrays if np.asarray(a).size]
+    m = max(vals) if vals else 1.0
+    if not np.isfinite(m) or m <= 0:
+        m = 1.0
+    ax.set_ylim(-m * pad, m * pad)
+    ax.axhline(0.0, color="black", lw=0.7, alpha=0.5, ls="--")
 
 
 class SequenceExplorer:
@@ -80,32 +85,23 @@ class SequenceExplorer:
         self.label_col = label_col
         self.fs = float(fs)
         self.random_state = random_state
-        self.catalog_: List[str] = []
 
         self.df = df.copy()
         if self.counter_col in self.df.columns:
             self.df = self.df.sort_values([sequence_col, counter_col], kind="stable")
 
-        self.filter_cols_ = [
-            c for c in ["subject", "sequence_type", "gesture",
-                        "orientation", "behavior", "phase"]
-            if c in self.df.columns
-        ]
-        self.meta_ = (
-            self.df[[sequence_col] + self.filter_cols_]
-            .groupby(sequence_col, sort=True)
-            .first()
-        )
+        self.filter_cols_ = [c for c in ["subject", "sequence_type", "gesture",
+                                         "orientation", "behavior", "phase"]
+                             if c in self.df.columns]
+        self.meta_ = (self.df[[sequence_col] + self.filter_cols_]
+                      .groupby(sequence_col, sort=True).first())
         self.meta_["length"] = self.df.groupby(sequence_col, sort=True).size()
-        self.raw_channels_ = [
-            c for c in self.df.columns
-            if c.startswith(("acc_", "rot_", "thm_"))
-            and not c.startswith("tof_")
-        ]
-        self.extractor_param_names_ = list(
-            inspect.signature(SequenceExtractor.__init__).parameters.keys()
-        )
-        self.extractor_param_names_.remove("self")
+        self.raw_channels_ = [c for c in self.df.columns
+                              if c.startswith(("acc_", "rot_", "thm_"))
+                              and not c.startswith("tof_")]
+        self.acc_axes_ = [c for c in ["acc_x", "acc_y", "acc_z"] if c in self.df.columns]
+
+        self.catalogue_: list = []
 
     # ------------------------------------------------------------------
     # data access
@@ -120,615 +116,480 @@ class SequenceExplorer:
     def sequence(self, seq_id):
         return self.df[self.df[self.sequence_col] == seq_id]
 
-    def extract(self, seq_df, **params):
-        """Row-level engineered features for one or many sequences."""
-        params.setdefault("output_format", "chunks")
-        ex = SequenceExtractor(**params)
-        ex.fit(seq_df)
-        return ex._preprocess_features(seq_df)
-
-    def extractor_defaults(self) -> Dict[str, Any]:
-        """Full default parameter dict from SequenceExtractor."""
-        return SequenceExtractor().get_params()
-
-    def _params(self, acc_modes, rotation_modes, tof_modes, thm_modes,
-                motion_filter_mode, use_dead_reckoning, dead_reckoning_detrend,
-                kalman_process_noise, kalman_measurement_noise,
-                smooth_alpha, window_size, clip_value, interp_mode, compute_dt,
-                imu_native_sampling_rate, imu_target_sampling_rate,
-                rot_native_sampling_rate, rot_target_sampling_rate,
-                tof_native_sampling_rate, tof_target_sampling_rate,
-                thm_native_sampling_rate, thm_target_sampling_rate,
-                resample_modalities, maxlen, add_global_context, frame_stats,
-                **extra):
-        p = dict(
-            acc_modes=acc_modes,
-            rotation_modes=rotation_modes,
-            tof_modes=tof_modes,
-            thm_modes=thm_modes,
-            motion_filter_mode=None if motion_filter_mode == "none" else motion_filter_mode,
-            use_dead_reckoning=bool(use_dead_reckoning),
-            dead_reckoning_detrend=bool(dead_reckoning_detrend),
-            kalman_process_noise=float(kalman_process_noise),
-            kalman_measurement_noise=float(kalman_measurement_noise),
-            smooth_alpha=None if smooth_alpha <= 0 else float(smooth_alpha),
-            window_size=int(window_size),
-            clip_value=None if clip_value <= 0 else float(clip_value),
-            interp_mode=str(interp_mode),
-            compute_dt=bool(compute_dt),
-            imu_native_sampling_rate=int(imu_native_sampling_rate),
-            imu_target_sampling_rate=int(imu_target_sampling_rate),
-            rot_native_sampling_rate=int(rot_native_sampling_rate),
-            rot_target_sampling_rate=int(rot_target_sampling_rate),
-            tof_native_sampling_rate=int(tof_native_sampling_rate),
-            tof_target_sampling_rate=int(tof_target_sampling_rate),
-            thm_native_sampling_rate=int(thm_native_sampling_rate),
-            thm_target_sampling_rate=int(thm_target_sampling_rate),
-            resample_modalities=bool(resample_modalities),
-            maxlen=int(maxlen),
-            add_global_context=bool(add_global_context),
-            frame_stats=str(frame_stats),
-        )
-        p.update(extra)
-        return p
-
-    def _params_from_controls(self, c, **extra):
-        keys = (
-            "acc_modes", "rotation_modes", "tof_modes", "thm_modes",
-            "motion_filter_mode", "use_dead_reckoning", "dead_reckoning_detrend",
-            "kalman_process_noise", "kalman_measurement_noise",
-            "smooth_alpha", "window_size", "clip_value", "interp_mode", "compute_dt",
-            "imu_native_sampling_rate", "imu_target_sampling_rate",
-            "rot_native_sampling_rate", "rot_target_sampling_rate",
-            "tof_native_sampling_rate", "tof_target_sampling_rate",
-            "thm_native_sampling_rate", "thm_target_sampling_rate",
-            "resample_modalities", "maxlen", "add_global_context", "frame_stats",
-        )
-        return self._params(**{k: c[k].value for k in keys}, **extra)
-
-    @staticmethod
-    def _match_raw_channel(feature: str, columns: Sequence[str]) -> Optional[str]:
-        """Match engineered feature to raw channel by prefix (acc_x_vel -> acc_x)."""
-        cols = set(columns)
-        name = str(feature)
-        for suf in _FEATURE_SUFFIXES:
-            if name.endswith(suf):
-                name = name[: -len(suf)]
-                break
-        if name in cols:
-            return name
-        parts = feature.split("_")
-        for i in range(len(parts), 0, -1):
-            candidate = "_".join(parts[:i])
-            if candidate in cols:
-                return candidate
-        return None
-
-    @staticmethod
-    def _center_axis(ax, *arrays):
-        vals = np.concatenate([np.asarray(a, dtype=float).ravel() for a in arrays if len(a)])
-        if len(vals) == 0:
-            return
-        ymax = float(np.nanmax(np.abs(vals)))
-        if ymax <= 0:
-            ymax = 1.0
-        ax.set_ylim(-ymax * 1.05, ymax * 1.05)
-        ax.axhline(0.0, color="gray", lw=0.5, alpha=0.5)
-
-    # ------------------------------------------------------------------
-    # controls
-    # ------------------------------------------------------------------
-    def _all_feature_names(self):
-        probe = self.sequence(self.meta_.index[0])
-        p = self._params(
-            ACC_MODES[-1], ROT_MODES[-1], TOF_MODES[-1], THM_MODES[-1],
-            "none", False, False, 1e-3, 1e-2, 0.0, 7, 0.0, "linear", True,
-            int(self.fs), int(self.fs), int(self.fs), int(self.fs),
-            5, 5, 5, 5, False, 160, False, "mean,std,min,max,last",
-        )
-        cols = [c for c in self.extract(probe, **p).columns if c != self.sequence_col]
-        return cols + [c for c in self.raw_channels_ if c not in cols]
-
-    def _refresh_feature_options(self):
-        try:
-            p = self._params_from_controls(self.c)
-            probe = self.sequence(self.meta_.index[0])
-            cols = [
-                c for c in self.extract(probe, **p).columns
-                if c != self.sequence_col
-            ]
-            options = cols + [c for c in self.raw_channels_ if c not in cols]
-            if options:
-                self.c["feature"].options = options
-                if self.c["feature"].value not in options:
-                    self.c["feature"].value = options[0]
-        except Exception:
-            pass
-
-    def _refresh_catalog_ui(self):
-        self.catalog_view_.options = list(self.catalog_)
-        self.catalog_count_.value = (
-            f"<b>Catalog: {len(self.catalog_)} sequence(s)</b>"
-        )
-
-    def _add_to_catalog(self, _btn=None):
-        sid = self._resolve(self.seq_pick_.value, self.seq_text_.value)
-        if sid not in self.catalog_:
-            self.catalog_.append(sid)
-        self._refresh_catalog_ui()
-
-    def _remove_from_catalog(self, _btn=None):
-        selected = list(self.catalog_view_.value)
-        self.catalog_ = [s for s in self.catalog_ if s not in selected]
-        self._refresh_catalog_ui()
-
-    def _clear_catalog(self, _btn=None):
-        self.catalog_ = []
-        self._refresh_catalog_ui()
-
-    def make_controls(self):
-        import ipywidgets as w
-
-        self.feature_options_ = self._all_feature_names()
-        self.filters_ = {
-            c: w.SelectMultiple(
-                options=["(all)"] + sorted(self.meta_[c].astype(str).unique()),
-                value=("(all)",),
-                description=c[:11] + ":",
-                rows=6,
-                layout=w.Layout(width="260px"),
-            )
-            for c in self.filter_cols_
-        }
-        seqs = self.candidates({})
-        self.seq_pick_ = w.Dropdown(
-            options=seqs, value=seqs[0], description="Sequence:",
-            layout=w.Layout(width="330px"),
-        )
-        self.seq_text_ = w.Text(
-            value="", description="or ID:", placeholder="SEQ_000007",
-            layout=w.Layout(width="330px"),
-        )
-        for f in self.filters_.values():
-            f.observe(self._on_filter_change, names="value")
-
-        defaults = self.extractor_defaults()
-        fs_int = int(self.fs)
-
-        self.catalog_view_ = w.SelectMultiple(
-            options=[], rows=4, description="Catalog:",
-            layout=w.Layout(width="420px"),
-        )
-        self.catalog_count_ = w.HTML(value="<b>Catalog: 0 sequence(s)</b>")
-        self.add_catalog_btn_ = w.Button(description="Add current", button_style="info")
-        self.remove_catalog_btn_ = w.Button(description="Remove selected")
-        self.clear_catalog_btn_ = w.Button(description="Clear catalog")
-        self.add_catalog_btn_.on_click(self._add_to_catalog)
-        self.remove_catalog_btn_.on_click(self._remove_from_catalog)
-        self.clear_catalog_btn_.on_click(self._clear_catalog)
-
-        self.c = {
-            "channels": w.SelectMultiple(
-                options=self.raw_channels_,
-                value=tuple(self.raw_channels_[:3]),
-                description="Channels:", rows=8,
-            ),
-            "view_mode": w.Dropdown(
-                options=["current", "catalog overlay", "catalog grid"],
-                value="current", description="View:",
-            ),
-            "acc_modes": w.Dropdown(options=ACC_MODES, value=ACC_MODES[3], description="acc:"),
-            "rotation_modes": w.Dropdown(
-                options=ROT_MODES, value="quaternion|angular_velocity", description="rot:",
-            ),
-            "tof_modes": w.Dropdown(options=TOF_MODES, value=TOF_MODES[0], description="tof:"),
-            "thm_modes": w.Dropdown(options=THM_MODES, value=THM_MODES[-1], description="thm:"),
-            "motion_filter_mode": w.Dropdown(
-                options=["none", "kalman", "extended_kalman"], value="none", description="filter:",
-            ),
-            "use_dead_reckoning": w.Checkbox(value=False, description="dead reckoning"),
-            "dead_reckoning_detrend": w.Checkbox(value=False, description="dr detrend"),
-            "kalman_process_noise": w.FloatLogSlider(
-                value=-3, base=10, min=-6, max=0, step=0.25, description="kalman Q:",
-            ),
-            "kalman_measurement_noise": w.FloatLogSlider(
-                value=-2, base=10, min=-6, max=0, step=0.25, description="kalman R:",
-            ),
-            "smooth_alpha": w.FloatSlider(
-                min=0.0, max=1.0, step=0.05, value=0.0, description="ewm a:",
-            ),
-            "window_size": w.IntSlider(min=3, max=31, step=2, value=7, description="window:"),
-            "clip_value": w.FloatSlider(
-                min=0.0, max=200.0, step=10.0, value=0.0, description="clip:",
-            ),
-            "interp_mode": w.Dropdown(options=INTERP_MODES, value="linear", description="interp:"),
-            "compute_dt": w.Checkbox(value=True, description="compute dt"),
-            "resample_modalities": w.Checkbox(value=False, description="resample"),
-            "imu_native_sampling_rate": w.IntSlider(
-                min=1, max=100, step=1, value=fs_int, description="imu native:",
-            ),
-            "imu_target_sampling_rate": w.IntSlider(
-                min=1, max=100, step=1, value=fs_int, description="imu target:",
-            ),
-            "rot_native_sampling_rate": w.IntSlider(
-                min=1, max=100, step=1, value=fs_int, description="rot native:",
-            ),
-            "rot_target_sampling_rate": w.IntSlider(
-                min=1, max=100, step=1, value=fs_int, description="rot target:",
-            ),
-            "tof_native_sampling_rate": w.IntSlider(
-                min=1, max=20, step=1, value=5, description="tof native:",
-            ),
-            "tof_target_sampling_rate": w.IntSlider(
-                min=1, max=20, step=1, value=5, description="tof target:",
-            ),
-            "thm_native_sampling_rate": w.IntSlider(
-                min=1, max=20, step=1, value=5, description="thm native:",
-            ),
-            "thm_target_sampling_rate": w.IntSlider(
-                min=1, max=20, step=1, value=5, description="thm target:",
-            ),
-            "maxlen": w.IntSlider(
-                min=32, max=512, step=16, value=int(defaults.get("maxlen", 160)),
-                description="maxlen:",
-            ),
-            "add_global_context": w.Checkbox(
-                value=bool(defaults.get("add_global_context", False)),
-                description="global ctx",
-            ),
-            "frame_stats": w.Dropdown(
-                options=FRAME_STATS, value="mean,std,min,max,last", description="frame stats:",
-            ),
-            "feature": w.Dropdown(
-                options=self.feature_options_,
-                value=self.feature_options_[0], description="Feature:",
-            ),
-            "spec_mode": w.Dropdown(
-                options=["fft", "psd", "spectrogram"], value="fft", description="Spectral:",
-            ),
-            "detrend": w.Checkbox(value=True, description="detrend"),
-            "logy": w.Checkbox(value=True, description="log power"),
-            "reduction": w.Dropdown(
-                options=["pca", "tsne"] + (["umap"] if _UMAP else []),
-                value="pca", description="Reduce:",
-            ),
-            "method": w.Dropdown(
-                options=["kmeans", "gmm", "agglomerative", "dbscan"]
-                + (["hdbscan"] if _HDBSCAN else []),
-                value="kmeans", description="Cluster:",
-            ),
-            "n_clusters": w.IntSlider(min=2, max=12, step=1, value=5, description="k:"),
-            "eps": w.FloatSlider(min=0.1, max=5.0, step=0.1, value=0.8, description="eps:"),
-            "cluster_space": w.Dropdown(
-                options=["features", "embedding"], value="features", description="Fit on:",
-            ),
-            "cluster_source": w.Dropdown(
-                options=["filtered", "catalog", "filtered+catalog"],
-                value="filtered", description="Source:",
-            ),
-            "max_seqs": w.IntSlider(min=50, max=2000, step=50, value=400, description="Max seqs:"),
-            "color_by": w.Dropdown(
-                options=["cluster"] + self.filter_cols_, value="cluster", description="Colour:",
-            ),
-        }
-
-        for key in ("acc_modes", "rotation_modes", "tof_modes", "thm_modes",
-                    "motion_filter_mode", "use_dead_reckoning", "smooth_alpha",
-                    "window_size", "clip_value"):
-            self.c[key].observe(lambda _: self._refresh_feature_options(), names="value")
-
-        return self.c
-
-    def _on_filter_change(self, _):
-        seqs = self.candidates({c: list(f.value) for c, f in self.filters_.items()})
-        if not seqs:
-            return
-        self.seq_pick_.options = seqs
-        self.seq_pick_.value = seqs[0]
-
     def _resolve(self, seq_id, seq_text):
-        sid = seq_text.strip() or seq_id
+        sid = (seq_text or "").strip() or seq_id
         if sid not in set(self.meta_.index):
             raise KeyError(f"{sid} not in data")
         return sid
 
-    def _sequence_ids_for_view(self, seq_id, seq_text, view_mode):
-        if view_mode == "current":
-            return [self._resolve(seq_id, seq_text)]
-        if not self.catalog_:
-            print("Catalog is empty — add sequences with 'Add current'.")
-            return [self._resolve(seq_id, seq_text)]
-        return list(self.catalog_)
-
-    def _cluster_sequence_ids(self, cluster_source, max_seqs):
-        filtered = self.candidates({c: list(f.value) for c, f in self.filters_.items()})
-        catalog = list(self.catalog_)
-
-        if cluster_source == "catalog":
-            seqs = catalog
-        elif cluster_source == "filtered+catalog":
-            seqs = sorted(set(filtered) | set(catalog))
-        else:
-            seqs = filtered
-
-        if len(seqs) < 5:
-            print(f"need at least 5 sequences (have {len(seqs)}) for source={cluster_source}")
-            return []
-
-        rng = np.random.RandomState(self.random_state)
-        if len(seqs) > max_seqs:
-            seqs = list(rng.choice(seqs, size=int(max_seqs), replace=False))
-        return seqs
+    def _current_filters(self):
+        return {c: list(f.value) for c, f in self.filters_.items()}
 
     # ------------------------------------------------------------------
-    # panel 1: raw sequence
+    # SequenceExtractor - full parameter surface
     # ------------------------------------------------------------------
-    def update_raw(self, seq_id, seq_text, channels, view_mode):
-        sids = self._sequence_ids_for_view(seq_id, seq_text, view_mode)
-        chans = list(channels) or self.raw_channels_[:3]
+    def _extractor_kwargs(self, vals):
+        """Translate raw widget values into exactly the kwargs
+        SequenceExtractor.__init__ accepts, no more and no less."""
+        def none_if_zero(x):
+            return None if x is None or x <= 0 else float(x)
 
-        if view_mode == "catalog grid" and len(sids) > 1:
-            n = len(sids)
-            ncols = min(3, n)
-            nrows = int(np.ceil(n / ncols))
-            fig, axes = plt.subplots(
-                nrows, ncols, figsize=(4.5 * ncols, 2.2 * nrows), squeeze=False,
-            )
-            for ax, sid in zip(axes.ravel(), sids):
-                g = self.sequence(sid)
-                t = np.arange(len(g)) / self.fs
-                for ch in chans[:1]:
-                    ax.plot(t, g[ch].to_numpy(), lw=0.8)
-                meta = self.meta_.loc[sid]
-                ax.set_title(
-                    f"{sid}\n{meta.get('gesture', '')} | {meta.get('orientation', '')}",
-                    fontsize=8,
-                )
-                self._center_axis(ax, g[chans[:1]].to_numpy())
-                ax.grid(alpha=0.3)
-            for ax in axes.ravel()[len(sids):]:
-                ax.axis("off")
-            fig.suptitle(f"Catalog grid ({len(sids)} sequences)", fontsize=10)
-            fig.tight_layout()
-            plt.show()
-            print(f"Showing {len(sids)} catalog sequence(s) | channels: {chans[:1]}")
-            return
+        def none_if_zero_int(x):
+            return None if x is None or int(x) <= 0 else int(x)
 
-        if view_mode == "catalog overlay" and len(sids) > 1:
-            fig, axes = plt.subplots(len(chans), 1, figsize=(12, 1.8 * len(chans)),
-                                     sharex=True, squeeze=False)
-            for ax, ch in zip(axes[:, 0], chans):
-                for sid in sids:
-                    g = self.sequence(sid)
-                    t = np.arange(len(g)) / self.fs
-                    ax.plot(t, g[ch].to_numpy(), lw=0.7, alpha=0.75, label=sid)
-                self._center_axis(ax, *(self.sequence(s)[ch].to_numpy() for s in sids))
-                ax.set_ylabel(ch, fontsize=8)
-                ax.grid(alpha=0.3)
-                if len(sids) <= 8:
-                    ax.legend(fontsize=6, ncol=2, loc="upper right")
-            axes[-1, 0].set_xlabel("time (s)")
-            fig.suptitle(f"Catalog overlay ({len(sids)} sequences)", fontsize=10)
-            fig.tight_layout()
-            plt.show()
-            print(f"Catalog: {len(sids)} sequence(s)")
-            return
+        acc_modes = "|".join(vals["acc_modes"]) or "raw"
+        rotation_modes = "|".join(vals["rotation_modes"]) or "quaternion"
+        tof_modes = "|".join(vals["tof_modes"]) or "pooled_stats"
+        thm_modes = "|".join(vals["thm_modes"]) or "centered_diff"
+        frame_stats = ",".join(vals["frame_stats"]) or "mean"
 
-        sid = sids[0]
-        g = self.sequence(sid)
-        meta = self.meta_.loc[sid]
+        chunk_window = none_if_zero_int(vals["chunk_window_size"])
+        chunk_stride = none_if_zero_int(vals["chunk_stride"])
+        if chunk_window is not None and chunk_stride is not None:
+            chunk_stride = min(chunk_stride, chunk_window)
 
-        fig, axes = plt.subplots(len(chans), 1, figsize=(12, 1.6 * len(chans)),
-                                 sharex=True, squeeze=False)
-        for ax, ch in zip(axes[:, 0], chans):
-            y = g[ch].to_numpy()
-            ax.plot(np.arange(len(g)) / self.fs, y, lw=0.9)
-            self._center_axis(ax, y)
-            ax.set_ylabel(ch, fontsize=8)
-            ax.grid(alpha=0.3)
-        axes[-1, 0].set_xlabel("time (s)")
-        fig.suptitle(
-            f"{sid} | " + " | ".join(f"{c}={meta[c]}" for c in self.filter_cols_[:4]),
-            fontsize=10,
-        )
-        fig.tight_layout()
-        plt.show()
-        print(
-            f"{len(g)} samples ({len(g) / self.fs:.1f}s @ {self.fs:g} Hz) | "
-            f"NaN cells: {int(g[chans].isna().sum().sum())} | "
-            f"Catalog total: {len(self.catalog_)}"
+        return dict(
+            acc_modes=acc_modes,
+            rotation_modes=rotation_modes,
+            tof_modes=tof_modes,
+            thm_modes=thm_modes,
+            motion_filter_mode=None if vals["motion_filter_mode"] == "none" else vals["motion_filter_mode"],
+            use_dead_reckoning=bool(vals["use_dead_reckoning"]),
+            dead_reckoning_detrend=bool(vals["dead_reckoning_detrend"]),
+            kalman_process_noise=10.0 ** vals["kalman_process_noise"],
+            kalman_measurement_noise=10.0 ** vals["kalman_measurement_noise"],
+            compute_dt=bool(vals["compute_dt"]),
+            window_size=int(vals["window_size"]),
+            smooth_alpha=none_if_zero(vals["smooth_alpha"]),
+            clip_value=none_if_zero(vals["clip_value"]),
+            interp_mode=vals["interp_mode"],
+            maxlen=int(vals["maxlen"]),
+            padding_value=float(vals["padding_value"]),
+            imu_native_sampling_rate=int(vals["imu_native_sampling_rate"]),
+            imu_target_sampling_rate=int(vals["imu_target_sampling_rate"]),
+            rot_native_sampling_rate=int(vals["rot_native_sampling_rate"]),
+            rot_target_sampling_rate=int(vals["rot_target_sampling_rate"]),
+            tof_native_sampling_rate=int(vals["tof_native_sampling_rate"]),
+            tof_target_sampling_rate=int(vals["tof_target_sampling_rate"]),
+            thm_native_sampling_rate=int(vals["thm_native_sampling_rate"]),
+            thm_target_sampling_rate=int(vals["thm_target_sampling_rate"]),
+            chunk_window_size=chunk_window,
+            chunk_stride=chunk_stride,
+            frame_stats=frame_stats,
+            add_global_context=bool(vals["add_global_context"]),
+            resample_modalities=bool(vals["resample_modalities"]),
         )
 
-    # ------------------------------------------------------------------
-    # panel 2: feature extraction before/after
-    # ------------------------------------------------------------------
-    def update_features(self, seq_id, seq_text, feature, **control_values):
-        sid = self._resolve(seq_id, seq_text)
-        g = self.sequence(sid)
-        params = self._params(**control_values)
-        out = self.extract(g, **params)
-        cols = [c for c in out.columns if c != self.sequence_col]
-        if feature not in cols:
-            print(f"'{feature}' not produced by these parameters — showing {cols[0]}")
-            feature = cols[0]
+    def extract(self, seq_df, extractor_kwargs, output_format="chunks"):
+        """Row-level engineered features for one or many sequences, using the
+        exact preprocessing path SequenceExtractor.fit/transform use."""
+        ex = SequenceExtractor(output_format=output_format, **extractor_kwargs)
+        ex.fit(seq_df)
+        return ex, ex._preprocess_features(seq_df)
 
-        raw_ch = self._match_raw_channel(feature, g.columns)
-        t = np.arange(len(g)) / self.fs
-        after = out[feature].to_numpy(dtype=float)
-
-        fig, axes = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
-        if raw_ch is not None:
-            before = g[raw_ch].to_numpy(dtype=float)
-            axes[0].plot(t, before, lw=0.9, color="slategray")
-            axes[0].set_title(f"before: {raw_ch}", fontsize=10)
-            self._center_axis(axes[0], before)
-        else:
-            axes[0].text(0.5, 0.5, "no matching raw channel", ha="center", va="center")
-        axes[1].plot(t[: len(out)], after, lw=0.9, color="seagreen")
-        axes[1].set_title(f"after: {feature}", fontsize=10)
-        self._center_axis(axes[1], after)
-        for ax in axes:
-            ax.grid(alpha=0.3)
-        axes[1].set_xlabel("time (s)")
-        fig.suptitle(
-            f"{sid} | acc={params['acc_modes']} | rot={params['rotation_modes']} | "
-            f"filter={params['motion_filter_mode']} | dr={params['use_dead_reckoning']}",
-            fontsize=9,
+    def _imu_domain_chain(self, seq_df, axis, extractor_kwargs):
+        """raw -> velocity -> displacement -> jerk for one accelerometer axis,
+        via the literal SignalCleaner -> MotionFilter -> IMUExtractor chain
+        SequenceExtractor.fit runs internally (cleaning/filter params only;
+        acc_modes is overridden per domain)."""
+        cleaner = SignalCleaner(
+            native_sampling_rate=extractor_kwargs["imu_native_sampling_rate"],
+            compute_dt=extractor_kwargs["compute_dt"],
+            clip_value=extractor_kwargs["clip_value"],
+            interp_mode=extractor_kwargs["interp_mode"],
+            window_size=extractor_kwargs["window_size"],
         )
-        fig.tight_layout()
-        plt.show()
+        cleaned = cleaner.fit_transform(seq_df)
 
-        rows = []
-        v = after
-        rows.append([feature, v.mean(), v.std(), v.min(), v.max(), float(np.nanmedian(v))])
-        if raw_ch is not None:
-            r = g[raw_ch].to_numpy(dtype=float)
-            rows.append([
-                raw_ch, np.nanmean(r), np.nanstd(r), np.nanmin(r), np.nanmax(r),
-                float(np.nanmedian(r)),
-            ])
-        stats = pd.DataFrame(rows, columns=["channel", "mean", "std", "min", "max", "median"])
-        if raw_ch is not None:
-            stats["delta_mean"] = stats["mean"] - stats["mean"].iloc[1]
-            stats.loc[stats.index[1], "delta_mean"] = np.nan
-            stats["delta_std"] = stats["std"] - stats["std"].iloc[1]
-            stats.loc[stats.index[1], "delta_std"] = np.nan
+        mf = MotionFilter(
+            motion_filter_mode=extractor_kwargs["motion_filter_mode"],
+            kalman_process_noise=extractor_kwargs["kalman_process_noise"],
+            kalman_measurement_noise=extractor_kwargs["kalman_measurement_noise"],
+            use_dead_reckoning=extractor_kwargs["use_dead_reckoning"],
+            dead_reckoning_detrend=extractor_kwargs["dead_reckoning_detrend"],
+        )
+        filtered = mf.transform(cleaned)
 
-        print(f"{len(cols)} engineered columns from SequenceExtractor._preprocess_features")
-        print("Active extractor params:")
-        for k in self.extractor_param_names_:
-            if k in params:
-                print(f"  {k}: {params[k]}")
-        print(stats.round(4).to_string(index=False))
+        domains = {}
+        for mode in IMU_DOMAIN_CHAIN:
+            imu = IMUExtractor(acc_modes=mode,
+                               window_size=extractor_kwargs["window_size"],
+                               smooth_alpha=extractor_kwargs["smooth_alpha"])
+            imu.fit(filtered)
+            out = imu.transform(filtered)
+            col = next((c for c in out.columns if c.startswith(axis + "_")), None)
+            domains[mode] = out[col].to_numpy(dtype=float) if col is not None \
+                else np.zeros(len(filtered))
+        return domains, filtered["dt"].to_numpy(dtype=float)
 
-    # ------------------------------------------------------------------
-    # panel 3: spectral
-    # ------------------------------------------------------------------
     def _spectrum(self, x, mode, detrend):
         x = np.nan_to_num(np.asarray(x, dtype=float))
-        if detrend:
-            x = signal.detrend(x, type="linear") if len(x) > 1 else x
+        if detrend and len(x) > 1:
+            x = signal.detrend(x, type="linear")
         nper = min(256, max(8, len(x)))
         if mode == "psd":
             return signal.welch(x, fs=self.fs, nperseg=nper, window="hann")
         win = np.hanning(len(x))
         X = np.fft.rfft(x * win)
         f = np.fft.rfftfreq(len(x), d=1.0 / self.fs)
-        amp = (2.0 / max(win.sum(), 1e-12)) * np.abs(X)
-        return f, amp
+        return f, (2.0 / max(win.sum(), 1e-12)) * np.abs(X)
 
-    def _print_spectral_stats(self, name, f, P):
-        P = np.asarray(P, dtype=float)
-        if len(P) <= 1 or P[1:].sum() <= 0:
-            print(f"{name:6s} peak=n/a | centroid=n/a | power={P.sum():.4g}")
+    # ------------------------------------------------------------------
+    # controls
+    # ------------------------------------------------------------------
+    def make_controls(self):
+        import ipywidgets as w
+
+        self.filters_ = {
+            c: w.SelectMultiple(options=["(all)"] + sorted(self.meta_[c].astype(str).unique()),
+                                value=("(all)",), description=c[:11] + ":", rows=6,
+                                layout=w.Layout(width="230px"))
+            for c in self.filter_cols_
+        }
+        for f in self.filters_.values():
+            f.observe(self._on_filter_change, names="value")
+
+        seqs = self.candidates({})
+        self.seq_pick_ = w.Dropdown(options=seqs, value=seqs[0], description="Sequence:",
+                                    layout=w.Layout(width="330px"))
+        self.seq_text_ = w.Text(value="", description="or ID:", placeholder="SEQ_000007",
+                                layout=w.Layout(width="330px"))
+
+        # ---- catalogue controls ----
+        self.add_one_btn_ = w.Button(description="+ Add current", button_style="success")
+        self.add_filtered_btn_ = w.Button(description="+ Add all filtered", button_style="info")
+        self.remove_one_btn_ = w.Button(description="- Remove current", button_style="warning")
+        self.clear_btn_ = w.Button(description="Clear catalogue", button_style="danger")
+        self.cat_label_ = w.HTML(value="<b>Catalogue: 0 sequences</b>")
+        self.cat_version_ = w.IntText(value=0)
+        self.cat_version_.layout.display = "none"
+        self.add_one_btn_.on_click(self._add_current)
+        self.add_filtered_btn_.on_click(self._add_filtered)
+        self.remove_one_btn_.on_click(self._remove_current)
+        self.clear_btn_.on_click(self._clear_catalogue)
+
+        # ---- full SequenceExtractor parameter surface ----
+        p = {
+            "acc_modes": w.SelectMultiple(options=ACC_MODE_OPTS, value=("raw", "velocity", "jerk"),
+                                          description="acc_modes:", rows=5),
+            "rotation_modes": w.SelectMultiple(options=ROT_MODE_OPTS,
+                                               value=("quaternion", "angular_velocity"),
+                                               description="rotation_modes:", rows=5),
+            "tof_modes": w.SelectMultiple(options=TOF_MODE_OPTS, value=("pooled_stats",),
+                                          description="tof_modes:", rows=4),
+            "thm_modes": w.SelectMultiple(options=THM_MODE_OPTS, value=("centered_diff",),
+                                          description="thm_modes:", rows=4),
+
+            "motion_filter_mode": w.Dropdown(options=["none", "kalman", "extended_kalman"],
+                                             value="none", description="motion_filter_mode:"),
+            "use_dead_reckoning": w.Checkbox(value=False, description="use_dead_reckoning"),
+            "dead_reckoning_detrend": w.Checkbox(value=False, description="dead_reckoning_detrend"),
+            "kalman_process_noise": w.FloatSlider(min=-6, max=0, step=0.5, value=-3,
+                                                   description="log10 kalman_process_noise:",
+                                                   style={"description_width": "220px"}),
+            "kalman_measurement_noise": w.FloatSlider(min=-6, max=0, step=0.5, value=-2,
+                                                       description="log10 kalman_measurement_noise:",
+                                                       style={"description_width": "220px"}),
+
+            "compute_dt": w.Checkbox(value=True, description="compute_dt"),
+            "window_size": w.IntSlider(min=3, max=31, step=2, value=7, description="window_size:"),
+            "smooth_alpha": w.FloatSlider(min=0.0, max=1.0, step=0.05, value=0.0,
+                                          description="smooth_alpha (0=None):",
+                                          style={"description_width": "160px"}),
+            "clip_value": w.FloatSlider(min=0.0, max=500.0, step=10.0, value=0.0,
+                                        description="clip_value (0=None):",
+                                        style={"description_width": "160px"}),
+            "interp_mode": w.Dropdown(options=["linear", "ffill"], value="linear",
+                                      description="interp_mode:"),
+            "maxlen": w.IntSlider(min=50, max=500, step=10, value=160, description="maxlen:"),
+            "padding_value": w.FloatText(value=0.0, description="padding_value:",
+                                         style={"description_width": "120px"}),
+
+            "imu_native_sampling_rate": w.IntSlider(min=1, max=100, value=int(self.fs),
+                                                     description="imu_native_hz:"),
+            "imu_target_sampling_rate": w.IntSlider(min=1, max=100, value=int(self.fs),
+                                                     description="imu_target_hz:"),
+            "rot_native_sampling_rate": w.IntSlider(min=1, max=100, value=int(self.fs),
+                                                     description="rot_native_hz:"),
+            "rot_target_sampling_rate": w.IntSlider(min=1, max=100, value=int(self.fs),
+                                                     description="rot_target_hz:"),
+            "tof_native_sampling_rate": w.IntSlider(min=1, max=100, value=5,
+                                                     description="tof_native_hz:"),
+            "tof_target_sampling_rate": w.IntSlider(min=1, max=100, value=5,
+                                                     description="tof_target_hz:"),
+            "thm_native_sampling_rate": w.IntSlider(min=1, max=100, value=5,
+                                                     description="thm_native_hz:"),
+            "thm_target_sampling_rate": w.IntSlider(min=1, max=100, value=5,
+                                                     description="thm_target_hz:"),
+            "resample_modalities": w.Checkbox(value=False, description="resample_modalities"),
+
+            "chunk_window_size": w.IntSlider(min=0, max=400, step=8, value=0,
+                                             description="chunk_window_size (0=None):",
+                                             style={"description_width": "200px"}),
+            "chunk_stride": w.IntSlider(min=0, max=400, step=8, value=0,
+                                        description="chunk_stride (0=None):",
+                                        style={"description_width": "200px"}),
+            "frame_stats": w.SelectMultiple(options=FRAME_STAT_OPTS,
+                                            value=("mean", "std", "min", "max", "last"),
+                                            description="frame_stats:", rows=9),
+            "add_global_context": w.Checkbox(value=False, description="add_global_context"),
+        }
+        self.p = p
+
+        # extra, per-tab widgets
+        self.feature_options_ = self._all_feature_names()
+        self.feature_ = w.Dropdown(options=self.feature_options_, value=self.feature_options_[0],
+                                   description="Feature:")
+        self.cat_channel_ = w.Dropdown(options=self.raw_channels_, value=self.raw_channels_[0],
+                                       description="Channel:")
+        self.axis_ = w.Dropdown(options=self.acc_axes_, value=self.acc_axes_[0],
+                                description="IMU axis:")
+        self.spec_mode_ = w.Dropdown(options=["fft", "psd", "spectrogram"], value="fft",
+                                     description="Spectral:")
+        self.detrend_ = w.Checkbox(value=True, description="detrend")
+        self.logy_ = w.Checkbox(value=True, description="log power")
+
+        self.reduction_ = w.Dropdown(options=["pca", "tsne"] + (["umap"] if _UMAP else []),
+                                     value="pca", description="Reduce:")
+        self.method_ = w.Dropdown(options=["kmeans", "gmm", "agglomerative", "dbscan"]
+                                  + (["hdbscan"] if _HDBSCAN else []),
+                                  value="kmeans", description="Cluster:")
+        self.n_clusters_ = w.IntSlider(min=2, max=12, step=1, value=5, description="k:")
+        self.eps_ = w.FloatSlider(min=0.1, max=5.0, step=0.1, value=0.8, description="eps:")
+        self.cluster_space_ = w.Dropdown(options=["features", "embedding"], value="features",
+                                         description="Fit on:")
+        self.population_ = w.Dropdown(options=["catalogue", "filtered"], value="filtered",
+                                      description="Population:")
+        self.max_seqs_ = w.IntSlider(min=20, max=2000, step=20, value=400, description="Max seqs:")
+        self.color_by_ = w.Dropdown(options=["cluster"] + self.filter_cols_, value="cluster",
+                                    description="Colour:")
+
+    def _all_feature_names(self):
+        """Union of engineered columns over the widest mode combination."""
+        probe = self.sequence(self.meta_.index[0])
+        widest = self._extractor_kwargs(dict(
+            acc_modes=ACC_MODE_OPTS, rotation_modes=ROT_MODE_OPTS, tof_modes=("pooled_stats",),
+            thm_modes=("centered_diff",), motion_filter_mode="none", use_dead_reckoning=False,
+            dead_reckoning_detrend=False, kalman_process_noise=-3, kalman_measurement_noise=-2,
+            compute_dt=True, window_size=7, smooth_alpha=0.0, clip_value=0.0,
+            interp_mode="linear", maxlen=160, padding_value=0.0,
+            imu_native_sampling_rate=int(self.fs), imu_target_sampling_rate=int(self.fs),
+            rot_native_sampling_rate=int(self.fs), rot_target_sampling_rate=int(self.fs),
+            tof_native_sampling_rate=5, tof_target_sampling_rate=5,
+            thm_native_sampling_rate=5, thm_target_sampling_rate=5,
+            chunk_window_size=0, chunk_stride=0, frame_stats=("mean",),
+            add_global_context=False, resample_modalities=False,
+        ))
+        _, out = self.extract(probe, widest)
+        cols = [c for c in out.columns if c != self.sequence_col]
+        return cols + [c for c in self.raw_channels_ if c not in cols]
+
+    # ------------------------------------------------------------------
+    # catalogue handlers
+    # ------------------------------------------------------------------
+    def _on_filter_change(self, _):
+        seqs = self.candidates(self._current_filters())
+        if not seqs:
             return
-        body = P[1:]
-        freqs = f[1:]
-        print(
-            f"{name:6s} peak={freqs[np.argmax(body)]:6.2f} Hz | "
-            f"centroid={(freqs * body).sum() / body.sum():6.2f} Hz | "
-            f"power={body.sum():.4g}"
-        )
+        self.seq_pick_.options = seqs
+        self.seq_pick_.value = seqs[0]
 
-    def update_spectrum(self, seq_id, seq_text, feature, spec_mode, detrend, logy,
-                        **control_values):
+    def _bump(self):
+        n = len(self.catalogue_)
+        preview = ", ".join(self.catalogue_[-8:])
+        tail = f" — last added: {preview}" if n else " (empty — Clusters tab falls back to Population=filtered)"
+        self.cat_label_.value = f"<b>Catalogue: {n} sequence(s)</b>{tail}"
+        self.cat_version_.value += 1
+
+    def _add_current(self, _btn):
+        sid = self._resolve(self.seq_pick_.value, self.seq_text_.value)
+        if sid not in self.catalogue_:
+            self.catalogue_.append(sid)
+        self._bump()
+
+    def _add_filtered(self, _btn):
+        for sid in self.candidates(self._current_filters()):
+            if sid not in self.catalogue_:
+                self.catalogue_.append(sid)
+        self._bump()
+
+    def _remove_current(self, _btn):
+        sid = self._resolve(self.seq_pick_.value, self.seq_text_.value)
+        if sid in self.catalogue_:
+            self.catalogue_.remove(sid)
+        self._bump()
+
+    def _clear_catalogue(self, _btn):
+        self.catalogue_.clear()
+        self._bump()
+
+    # ------------------------------------------------------------------
+    # panel 1: catalogue
+    # ------------------------------------------------------------------
+    def update_catalogue(self, cat_version, channel):
+        ids = list(self.catalogue_)
+        if not ids:
+            print("catalogue is empty — use '+ Add current' or '+ Add all filtered' above")
+            return
+        show = ids[:24]
+        ncols = 4
+        nrows = int(np.ceil(len(show) / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(3.2 * ncols, 1.9 * nrows), squeeze=False)
+        for ax, sid in zip(axes.ravel(), show):
+            g = self.sequence(sid)
+            y = g[channel].to_numpy(dtype=float) if channel in g.columns else np.zeros(len(g))
+            ax.plot(np.arange(len(g)) / self.fs, y, lw=0.8, color="steelblue")
+            _center_zero(ax, y)
+            lab = self.meta_.loc[sid, self.label_col] if self.label_col in self.meta_.columns else ""
+            ax.set_title(f"{sid}\n{lab}", fontsize=7)
+            ax.tick_params(labelsize=6)
+        for ax in axes.ravel()[len(show):]:
+            ax.axis("off")
+        fig.suptitle(f"Catalogue ({len(ids)} sequences, showing first {len(show)}) — {channel}",
+                     fontsize=10)
+        fig.tight_layout()
+        plt.show()
+
+    # ------------------------------------------------------------------
+    # panel 2: feature extraction before/after (full SequenceExtractor)
+    # ------------------------------------------------------------------
+    def update_features(self, seq_id, seq_text, feature, **pvals):
         sid = self._resolve(seq_id, seq_text)
         g = self.sequence(sid)
-        params = self._params(**control_values)
-        out = self.extract(g, **params)
+        kwargs = self._extractor_kwargs(pvals)
+        ex, out = self.extract(g, kwargs, output_format="chunks")
         cols = [c for c in out.columns if c != self.sequence_col]
         if feature not in cols:
+            print(f"'{feature}' not produced by this parameter set — showing {cols[0]}")
             feature = cols[0]
 
-        raw_ch = self._match_raw_channel(feature, g.columns)
-        if raw_ch is None:
-            raw_ch = self.raw_channels_[0]
+        base = "_".join(feature.split("_")[:2])
+        raw_ch = base if base in g.columns else None
+        t = np.arange(len(g)) / self.fs
 
-        before = g[raw_ch].to_numpy(dtype=float)
-        after = out[feature].to_numpy(dtype=float)
+        fig, axes = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
+        if raw_ch is not None:
+            y0 = g[raw_ch].to_numpy(dtype=float)
+            axes[0].plot(t, y0, lw=0.9, color="slategray")
+            _center_zero(axes[0], y0)
+            axes[0].set_title(f"before: {raw_ch}", fontsize=10)
+        else:
+            axes[0].text(0.5, 0.5, "no matching raw channel", ha="center", transform=axes[0].transAxes)
+        y1 = out[feature].to_numpy(dtype=float)
+        axes[1].plot(t[:len(out)], y1, lw=0.9, color="seagreen")
+        _center_zero(axes[1], y1)
+        axes[1].set_title(f"after: {feature}", fontsize=10)
+        for ax in axes:
+            ax.grid(alpha=0.3)
+        axes[1].set_xlabel("time (s)")
+        fig.suptitle(f"{sid} | acc={kwargs['acc_modes']} | rot={kwargs['rotation_modes']} | "
+                     f"filter={kwargs['motion_filter_mode']} | dr={kwargs['use_dead_reckoning']}",
+                     fontsize=9)
+        fig.tight_layout()
+        plt.show()
+
+        stats = pd.DataFrame({feature: [y1.mean(), y1.std(), y1.min(), y1.max()]},
+                             index=["mean", "std", "min", "max"]).T
+        if raw_ch is not None:
+            r = g[raw_ch].to_numpy(dtype=float)
+            stats.loc[raw_ch] = [np.nanmean(r), np.nanstd(r), np.nanmin(r), np.nanmax(r)]
+        print(f"{len(cols)} engineered columns | base_feature_names_: {len(ex.base_feature_names_)}")
+        print(stats.round(4).to_string())
+
+    # ------------------------------------------------------------------
+    # panel 3: spectrum over the raw -> velocity -> displacement -> jerk chain
+    # ------------------------------------------------------------------
+    def update_spectrum(self, seq_id, seq_text, axis, spec_mode, detrend, logy, **pvals):
+        sid = self._resolve(seq_id, seq_text)
+        g = self.sequence(sid)
+        kwargs = self._extractor_kwargs(pvals)
+        domains, dt = self._imu_domain_chain(g, axis, kwargs)
+        t = np.arange(len(g)) / self.fs
 
         if spec_mode == "spectrogram":
-            fig, axes = plt.subplots(1, 2, figsize=(13, 4.5), sharey=True)
-            for ax, (x, ttl) in zip(
-                axes,
-                [(before, f"before: {raw_ch}"), (after, f"after: {feature}")],
-            ):
+            fig, axes = plt.subplots(1, len(IMU_DOMAIN_CHAIN), figsize=(4 * len(IMU_DOMAIN_CHAIN), 4),
+                                     sharey=True)
+            for ax, mode in zip(axes, IMU_DOMAIN_CHAIN):
+                x = np.nan_to_num(domains[mode])
                 nper = min(64, max(8, len(x) // 4))
-                f, t_spec, S = signal.spectrogram(
-                    np.nan_to_num(x), fs=self.fs, nperseg=nper,
-                    noverlap=nper // 2, window="hann",
-                )
-                ax.pcolormesh(
-                    t_spec, f, 10 * np.log10(S + 1e-12),
-                    shading="gouraud", cmap="magma",
-                )
-                ax.set_title(ttl, fontsize=10)
+                f, tt, S = signal.spectrogram(x, fs=self.fs, nperseg=nper,
+                                              noverlap=nper // 2, window="hann")
+                ax.pcolormesh(tt, f, 10 * np.log10(S + 1e-12), shading="gouraud", cmap="magma")
+                ax.set_title(mode, fontsize=10)
                 ax.set_xlabel("time (s)")
-                ax.axhline(self.fs / 2, color="white", ls="--", lw=0.6, alpha=0.7)
             axes[0].set_ylabel("Hz")
-            fig.suptitle(
-                f"{sid} | pipeline: raw→{params['acc_modes']} | Nyquist={self.fs / 2:g} Hz",
-                fontsize=10,
-            )
+            fig.suptitle(f"{sid} | {axis} | spectrogram over raw->velocity->displacement->jerk",
+                         fontsize=10)
             fig.tight_layout()
             plt.show()
             return
 
-        fb, Pb = self._spectrum(before, spec_mode, detrend)
-        fa, Pa = self._spectrum(after, spec_mode, detrend)
-        t = np.arange(len(g)) / self.fs
+        fig, axes = plt.subplots(2, len(IMU_DOMAIN_CHAIN), figsize=(4 * len(IMU_DOMAIN_CHAIN), 6.5))
+        summary = []
+        for i, mode in enumerate(IMU_DOMAIN_CHAIN):
+            x = domains[mode]
+            axes[0, i].plot(t[:len(x)], x, lw=0.8, color="darkorange")
+            _center_zero(axes[0, i], x)
+            axes[0, i].set_title(mode, fontsize=10)
+            axes[0, i].grid(alpha=0.3)
 
-        fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
-        axes[0].plot(t, before, lw=0.8, color="slategray", label=f"before: {raw_ch}")
-        axes[0].plot(t[: len(after)], after, lw=0.8, color="seagreen", label=f"after: {feature}")
-        self._center_axis(axes[0], before, after)
-        axes[0].set_xlabel("time (s)")
-        axes[0].legend(fontsize=8)
-        axes[0].set_title("time domain (centered on 0)", fontsize=10)
+            f, P = self._spectrum(x, spec_mode, detrend)
+            axes[1, i].plot(f, P, lw=0.9, color="steelblue")
+            if logy:
+                axes[1, i].set_yscale("log")
+            axes[1, i].set_xlabel("Hz")
+            axes[1, i].grid(alpha=0.3)
 
-        axes[1].plot(fb, Pb, lw=1.0, color="slategray", label=f"before: {raw_ch}")
-        axes[1].plot(fa, Pa, lw=1.0, color="seagreen", label=f"after: {feature}")
-        axes[1].axvline(self.fs / 2, color="gray", ls="--", lw=0.8, alpha=0.7)
-        axes[1].set_xlabel("Hz")
-        axes[1].set_ylabel("PSD" if spec_mode == "psd" else "|X(f)|")
-        axes[1].set_title(
-            f"{spec_mode.upper()} (Nyquist = {self.fs / 2:g} Hz)", fontsize=10,
-        )
-        axes[1].legend(fontsize=8)
-        if logy:
-            axes[1].set_yscale("log")
-        for ax in axes:
-            ax.grid(alpha=0.3)
-        fig.suptitle(sid, fontsize=10)
+            P = np.asarray(P, dtype=float)
+            if P[1:].sum() > 0:
+                centroid = float((f[1:] * P[1:]).sum() / P[1:].sum())
+                peak = float(f[1:][np.argmax(P[1:])])
+            else:
+                centroid = peak = 0.0
+            summary.append((mode, peak, centroid, float(P[1:].sum())))
+
+        axes[0, 0].set_ylabel("amplitude")
+        axes[1, 0].set_ylabel("PSD" if spec_mode == "psd" else "|X(f)|")
+        fig.suptitle(f"{sid} | {axis} | native_hz={kwargs['imu_native_sampling_rate']} | "
+                     f"filter={kwargs['motion_filter_mode']} | Nyquist={self.fs / 2:g} Hz", fontsize=10)
         fig.tight_layout()
         plt.show()
 
-        self._print_spectral_stats("before", fb, Pb)
-        self._print_spectral_stats("after", fa, Pa)
+        print(pd.DataFrame(summary, columns=["mode", "peak_hz", "centroid_hz", "power"])
+              .set_index("mode").round(4).to_string())
 
     # ------------------------------------------------------------------
     # panel 4: unsupervised
     # ------------------------------------------------------------------
     def update_cluster(self, reduction, method, n_clusters, eps, cluster_space,
-                       cluster_source, max_seqs, color_by, **control_values):
-        seqs = self._cluster_sequence_ids(cluster_source, max_seqs)
-        if not seqs:
-            return
+                       population, max_seqs, color_by, cat_version, **pvals):
+        if population == "catalogue":
+            seqs = list(self.catalogue_)
+            if not seqs:
+                print("catalogue is empty — add sequences in the Catalogue tab, "
+                      "or set Population='filtered'")
+                return
+        else:
+            seqs = self.candidates(self._current_filters())
+            if len(seqs) < 5:
+                print("need at least 5 sequences after filtering")
+                return
+
+        rng = np.random.RandomState(self.random_state)
+        if len(seqs) > max_seqs:
+            seqs = list(rng.choice(seqs, size=int(max_seqs), replace=False))
         sub = self.df[self.df[self.sequence_col].isin(seqs)]
 
-        params = self._params(
-            **control_values,
-            output_format="frame",
-        )
-        F = SequenceExtractor(**params).fit_transform(sub)
+        kwargs = self._extractor_kwargs(pvals)
+        ex = SequenceExtractor(output_format="frame", **kwargs)
+        ex.fit(sub)
+        F = ex.transform_frame(sub)
         M = StandardScaler().fit_transform(np.nan_to_num(F.to_numpy(dtype=float)))
 
         if reduction == "tsne":
-            Z = TSNE(
-                n_components=2, init="pca", learning_rate="auto",
-                perplexity=min(30, max(5, len(M) // 4)),
-                random_state=self.random_state,
-            ).fit_transform(M)
+            Z = TSNE(n_components=2, init="pca", learning_rate="auto",
+                     perplexity=min(30, max(5, len(M) // 4)),
+                     random_state=self.random_state).fit_transform(M)
         elif reduction == "umap" and _UMAP:
             Z = UMAP(n_components=2, random_state=self.random_state).fit_transform(M)
         else:
@@ -736,13 +597,11 @@ class SequenceExplorer:
 
         S = M if cluster_space == "features" else Z
         if method == "kmeans":
-            labels = KMeans(
-                n_clusters=n_clusters, n_init=10, random_state=self.random_state,
-            ).fit_predict(S)
+            labels = KMeans(n_clusters=n_clusters, n_init=10,
+                            random_state=self.random_state).fit_predict(S)
         elif method == "gmm":
-            labels = GaussianMixture(
-                n_components=n_clusters, n_init=3, random_state=self.random_state,
-            ).fit_predict(S)
+            labels = GaussianMixture(n_components=n_clusters, n_init=3,
+                                     random_state=self.random_state).fit_predict(S)
         elif method == "agglomerative":
             labels = AgglomerativeClustering(n_clusters=n_clusters).fit_predict(S)
         elif method == "dbscan":
@@ -752,28 +611,18 @@ class SequenceExplorer:
 
         n_lab = len(set(labels)) - (1 if -1 in labels else 0)
         sil = silhouette_score(S, labels) if 2 <= n_lab < len(S) else np.nan
-        truth = (
-            self.meta_.loc[F.index, self.label_col].astype(str)
+        truth = self.meta_.loc[F.index, self.label_col].astype(str) \
             if self.label_col in self.meta_.columns else None
-        )
-        ari = (
-            adjusted_rand_score(truth, labels)
-            if truth is not None and n_lab >= 2 else np.nan
-        )
+        ari = adjusted_rand_score(truth, labels) if truth is not None and n_lab >= 2 else np.nan
 
         fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
         axes[0].scatter(Z[:, 0], Z[:, 1], c=labels, cmap="tab10", s=14, alpha=0.8)
-        axes[0].set_title(
-            f"{method} on {cluster_space} | source={cluster_source} | "
-            f"{n_lab} clusters | silhouette={sil:.3f} | ARI={ari:.3f}",
-            fontsize=9,
-        )
+        axes[0].set_title(f"{method} on {cluster_space} | pop={population} ({len(seqs)}) | "
+                          f"{n_lab} clusters | silhouette={sil:.3f} | ARI={ari:.3f}", fontsize=9)
         key = color_by if color_by != "cluster" else self.label_col
         if key in self.meta_.columns:
             codes = self.meta_.loc[F.index, key].astype("category")
-            axes[1].scatter(
-                Z[:, 0], Z[:, 1], c=codes.cat.codes, cmap="tab20", s=14, alpha=0.8,
-            )
+            axes[1].scatter(Z[:, 0], Z[:, 1], c=codes.cat.codes, cmap="tab20", s=14, alpha=0.8)
             axes[1].set_title(f"true {key} ({codes.nunique()} levels)", fontsize=9)
         for ax in axes:
             ax.set_xlabel(f"{reduction} 1")
@@ -782,10 +631,7 @@ class SequenceExplorer:
         fig.tight_layout()
         plt.show()
 
-        print(
-            f"{len(F)} sequences | {F.shape[1]} frame features | "
-            f"source={cluster_source} | catalog={len(self.catalog_)}"
-        )
+        print(f"{len(F)} sequences | {F.shape[1]} frame features")
         if truth is not None:
             ct = pd.crosstab(pd.Series(labels, name="cluster"), truth.values)
             summary = pd.DataFrame({
@@ -802,93 +648,64 @@ class SequenceExplorer:
         import ipywidgets as w
         from IPython.display import display
 
-        c = self.make_controls()
-        param_keys = (
-            "acc_modes", "rotation_modes", "tof_modes", "thm_modes",
-            "motion_filter_mode", "use_dead_reckoning", "dead_reckoning_detrend",
-            "kalman_process_noise", "kalman_measurement_noise",
-            "smooth_alpha", "window_size", "clip_value", "interp_mode", "compute_dt",
-            "imu_native_sampling_rate", "imu_target_sampling_rate",
-            "rot_native_sampling_rate", "rot_target_sampling_rate",
-            "tof_native_sampling_rate", "tof_target_sampling_rate",
-            "thm_native_sampling_rate", "thm_target_sampling_rate",
-            "resample_modalities", "maxlen", "add_global_context", "frame_stats",
-        )
-        fx_kw = {k: c[k] for k in param_keys}
+        self.make_controls()
+        p = self.p
 
-        picker = w.VBox([
-            w.HBox(list(self.filters_.values())),
-            w.HBox([self.seq_pick_, self.seq_text_]),
-            w.HBox([
-                self.add_catalog_btn_, self.remove_catalog_btn_,
-                self.clear_catalog_btn_, self.catalog_count_,
-            ]),
-            w.HBox([self.catalog_view_]),
+        filter_row = w.HBox(list(self.filters_.values()))
+        picker_row = w.HBox([self.seq_pick_, self.seq_text_])
+        catalogue_btns = w.HBox([self.add_one_btn_, self.add_filtered_btn_,
+                                 self.remove_one_btn_, self.clear_btn_])
+        top = w.VBox([filter_row, picker_row, catalogue_btns, self.cat_label_, self.cat_version_])
+
+        param_accordion = w.Accordion(children=[
+            w.HBox([p["acc_modes"], p["rotation_modes"], p["tof_modes"], p["thm_modes"]]),
+            w.VBox([w.HBox([p["motion_filter_mode"], p["use_dead_reckoning"],
+                            p["dead_reckoning_detrend"]]),
+                    w.HBox([p["kalman_process_noise"], p["kalman_measurement_noise"]])]),
+            w.VBox([w.HBox([p["compute_dt"], p["window_size"], p["interp_mode"]]),
+                    w.HBox([p["smooth_alpha"], p["clip_value"]]),
+                    w.HBox([p["maxlen"], p["padding_value"]])]),
+            w.VBox([w.HBox([p["imu_native_sampling_rate"], p["imu_target_sampling_rate"]]),
+                    w.HBox([p["rot_native_sampling_rate"], p["rot_target_sampling_rate"]]),
+                    w.HBox([p["tof_native_sampling_rate"], p["tof_target_sampling_rate"]]),
+                    w.HBox([p["thm_native_sampling_rate"], p["thm_target_sampling_rate"]]),
+                    p["resample_modalities"]]),
+            w.VBox([w.HBox([p["chunk_window_size"], p["chunk_stride"]]),
+                    p["frame_stats"], p["add_global_context"]]),
         ])
+        for i, t in enumerate(["Modes", "Motion filter / dead reckoning", "Cleaning",
+                               "Sampling rates & resampling", "Chunking / frame stats"]):
+            param_accordion.set_title(i, t)
 
-        core_extractor = w.VBox([
-            w.HBox([c["acc_modes"], c["rotation_modes"], c["tof_modes"], c["thm_modes"]]),
-            w.HBox([
-                c["motion_filter_mode"], c["use_dead_reckoning"],
-                c["dead_reckoning_detrend"], c["interp_mode"], c["compute_dt"],
-            ]),
-            w.HBox([c["smooth_alpha"], c["window_size"], c["clip_value"]]),
-            w.HBox([c["kalman_process_noise"], c["kalman_measurement_noise"]]),
-        ])
+        pvals_kw = {k: v for k, v in p.items()}
 
-        advanced_extractor = w.VBox([
-            w.HBox([
-                c["imu_native_sampling_rate"], c["imu_target_sampling_rate"],
-                c["rot_native_sampling_rate"], c["rot_target_sampling_rate"],
-            ]),
-            w.HBox([
-                c["tof_native_sampling_rate"], c["tof_target_sampling_rate"],
-                c["thm_native_sampling_rate"], c["thm_target_sampling_rate"],
-            ]),
-            w.HBox([c["resample_modalities"], c["maxlen"], c["add_global_context"], c["frame_stats"]]),
-        ])
-        extractor_accordion = w.Accordion(children=[advanced_extractor])
-        extractor_accordion.set_title(0, "Advanced SequenceExtractor params")
-
-        o1 = w.interactive_output(
-            self.update_raw,
-            {
-                "seq_id": self.seq_pick_, "seq_text": self.seq_text_,
-                "channels": c["channels"], "view_mode": c["view_mode"],
-            },
-        )
-        o2 = w.interactive_output(
-            self.update_features,
-            {"seq_id": self.seq_pick_, "seq_text": self.seq_text_,
-             "feature": c["feature"], **fx_kw},
-        )
-        o3 = w.interactive_output(
-            self.update_spectrum,
-            {"seq_id": self.seq_pick_, "seq_text": self.seq_text_,
-             "feature": c["feature"], "spec_mode": c["spec_mode"],
-             "detrend": c["detrend"], "logy": c["logy"], **fx_kw},
-        )
-        o4 = w.interactive_output(
-            self.update_cluster,
-            {"reduction": c["reduction"], "method": c["method"],
-             "n_clusters": c["n_clusters"], "eps": c["eps"],
-             "cluster_space": c["cluster_space"], "cluster_source": c["cluster_source"],
-             "max_seqs": c["max_seqs"], "color_by": c["color_by"], **fx_kw},
-        )
+        o_cat = w.interactive_output(self.update_catalogue,
+                                     {"cat_version": self.cat_version_, "channel": self.cat_channel_})
+        o_feat = w.interactive_output(self.update_features,
+                                      {"seq_id": self.seq_pick_, "seq_text": self.seq_text_,
+                                       "feature": self.feature_, **pvals_kw})
+        o_spec = w.interactive_output(self.update_spectrum,
+                                      {"seq_id": self.seq_pick_, "seq_text": self.seq_text_,
+                                       "axis": self.axis_, "spec_mode": self.spec_mode_,
+                                       "detrend": self.detrend_, "logy": self.logy_, **pvals_kw})
+        o_clus = w.interactive_output(self.update_cluster,
+                                      {"reduction": self.reduction_, "method": self.method_,
+                                       "n_clusters": self.n_clusters_, "eps": self.eps_,
+                                       "cluster_space": self.cluster_space_,
+                                       "population": self.population_, "max_seqs": self.max_seqs_,
+                                       "color_by": self.color_by_, "cat_version": self.cat_version_,
+                                       **pvals_kw})
 
         tabs = w.Tab(children=[
-            w.VBox([c["view_mode"], c["channels"], o1]),
-            w.VBox([core_extractor, extractor_accordion, c["feature"], o2]),
-            w.VBox([
-                core_extractor, extractor_accordion,
-                w.HBox([c["feature"], c["spec_mode"], c["detrend"], c["logy"]]), o3,
-            ]),
-            w.VBox([
-                core_extractor, extractor_accordion,
-                w.HBox([c["reduction"], c["method"], c["cluster_space"], c["cluster_source"]]),
-                w.HBox([c["n_clusters"], c["eps"], c["max_seqs"], c["color_by"]]), o4,
-            ]),
+            w.VBox([self.cat_channel_, o_cat]),
+            w.VBox([param_accordion, self.feature_, o_feat]),
+            w.VBox([param_accordion, w.HBox([self.axis_, self.spec_mode_, self.detrend_, self.logy_]),
+                    o_spec]),
+            w.VBox([param_accordion,
+                    w.HBox([self.population_, self.reduction_, self.method_, self.cluster_space_]),
+                    w.HBox([self.n_clusters_, self.eps_, self.max_seqs_, self.color_by_]),
+                    o_clus]),
         ])
-        for i, t in enumerate(["Sequence", "Features", "Spectrum", "Clusters"]):
+        for i, t in enumerate(["Catalogue", "Features", "Spectrum", "Clusters"]):
             tabs.set_title(i, t)
-        display(w.VBox([picker, tabs]))
+        display(w.VBox([top, tabs]))
