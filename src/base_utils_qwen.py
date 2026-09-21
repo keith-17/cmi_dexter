@@ -2438,3 +2438,339 @@ class CWTExtractor(HoneycombBase):
             return pd.DataFrame(index=df.index)
         
         return pd.concat(parts, axis=1)
+
+
+# ============================================================
+#  DATA AUGMENTATION FOR SENSOR TIME-SERIES
+#  Append this block to the end of base_utils_qwen.py
+# ============================================================
+
+from scipy.interpolate import CubicSpline
+from sklearn.base import BaseEstimator, TransformerMixin
+
+# ------------------------------------------------------------------ #
+#  Low-level augmentation functions (operate on np.ndarray (T, C))   #
+# ------------------------------------------------------------------ #
+
+def augment_jitter(
+    x: np.ndarray,
+    sigma: float = 0.03,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Add small per-sample uniform-ish jitter (Gaussian with tiny σ)."""
+    rng = rng or np.random.default_rng()
+    return x + rng.normal(loc=0.0, scale=sigma, size=x.shape)
+
+
+def augment_gaussian_noise(
+    x: np.ndarray,
+    std: float = 0.05,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Add Gaussian noise scaled relative to per-channel std."""
+    rng = rng or np.random.default_rng()
+    ch_std = np.nanstd(x, axis=0, keepdims=True)
+    ch_std = np.where(ch_std == 0, 1.0, ch_std)
+    return x + rng.normal(loc=0.0, scale=std * ch_std, size=x.shape)
+
+
+def augment_scaling(
+    x: np.ndarray,
+    sigma: float = 0.1,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Multiply entire sequence by a random scalar ~ N(1, σ)."""
+    rng = rng or np.random.default_rng()
+    factor = rng.normal(loc=1.0, scale=sigma)
+    return x * factor
+
+
+def augment_time_shift(
+    x: np.ndarray,
+    max_shift_frac: float = 0.1,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Shift sequence left/right, padding edges with boundary values."""
+    rng = rng or np.random.default_rng()
+    T = x.shape[0]
+    max_shift = max(1, int(T * max_shift_frac))
+    shift = rng.integers(-max_shift, max_shift + 1)
+    if shift == 0:
+        return x.copy()
+    out = np.empty_like(x)
+    if shift > 0:
+        out[:shift] = x[0]
+        out[shift:] = x[:-shift]
+    else:
+        out[shift:] = x[-1]
+        out[:shift] = x[-shift:]
+    return out
+
+
+def augment_crop_resize(
+    x: np.ndarray,
+    crop_frac_range: tuple[float, float] = (0.5, 0.9),
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Crop a random contiguous sub-sequence then resize back to T."""
+    rng = rng or np.random.default_rng()
+    T, C = x.shape
+    lo, hi = crop_frac_range
+    crop_frac = rng.uniform(lo, hi)
+    crop_len = max(2, int(T * crop_frac))
+    start = rng.integers(0, T - crop_len + 1)
+    cropped = x[start : start + crop_len]
+    # Resize via linear interpolation per channel
+    old_idx = np.linspace(0, 1, crop_len)
+    new_idx = np.linspace(0, 1, T)
+    out = np.empty_like(x)
+    for c in range(C):
+        out[:, c] = np.interp(new_idx, old_idx, cropped[:, c])
+    return out
+
+
+def augment_temporal_mask(
+    x: np.ndarray,
+    mask_frac: float = 0.1,
+    num_masks: int = 1,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Zero-out random contiguous temporal segments."""
+    rng = rng or np.random.default_rng()
+    T = x.shape[0]
+    mask_len = max(1, int(T * mask_frac))
+    out = x.copy()
+    for _ in range(num_masks):
+        start = rng.integers(0, max(1, T - mask_len))
+        out[start : start + mask_len] = 0.0
+    return out
+
+
+def augment_channel_dropout(
+    x: np.ndarray,
+    drop_prob: float = 0.1,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Zero-out individual channels with probability drop_prob."""
+    rng = rng or np.random.default_rng()
+    C = x.shape[1]
+    mask = rng.random(C) >= drop_prob          # True = keep
+    return x * mask[np.newaxis, :]
+
+
+def augment_sensor_dropout(
+    x: np.ndarray,
+    sensor_groups: dict[str, list[int]],
+    drop_prob: float = 0.3,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Zero-out entire sensor groups (acc / rot / tof / thm)."""
+    rng = rng or np.random.default_rng()
+    out = x.copy()
+    for _name, col_idx in sensor_groups.items():
+        if not col_idx:
+            continue
+        if rng.random() < drop_prob:
+            out[:, col_idx] = 0.0
+    return out
+
+
+def augment_magnitude_warp(
+    x: np.ndarray,
+    sigma: float = 0.2,
+    num_knots: int = 4,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Multiply signal by a smooth random curve (cubic spline through
+    random control points centred at 1.0)."""
+    rng = rng or np.random.default_rng()
+    T, C = x.shape
+    num_knots = max(2, min(num_knots, T))
+    knot_x = np.linspace(0, T - 1, num_knots)
+    knot_y = rng.normal(loc=1.0, scale=sigma, size=(num_knots, C))
+    cs = CubicSpline(knot_x, knot_y, extrapolate=True)
+    warp = cs(np.arange(T))
+    return x * warp
+
+
+# ------------------------------------------------------------------ #
+#  Registry mapping names → functions                                 #
+# ------------------------------------------------------------------ #
+
+_AUGMENTATION_REGISTRY: dict[str, callable] = {
+    "jitter":            augment_jitter,
+    "gaussian_noise":    augment_gaussian_noise,
+    "scaling":           augment_scaling,
+    "time_shift":        augment_time_shift,
+    "crop_resize":       augment_crop_resize,
+    "temporal_mask":     augment_temporal_mask,
+    "channel_dropout":   augment_channel_dropout,
+    "sensor_dropout":    augment_sensor_dropout,
+    "magnitude_warp":    augment_magnitude_warp,
+}
+
+ALL_AUGMENTATION_NAMES = tuple(_AUGMENTATION_REGISTRY.keys())
+
+# ------------------------------------------------------------------ #
+#  Default sensor-group column prefixes                               #
+# ------------------------------------------------------------------ #
+
+_SENSOR_PREFIXES: dict[str, tuple[str, ...]] = {
+    "acc":  ("acc_",),
+    "rot":  ("rot_",),
+    "tof":  ("tof_", "depth_"),
+    "thm":  ("thm_", "thermal_", "temp_"),
+}
+
+
+def _detect_sensor_groups(
+    columns: list[str],
+) -> dict[str, list[int]]:
+    """Map sensor name → list of integer column indices."""
+    groups: dict[str, list[int]] = {}
+    for sensor, prefixes in _SENSOR_PREFIXES.items():
+        idx = [
+            i for i, c in enumerate(columns)
+            if any(c.startswith(p) for p in prefixes)
+        ]
+        groups[sensor] = idx
+    return groups
+
+
+# ------------------------------------------------------------------ #
+#  Orchestrator class                                                 #
+# ------------------------------------------------------------------ #
+
+class SensorAugmentor(BaseEstimator, TransformerMixin):
+    """Per-sequence sensor augmentation for DataFrames.
+
+    Parameters
+    ----------
+    augmentations : list[str] | None
+        Subset of ALL_AUGMENTATION_NAMES.  ``None`` → use all.
+    prob : float
+        Per-sequence probability that *any* augmentation fires.
+    per_aug_prob : float
+        Conditional probability that each individual augmentation
+        is applied when the sequence is selected.
+    jitter_sigma, noise_std, scaling_sigma, … : float
+        Strength knobs forwarded to each augmentation function.
+    sequence_col, counter_col : str
+        Column names that identify sequences.
+    seed : int | None
+        Reproducibility seed.
+    """
+
+    def __init__(
+        self,
+        augmentations: list[str] | None = None,
+        prob: float = 0.5,
+        per_aug_prob: float = 0.5,
+        # --- strength knobs ---
+        jitter_sigma: float = 0.03,
+        noise_std: float = 0.05,
+        scaling_sigma: float = 0.1,
+        time_shift_frac: float = 0.1,
+        crop_frac_range: tuple[float, float] = (0.5, 0.9),
+        temporal_mask_frac: float = 0.1,
+        temporal_num_masks: int = 1,
+        channel_drop_prob: float = 0.1,
+        sensor_drop_prob: float = 0.3,
+        warp_sigma: float = 0.2,
+        warp_num_knots: int = 4,
+        # --- structural ---
+        sequence_col: str = "sequence_id",
+        counter_col: str = "sequence_counter",
+        seed: int | None = 42,
+    ):
+        self.augmentations = augmentations
+        self.prob = prob
+        self.per_aug_prob = per_aug_prob
+        self.jitter_sigma = jitter_sigma
+        self.noise_std = noise_std
+        self.scaling_sigma = scaling_sigma
+        self.time_shift_frac = time_shift_frac
+        self.crop_frac_range = crop_frac_range
+        self.temporal_mask_frac = temporal_mask_frac
+        self.temporal_num_masks = temporal_num_masks
+        self.channel_drop_prob = channel_drop_prob
+        self.sensor_drop_prob = sensor_drop_prob
+        self.warp_sigma = warp_sigma
+        self.warp_num_knots = warp_num_knots
+        self.sequence_col = sequence_col
+        self.counter_col = counter_col
+        self.seed = seed
+
+    # ---- sklearn interface ---------------------------------------- #
+
+    def fit(self, X, y=None):
+        self._rng = np.random.default_rng(self.seed)
+        self.aug_names_ = list(
+            self.augmentations
+            if self.augmentations is not None
+            else ALL_AUGMENTATION_NAMES
+        )
+        # Identify numeric sensor columns (everything that is not
+        # sequence_id, sequence_counter, or a known metadata col)
+        skip = {self.sequence_col, self.counter_col}
+        self.sensor_cols_ = [
+            c for c in X.columns
+            if c not in skip and np.issubdtype(X[c].dtype, np.number)
+        ]
+        self.sensor_groups_ = _detect_sensor_groups(self.sensor_cols_)
+        return self
+
+    def transform(self, X, y=None):
+        from sklearn.utils.validation import check_is_fitted
+        check_is_fitted(self, "sensor_cols_")
+
+        out = X.copy()
+        grouped = out.groupby(self.sequence_col, sort=False)
+
+        for seq_id, grp in grouped:
+            if self._rng.random() > self.prob:
+                continue  # skip this sequence entirely
+
+            idx = grp.index
+            vals = grp[self.sensor_cols_].to_numpy(dtype=float)
+
+            for aug_name in self.aug_names_:
+                if self._rng.random() > self.per_aug_prob:
+                    continue  # skip this particular augmentation
+
+                fn = _AUGMENTATION_REGISTRY[aug_name]
+                kwargs = self._build_kwargs(aug_name)
+                vals = fn(vals, rng=self._rng, **kwargs)
+
+            out.loc[idx, self.sensor_cols_] = vals
+
+        return out
+
+    # ---- helpers -------------------------------------------------- #
+
+    def _build_kwargs(self, name: str) -> dict:
+        """Map augmentation name → its specific keyword arguments."""
+        table = {
+            "jitter":          {"sigma": self.jitter_sigma},
+            "gaussian_noise":  {"std": self.noise_std},
+            "scaling":         {"sigma": self.scaling_sigma},
+            "time_shift":      {"max_shift_frac": self.time_shift_frac},
+            "crop_resize":     {"crop_frac_range": self.crop_frac_range},
+            "temporal_mask":   {
+                "mask_frac": self.temporal_mask_frac,
+                "num_masks": self.temporal_num_masks,
+            },
+            "channel_dropout": {"drop_prob": self.channel_drop_prob},
+            "sensor_dropout":  {
+                "sensor_groups": self.sensor_groups_,
+                "drop_prob": self.sensor_drop_prob,
+            },
+            "magnitude_warp":  {
+                "sigma": self.warp_sigma,
+                "num_knots": self.warp_num_knots,
+            },
+        }
+        return table.get(name, {})
+
+    def get_feature_names_out(self, input_features=None):
+        return np.array(self.sensor_cols_)
