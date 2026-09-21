@@ -21,6 +21,7 @@ This is designed so that:
 
 from __future__ import annotations
 
+import ast
 import json
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
@@ -2086,8 +2087,11 @@ class STFTExtractor(HoneycombBase):
             c for c in X.columns 
             if c.startswith("acc_") and not c.endswith(("_vel", "_disp", "_jerk", "_mag", "_dr_vel", "_dr_pos"))
         ]
+        self.nperseg = int(self.nperseg) if self.nperseg is not None else 32
         if self.noverlap is None:
-            self.noverlap = self.nperseg // 2
+            self.noverlap = max(0, self.nperseg // 2)
+        else:
+            self.noverlap = int(self.noverlap)
         return self
 
     def _compute_stft_features(self, signal: np.ndarray) -> Dict[str, np.ndarray]:
@@ -2097,9 +2101,16 @@ class STFTExtractor(HoneycombBase):
 
         signal = np.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0)
 
-        if len(signal) < self.nperseg:
+        nperseg = int(self.nperseg)
+        if nperseg <= 0:
+            nperseg = min(len(signal), 32) or 1
+        if len(signal) < nperseg:
             # Pad signal if too short
-            signal = np.pad(signal, (0, self.nperseg - len(signal)), mode='constant')
+            signal = np.pad(signal, (0, nperseg - len(signal)), mode='constant')
+
+        noverlap = int(self.noverlap) if self.noverlap is not None else max(0, nperseg // 2)
+        if noverlap >= nperseg:
+            noverlap = max(0, nperseg // 2)
 
         scipy_scaling = self.scaling.lower()
         if scipy_scaling == 'density':
@@ -2112,8 +2123,8 @@ class STFTExtractor(HoneycombBase):
             signal,
             fs=self.sampling_rate,
             window=self.window_type,
-            nperseg=self.nperseg,
-            noverlap=self.noverlap,
+            nperseg=nperseg,
+            noverlap=noverlap,
             nfft=None,
             detrend=self.detrend,
             return_onesided=True,
@@ -2507,6 +2518,31 @@ def augment_time_shift(
     return out
 
 
+def _normalize_crop_frac_range(value: tuple[float, float] | list[float] | str | np.ndarray | None) -> tuple[float, float]:
+    if value is None:
+        return (0.5, 0.9)
+    if isinstance(value, str):
+        try:
+            parsed = ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            parsed = value.strip("()[]")
+            parts = [p.strip() for p in parsed.split(",") if p.strip()]
+            if len(parts) != 2:
+                raise ValueError(f"Invalid crop_frac_range value: {value!r}")
+            parsed = tuple(float(p) for p in parts)
+        if isinstance(parsed, (tuple, list, np.ndarray)) and len(parsed) == 2:
+            return (float(parsed[0]), float(parsed[1]))
+        raise ValueError(f"Invalid crop_frac_range value: {value!r}")
+    if isinstance(value, np.ndarray):
+        arr = value.tolist()
+        if len(arr) == 2:
+            return (float(arr[0]), float(arr[1]))
+        raise ValueError(f"Invalid crop_frac_range value: {value!r}")
+    if isinstance(value, (tuple, list)) and len(value) == 2:
+        return (float(value[0]), float(value[1]))
+    raise ValueError(f"Invalid crop_frac_range value: {value!r}")
+
+
 def augment_crop_resize(
     x: np.ndarray,
     crop_frac_range: tuple[float, float] = (0.5, 0.9),
@@ -2514,19 +2550,30 @@ def augment_crop_resize(
 ) -> np.ndarray:
     """Crop a random contiguous sub-sequence then resize back to T."""
     rng = rng or np.random.default_rng()
+    crop_frac_range = _normalize_crop_frac_range(crop_frac_range)
+    x = np.asarray(x, dtype=float)
+    squeeze = False
+    if x.ndim == 1:
+        x = x[:, None]
+        squeeze = True
+    elif x.ndim > 2:
+        x = x.reshape(x.shape[0], -1)
+
     T, C = x.shape
     lo, hi = crop_frac_range
     crop_frac = rng.uniform(lo, hi)
     crop_len = max(2, int(T * crop_frac))
+    crop_len = min(crop_len, T)
     start = rng.integers(0, T - crop_len + 1)
     cropped = x[start : start + crop_len]
-    # Resize via linear interpolation per channel
+
     old_idx = np.linspace(0, 1, crop_len)
     new_idx = np.linspace(0, 1, T)
     out = np.empty_like(x)
     for c in range(C):
         out[:, c] = np.interp(new_idx, old_idx, cropped[:, c])
-    return out
+
+    return out[:, 0] if squeeze else out
 
 
 def augment_temporal_mask(
@@ -2671,7 +2718,7 @@ class SensorAugmentor(BaseEstimator, TransformerMixin):
         noise_std: float = 0.05,
         scaling_sigma: float = 0.1,
         time_shift_frac: float = 0.1,
-        crop_frac_range: tuple[float, float] = (0.5, 0.9),
+        crop_frac_range: tuple[float, float] | str = (0.5, 0.9),
         temporal_mask_frac: float = 0.1,
         temporal_num_masks: int = 1,
         channel_drop_prob: float = 0.1,
@@ -2748,14 +2795,19 @@ class SensorAugmentor(BaseEstimator, TransformerMixin):
 
     # ---- helpers -------------------------------------------------- #
 
+    @staticmethod
+    def _coerce_crop_frac_range(value: tuple[float, float] | list[float] | str | np.ndarray | None) -> tuple[float, float]:
+        return _normalize_crop_frac_range(value)
+
     def _build_kwargs(self, name: str) -> dict:
         """Map augmentation name → its specific keyword arguments."""
+        crop_range = self._coerce_crop_frac_range(self.crop_frac_range)
         table = {
             "jitter":          {"sigma": self.jitter_sigma},
             "gaussian_noise":  {"std": self.noise_std},
             "scaling":         {"sigma": self.scaling_sigma},
             "time_shift":      {"max_shift_frac": self.time_shift_frac},
-            "crop_resize":     {"crop_frac_range": self.crop_frac_range},
+            "crop_resize":     {"crop_frac_range": crop_range},
             "temporal_mask":   {
                 "mask_frac": self.temporal_mask_frac,
                 "num_masks": self.temporal_num_masks,
