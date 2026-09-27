@@ -1832,12 +1832,49 @@ def competition_score(
 
 def make_competition_scorer(target_col: str = "bfrb"):
     """
-    Sklearn CV scorer aligned with row-level y and sequence-level predictions.
+    Sklearn CV scorer aligned with sequence-level predictions.
+
+    For bfrb, use the competition score. For non-bfrb tasks such as orientation or
+    gesture_action, fall back to the standard macro-F1 score across the target labels.
     """
 
     seq_col = "sequence_id"
 
     def _score(y_true, y_pred):
+        if target_col == "bfrb":
+            if isinstance(y_true, pd.DataFrame):
+                if seq_col not in y_true.columns:
+                    if y_true.index.name == seq_col:
+                        y_true = y_true.reset_index()
+                    else:
+                        raise ValueError("y_true must contain sequence_id.")
+
+                y_seq = y_true.drop_duplicates(seq_col).sort_values(seq_col)
+
+                if "is_target" in y_seq.columns:
+                    y_true_binary = y_seq["is_target"].astype(int).values
+                else:
+                    y_true_binary = (y_seq[target_col] != "non_bfrb").astype(int)
+
+                y_true_gesture = y_seq[target_col].values
+
+                if isinstance(y_pred, pd.Series) and y_pred.index.name == seq_col:
+                    y_pred = y_pred.reindex(y_seq[seq_col]).to_numpy()
+                else:
+                    y_pred = np.asarray(y_pred)
+
+            else:
+                y_true_gesture = np.asarray(y_true)
+                y_true_binary = (y_true_gesture != "non_bfrb").astype(int)
+                y_pred = np.asarray(y_pred)
+
+            return competition_score(
+                y_true_gesture,
+                y_pred,
+                y_true_binary=y_true_binary,
+                target_only_macro=True,
+            )
+
         if isinstance(y_true, pd.DataFrame):
             if seq_col not in y_true.columns:
                 if y_true.index.name == seq_col:
@@ -1845,34 +1882,19 @@ def make_competition_scorer(target_col: str = "bfrb"):
                 else:
                     raise ValueError("y_true must contain sequence_id.")
 
-            y_seq = (
-                y_true.drop_duplicates(seq_col)
-                .sort_values(seq_col)
-            )
-
-            if "is_target" in y_seq.columns:
-                y_true_binary = y_seq["is_target"].astype(int).values
-            else:
-                y_true_binary = (y_seq[target_col] != "non_bfrb").astype(int)
-
-            y_true_gesture = y_seq[target_col].values
+            y_seq = y_true.drop_duplicates(seq_col).sort_values(seq_col)
+            y_true_vals = y_seq[target_col].astype(str).values
 
             if isinstance(y_pred, pd.Series) and y_pred.index.name == seq_col:
-                y_pred = y_pred.reindex(y_seq[seq_col]).to_numpy()
+                y_pred = y_pred.reindex(y_seq[seq_col]).astype(str).to_numpy()
             else:
-                y_pred = np.asarray(y_pred)
+                y_pred = np.asarray(y_pred, dtype=str)
 
-        else:
-            y_true_gesture = np.asarray(y_true)
-            y_true_binary = (y_true_gesture != "non_bfrb").astype(int)
-            y_pred = np.asarray(y_pred)
+            return f1_score(y_true_vals, y_pred, average="macro", zero_division=0)
 
-        return competition_score(
-            y_true_gesture,
-            y_pred,
-            y_true_binary=y_true_binary,
-            target_only_macro=True,
-        )
+        y_true_vals = np.asarray(y_true, dtype=str)
+        y_pred = np.asarray(y_pred, dtype=str)
+        return f1_score(y_true_vals, y_pred, average="macro", zero_division=0)
 
     return make_scorer(_score)
 
@@ -1889,11 +1911,9 @@ def evaluate_holdout(
     """
     Final holdout evaluation.
 
-    Returns dict with:
-    - binary_f1
-    - gesture_f1
-    - competition_score
-    - results_df
+    For the bfrb task, keep the competition score used in the Kaggle challenge.
+    For all other tasks such as orientation and gesture_action, use the standard
+    macro-F1 score across the target labels.
     """
 
     seq_col = "sequence_id"
@@ -1917,67 +1937,98 @@ def evaluate_holdout(
     else:
         y_pred = np.asarray(y_pred)
 
-    if "is_target" in y_test_seq.columns:
-        y_true_binary = y_test_seq["is_target"].astype(int).values
-    else:
-        y_true_binary = (y_test_seq[target_col] != "non_bfrb").astype(int)
+    if target_col == "bfrb":
+        if "is_target" in y_test_seq.columns:
+            y_true_binary = y_test_seq["is_target"].astype(int).values
+        else:
+            y_true_binary = (y_test_seq[target_col] != "non_bfrb").astype(int)
 
-    y_pred_binary = (y_pred != "non_bfrb").astype(int)
+        y_pred_binary = (y_pred != "non_bfrb").astype(int)
 
-    binary_f1 = f1_score(
-        y_true_binary,
-        y_pred_binary,
-        zero_division=0,
-    )
+        binary_f1 = f1_score(y_true_binary, y_pred_binary, zero_division=0)
 
-    target_mask = y_true_binary == 1
+        target_mask = y_true_binary == 1
 
-    if target_mask.sum() > 0:
-        gesture_f1 = f1_score(
-            y_test_seq.loc[target_mask, target_col].values,
-            y_pred[target_mask],
-            average="macro",
-            zero_division=0,
+        if target_mask.sum() > 0:
+            gesture_f1 = f1_score(
+                y_test_seq.loc[target_mask, target_col].values,
+                y_pred[target_mask],
+                average="macro",
+                zero_division=0,
+            )
+        else:
+            gesture_f1 = 0.0
+
+        comp_score = (binary_f1 + gesture_f1) / 2.0
+        metric_name = "competition_score"
+        metric_value = comp_score
+        summary_text = "COMPETITION SCORE"
+        summary_prefix = "Binary F1 (non_bfrb vs bfrb)"
+
+        if verbose:
+            print("\n" + "=" * 60)
+            print("FINAL EVALUATION")
+            print("=" * 60)
+            print(f"{summary_prefix}: {binary_f1:.4f}")
+            print(f"BFRB Gesture Macro F1: {gesture_f1:.4f}")
+            print(f"{summary_text}: {metric_value:.4f}")
+
+            if target_mask.sum() > 0:
+                print("\n" + "-" * 40)
+                print("BFRB Gesture Classification Report")
+                print("-" * 40)
+                print(
+                    classification_report(
+                        y_test_seq.loc[target_mask, target_col].values,
+                        y_pred[target_mask],
+                        zero_division=0,
+                    )
+                )
+
+        results_df = pd.DataFrame(
+            {
+                "sequence_id": y_test_seq[seq_col].values,
+                "is_target_true": y_true_binary,
+                "is_target_pred": y_pred_binary,
+                f"{target_col}_true": y_test_seq[target_col].values,
+                f"{target_col}_pred": y_pred,
+            }
         )
-    else:
-        gesture_f1 = 0.0
 
-    comp_score = (binary_f1 + gesture_f1) / 2.0
+        return {
+            "binary_f1": binary_f1,
+            "gesture_f1": gesture_f1,
+            "competition_score": comp_score,
+            "results_df": results_df,
+        }
+
+    y_true_values = y_test_seq[target_col].astype(str).values
+    y_pred_values = np.asarray(y_pred, dtype=str)
+
+    macro_f1 = f1_score(y_true_values, y_pred_values, average="macro", zero_division=0)
 
     if verbose:
         print("\n" + "=" * 60)
         print("FINAL EVALUATION")
         print("=" * 60)
-        print(f"Binary F1 (non_bfrb vs bfrb): {binary_f1:.4f}")
-        print(f"BFRB Gesture Macro F1: {gesture_f1:.4f}")
-        print(f"COMPETITION SCORE: {comp_score:.4f}")
-
-        if target_mask.sum() > 0:
-            print("\n" + "-" * 40)
-            print("BFRB Gesture Classification Report")
-            print("-" * 40)
-            print(
-                classification_report(
-                    y_test_seq.loc[target_mask, target_col].values,
-                    y_pred[target_mask],
-                    zero_division=0,
-                )
-            )
+        print(f"Target: {target_col}")
+        print(f"Macro F1: {macro_f1:.4f}")
+        print("\n" + "-" * 40)
+        print("Classification Report")
+        print("-" * 40)
+        print(classification_report(y_true_values, y_pred_values, zero_division=0))
 
     results_df = pd.DataFrame(
         {
             "sequence_id": y_test_seq[seq_col].values,
-            "is_target_true": y_true_binary,
-            "is_target_pred": y_pred_binary,
-            f"{target_col}_true": y_test_seq[target_col].values,
-            f"{target_col}_pred": y_pred,
+            f"{target_col}_true": y_true_values,
+            f"{target_col}_pred": y_pred_values,
         }
     )
 
     return {
-        "binary_f1": binary_f1,
-        "gesture_f1": gesture_f1,
-        "competition_score": comp_score,
+        "macro_f1": macro_f1,
+        "competition_score": macro_f1,
         "results_df": results_df,
     }
 
