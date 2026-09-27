@@ -162,6 +162,50 @@ class HoneycombBase(BaseEstimator, TransformerMixin):
         ]
 
 
+class ProblematicSequenceFilter(HoneycombBase):
+    """Identify sequences with too many highly-skewed sensor channels.
+
+    The thresholds are estimator parameters on purpose: they can be searched by
+    ``GridSearchCV``/``BayesSearchCV`` without notebook-side preprocessing.
+    """
+
+    def __init__(
+        self,
+        ideal_skew_threshold: float = 1.35,
+        problematic_features_threshold: int = 6,
+        feature_cols: Optional[List[str]] = None,
+        sequence_col: str = "sequence_id",
+    ):
+        self.ideal_skew_threshold = ideal_skew_threshold
+        self.problematic_features_threshold = problematic_features_threshold
+        self.feature_cols = feature_cols
+        self.sequence_col = sequence_col
+
+    def fit(self, X: pd.DataFrame, y=None):
+        if self.sequence_col not in X.columns:
+            raise ValueError(f"ProblematicSequenceFilter requires '{self.sequence_col}'.")
+        default = ["acc_x", "acc_y", "acc_z", "rot_x", "rot_y", "rot_w", "rot_z"]
+        requested = default if self.feature_cols is None else list(self.feature_cols)
+        self.feature_cols_ = [col for col in requested if col in X.columns]
+        if not self.feature_cols_:
+            self.problematic_sequence_ids_ = pd.Index([], name=self.sequence_col)
+            return self
+        skew = X.groupby(self.sequence_col, sort=False)[self.feature_cols_].skew().abs()
+        count = (skew > float(self.ideal_skew_threshold)).sum(axis=1)
+        self.problematic_sequence_ids_ = skew.index[
+            count >= int(self.problematic_features_threshold)
+        ]
+        return self
+
+    def problematic_mask(self, X: pd.DataFrame) -> pd.Series:
+        check_is_fitted(self, ["problematic_sequence_ids_"])
+        return X[self.sequence_col].isin(self.problematic_sequence_ids_)
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Remove only IDs flagged while fitting (never re-evaluates validation data)."""
+        return X.loc[~self.problematic_mask(X)].copy()
+
+
 # ---------------------------------------------------------------------------
 # Signal cleaning
 # ---------------------------------------------------------------------------
@@ -920,6 +964,12 @@ class SequenceExtractor(HoneycombBase):
         cwt_max_scale: int = 128,
         cwt_n_scales: int = 32,
         cwt_use_log_scale: bool = True,
+        stft_configs: Optional[List[Dict[str, Any]]] = None,
+        cwt_configs: Optional[List[Dict[str, Any]]] = None,
+        filter_problematic_sequences: bool = False,
+        ideal_skew_threshold: float = 1.35,
+        problematic_features_threshold: int = 6,
+        problematic_feature_cols: Optional[List[str]] = None,
     ):
         self.acc_modes = acc_modes
         self.rotation_modes = rotation_modes
@@ -964,6 +1014,12 @@ class SequenceExtractor(HoneycombBase):
         self.cwt_max_scale = cwt_max_scale
         self.cwt_n_scales = cwt_n_scales
         self.cwt_use_log_scale = cwt_use_log_scale
+        self.stft_configs = stft_configs
+        self.cwt_configs = cwt_configs
+        self.filter_problematic_sequences = filter_problematic_sequences
+        self.ideal_skew_threshold = ideal_skew_threshold
+        self.problematic_features_threshold = problematic_features_threshold
+        self.problematic_feature_cols = problematic_feature_cols
 
         self.cleaner = SignalCleaner(
             native_sampling_rate=self.imu_native_sampling_rate,
@@ -1007,26 +1063,40 @@ class SequenceExtractor(HoneycombBase):
         )
 
 
-        self.stft_extractor = STFTExtractor(
-            nperseg=self.stft_nperseg,
-            noverlap=self.stft_noverlap,
-            window_type=self.stft_window_type,
-            use_log_scale=self.stft_use_log_scale,
-            sampling_rate=self.imu_native_sampling_rate,
-            sequence_col=self.sequence_col,
-        )
-        
-        self.cwt_extractor = CWTExtractor(
-            wavelet=self.cwt_wavelet,
-            max_scale=self.cwt_max_scale,
-            n_scales=self.cwt_n_scales,
-            use_log_scale=self.cwt_use_log_scale,
-            sampling_rate=self.imu_native_sampling_rate,
-            sequence_col=self.sequence_col,
-        )
+        self._build_time_frequency_extractors()
         
 
     # ----------------------------- helpers -----------------------------
+
+    def _build_time_frequency_extractors(self) -> None:
+        """Build one or many named STFT/CWT extractors from search-safe configs."""
+        stft_defaults = dict(nperseg=self.stft_nperseg, noverlap=self.stft_noverlap,
+            window_type=self.stft_window_type, use_log_scale=self.stft_use_log_scale,
+            sampling_rate=self.imu_native_sampling_rate, sequence_col=self.sequence_col)
+        cwt_defaults = dict(wavelet=self.cwt_wavelet, max_scale=self.cwt_max_scale,
+            n_scales=self.cwt_n_scales, use_log_scale=self.cwt_use_log_scale,
+            sampling_rate=self.imu_native_sampling_rate, sequence_col=self.sequence_col)
+        stft_configs = self.stft_configs or [{}]
+        cwt_configs = self.cwt_configs or [{}]
+        # ``prepare_bayesian_space`` serializes list/dict categories. Accepting
+        # that representation keeps stacked configs usable in BayesSearchCV.
+        if isinstance(stft_configs, str):
+            stft_configs = json.loads(stft_configs)
+        if isinstance(cwt_configs, str):
+            cwt_configs = json.loads(cwt_configs)
+        self.stft_extractors = []
+        self.cwt_extractors = []
+        for i, config in enumerate(stft_configs):
+            config = dict(config)
+            name = config.pop("name", f"stft{i}")
+            self.stft_extractors.append(STFTExtractor(**(stft_defaults | config), feature_prefix=name))
+        for i, config in enumerate(cwt_configs):
+            config = dict(config)
+            name = config.pop("name", f"cwt{i}")
+            self.cwt_extractors.append(CWTExtractor(**(cwt_defaults | config), feature_prefix=name))
+        # Backwards-compatible public handles.
+        self.stft_extractor = self.stft_extractors[0]
+        self.cwt_extractor = self.cwt_extractors[0]
 
     def _non_feature_cols(self) -> List[str]:
         cols = {self.sequence_col, self.counter_col, "dt", "mask"}
@@ -1152,7 +1222,7 @@ class SequenceExtractor(HoneycombBase):
     def _combine_feature_outputs(self, processed: pd.DataFrame, add_context: bool = False) -> pd.DataFrame:
         outs = []
 
-        for est in (self.imu, self.rotation, self.tof, self.thermo, self.stft_extractor, self.cwt_extractor):
+        for est in (self.imu, self.rotation, self.tof, self.thermo, *self.stft_extractors, *self.cwt_extractors):
             out = est.transform(processed)
             if out is not None and not out.empty:
                 outs.append(out)
@@ -1198,6 +1268,12 @@ class SequenceExtractor(HoneycombBase):
         return out
 
     def _preprocess_features(self, X: pd.DataFrame) -> pd.DataFrame:
+        # The fitted list contains training IDs only, so held-out/test sequences
+        # are retained while a training transform remains label-aligned.
+        if self.filter_problematic_sequences:
+            X = self.problematic_filter_.transform(X)
+            if X.empty:
+                raise InvalidExtractorParams("Problematic-sequence filtering removed every input row.")
         cleaned = self.cleaner.transform(X)
         filtered = self.motion_filter.transform(cleaned)
         processed = self._maybe_resample(filtered)
@@ -1286,7 +1362,18 @@ class SequenceExtractor(HoneycombBase):
             sequence_col=self.sequence_col,
         )
 
-        cleaned = self.cleaner.fit_transform(X)
+        self._build_time_frequency_extractors()
+        self.problematic_filter_ = ProblematicSequenceFilter(
+            ideal_skew_threshold=self.ideal_skew_threshold,
+            problematic_features_threshold=self.problematic_features_threshold,
+            feature_cols=self.problematic_feature_cols,
+            sequence_col=self.sequence_col,
+        ).fit(X)
+        X_fit = self.problematic_filter_.transform(X) if self.filter_problematic_sequences else X
+        if X_fit.empty:
+            raise InvalidExtractorParams("Problematic-sequence filtering removed every training row.")
+
+        cleaned = self.cleaner.fit_transform(X_fit)
         filtered = self.motion_filter.fit_transform(cleaned)
         processed = self._maybe_resample(filtered)
 
@@ -1294,8 +1381,8 @@ class SequenceExtractor(HoneycombBase):
         self.rotation.fit(processed)
         self.tof.fit(processed)
         self.thermo.fit(processed)
-        self.stft_extractor.fit(processed)
-        self.cwt_extractor.fit(processed)
+        for extractor in (*self.stft_extractors, *self.cwt_extractors):
+            extractor.fit(processed)
 
         combined = self._combine_feature_outputs(processed, add_context=False)
 
@@ -1723,6 +1810,10 @@ class RandomForestSequenceClassifier(BaseEstimator, ClassifierMixin):
             y_seq = yy.drop_duplicates(seq_col).sort_values(seq_col)
 
             if isinstance(preds, pd.Series):
+                # A training transform may intentionally omit problematic IDs.
+                # Score only the sequence IDs for which the extractor emitted a
+                # prediction; held-out IDs are never in that fitted omission set.
+                y_seq = y_seq[y_seq[seq_col].isin(preds.index)]
                 preds_aligned = preds.reindex(y_seq[seq_col]).to_numpy()
             else:
                 preds_aligned = np.asarray(preds)
@@ -2116,6 +2207,8 @@ class STFTExtractor(HoneycombBase):
         frequency_bands: Optional[Dict[str, Tuple[float, float]]] = None,
         sampling_rate: int = 20,
         sequence_col: str = "sequence_id",
+        feature_prefix: str = "stft0",
+        signal_columns: Optional[List[str]] = None,
     ):
         self.acc_modes = acc_modes
         self.nperseg = nperseg
@@ -2132,12 +2225,15 @@ class STFTExtractor(HoneycombBase):
         }
         self.sampling_rate = sampling_rate
         self.sequence_col = sequence_col
+        self.feature_prefix = feature_prefix
+        self.signal_columns = signal_columns
 
     def fit(self, X: pd.DataFrame, y=None):
-        self.acc_cols_ = [
+        candidates = [
             c for c in X.columns 
             if c.startswith("acc_") and not c.endswith(("_vel", "_disp", "_jerk", "_mag", "_dr_vel", "_dr_pos"))
         ]
+        self.acc_cols_ = candidates if self.signal_columns is None else [c for c in self.signal_columns if c in X.columns]
         self.nperseg = int(self.nperseg) if self.nperseg is not None else 32
         if self.noverlap is None:
             self.noverlap = max(0, self.nperseg // 2)
@@ -2282,10 +2378,10 @@ class STFTExtractor(HoneycombBase):
             
             for feat_name, values in feat_dict.items():
                 seq_to_val = dict(zip(unique_seqs, values))
-                df[f"{col}_{feat_name}"] = [seq_to_val[sid] for sid in seq_ids]
+                df[f"{col}_{self.feature_prefix}_{feat_name}"] = [seq_to_val[sid] for sid in seq_ids]
             
             # Add column-specific features to parts
-            feat_cols = [f"{col}_{k}" for k in feat_dict.keys()]
+            feat_cols = [f"{col}_{self.feature_prefix}_{k}" for k in feat_dict.keys()]
             parts.append(df[feat_cols])
         
         if not parts:
@@ -2314,6 +2410,8 @@ class CWTExtractor(HoneycombBase):
         use_log_scale: bool = True,
         sampling_rate: int = 20,
         sequence_col: str = "sequence_id",
+        feature_prefix: str = "cwt0",
+        signal_columns: Optional[List[str]] = None,
     ):
         self.acc_modes = acc_modes
         self.wavelet = wavelet
@@ -2323,12 +2421,15 @@ class CWTExtractor(HoneycombBase):
         self.use_log_scale = use_log_scale
         self.sampling_rate = sampling_rate
         self.sequence_col = sequence_col
+        self.feature_prefix = feature_prefix
+        self.signal_columns = signal_columns
 
     def fit(self, X: pd.DataFrame, y=None):
-        self.acc_cols_ = [
+        candidates = [
             c for c in X.columns 
             if c.startswith("acc_") and not c.endswith(("_vel", "_disp", "_jerk", "_mag", "_dr_vel", "_dr_pos"))
         ]
+        self.acc_cols_ = candidates if self.signal_columns is None else [c for c in self.signal_columns if c in X.columns]
         
         # Generate scales if not provided
         if self.widths is None:
@@ -2491,9 +2592,9 @@ class CWTExtractor(HoneycombBase):
             
             for feat_name, values in feat_dict.items():
                 seq_to_val = dict(zip(unique_seqs, values))
-                df[f"{col}_{feat_name}"] = [seq_to_val[sid] for sid in seq_ids]
+                df[f"{col}_{self.feature_prefix}_{feat_name}"] = [seq_to_val[sid] for sid in seq_ids]
             
-            feat_cols = [f"{col}_{k}" for k in feat_dict.keys()]
+            feat_cols = [f"{col}_{self.feature_prefix}_{k}" for k in feat_dict.keys()]
             parts.append(df[feat_cols])
         
         if not parts:
