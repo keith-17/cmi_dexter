@@ -908,7 +908,36 @@ class ThermoExtractor(HoneycombBase):
 # ---------------------------------------------------------------------------
 
 
-_UNSET = object()
+class _UnsetType:
+    """Sentinel that survives copy/deepcopy/sklearn cloning.
+
+    A bare ``object()`` is not clone-safe: sklearn's ``_clone_parametrized``
+    deepcopies constructor parameters, and ``copy.deepcopy(object())``
+    returns a brand new instance, so the identity check
+    ``stft_configs is _UNSET`` inside ``__init__`` would be False on the
+    cloned estimator and the sentinel would leak through as a non-iterable.
+    Making the sentinel a singleton that returns itself from
+    ``__deepcopy__`` / ``__copy__`` keeps the identity check valid.
+    """
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __repr__(self):
+        return "UNSET"
+
+
+_UNSET = _UnsetType()
 
 
 class SequenceExtractor(HoneycombBase):
@@ -2181,31 +2210,34 @@ def prepare_multitask_param_space(param_space: Dict[str, Any], search_mode: str)
 def prepare_bayesian_space(param_space: Dict[str, Any]) -> Dict[str, Any]:
     """
     Converts lists and complex Categorical values into skopt-compatible spaces.
+    Automatically JSON-encodes any unhashable elements (dicts, lists, tuples)
+    so that skopt's Categorical encoder doesn't crash.
     """
-
     if Categorical is None:
         return param_space
-
     out = {}
-
     for key, space in param_space.items():
         if isinstance(space, Categorical):
             new_cats = []
-
             for cat in space.categories:
-                if isinstance(cat, (tuple, list, dict)):
+                if isinstance(cat, (tuple, list, dict, set)):
                     new_cats.append(json.dumps(cat, sort_keys=True))
                 else:
                     new_cats.append(cat)
-
             out[key] = Categorical(new_cats)
-
+            
         elif isinstance(space, list):
-            out[key] = Categorical(space)
-
+            # FIX: Check for unhashable types inside the list and JSON-encode them
+            new_cats = []
+            for cat in space:
+                if isinstance(cat, (tuple, list, dict, set)):
+                    new_cats.append(json.dumps(cat, sort_keys=True))
+                else:
+                    new_cats.append(cat)
+            out[key] = Categorical(new_cats)
+            
         else:
             out[key] = space
-
     return out
 
 

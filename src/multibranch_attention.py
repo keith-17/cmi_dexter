@@ -254,6 +254,7 @@ def build_multibranch_model(
     branch_filters = _json_maybe(branch_filters) or DEFAULT_BRANCH_FILTERS
     branch_kernel_sizes = _json_maybe(branch_kernel_sizes) or DEFAULT_BRANCH_KERNEL_SIZES
     branch_pool_sizes = _json_maybe(branch_pool_sizes) or DEFAULT_BRANCH_POOL_SIZES
+    branch_num_conv_layers = _json_maybe(branch_num_conv_layers)
     if isinstance(branch_num_conv_layers, dict):
         branch_num_conv_layers = {
             str(k): max(1, int(v)) for k, v in branch_num_conv_layers.items()
