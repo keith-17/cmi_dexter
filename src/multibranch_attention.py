@@ -79,13 +79,31 @@ except Exception:  # pragma: no cover - exercised only when TF is missing
 # Branch bookkeeping
 # ---------------------------------------------------------------------------
 
-BRANCH_ORDER = ["acc", "rotation", "tof", "thermo", "stft", "cwt", "misc"]
-TIME_SERIES_BRANCHES = {"acc", "rotation", "tof", "thermo", "misc"}
+BRANCH_ORDER = ["acc", "rotation", "tof", "thermo", "stft", "cwt"]
+TIME_SERIES_BRANCHES = {"acc", "rotation", "tof", "thermo"}
 STATIC_BRANCHES = {"stft", "cwt"}
 
-DEFAULT_BRANCH_FILTERS = {"acc": 64, "rotation": 64, "tof": 32, "thermo": 32, "misc": 32}
-DEFAULT_BRANCH_KERNEL_SIZES = {"acc": 5, "rotation": 5, "tof": 3, "thermo": 3, "misc": 3}
-DEFAULT_BRANCH_POOL_SIZES = {"acc": 2, "rotation": 2, "tof": 2, "thermo": 2, "misc": 2}
+DEFAULT_BRANCH_FILTERS = {"acc": 64, "rotation": 64, "tof": 32, "thermo": 32, "stft": 32, "cwt": 32}
+DEFAULT_BRANCH_KERNEL_SIZES = {"acc": 5, "rotation": 5, "tof": 3, "thermo": 3, "stft": 3, "cwt": 3}
+DEFAULT_BRANCH_POOL_SIZES = {"acc": 2, "rotation": 2, "tof": 2, "thermo": 2, "stft": 2, "cwt": 2}
+
+
+def _attention_pool_over_time(name: str, x):
+    """Attention pooling over the temporal axis for a branch.
+
+    The Kaggle solution pools over each modality's sequence with an attention
+    gate before concatenation; this keeps the branch’s temporal information
+    while reducing the time dimension to a single embedding vector.
+    """
+    attention_logits = layers.Dense(1, activation="tanh", name=f"{name}_attention_score")(x)
+    attention_logits = layers.Reshape((-1,), name=f"{name}_attention_flat")(attention_logits)
+    attention_weights = layers.Softmax(name=f"{name}_attention_weights")(attention_logits)
+    attention_weights = layers.Reshape((-1, 1), name=f"{name}_attention_reshape")(attention_weights)
+    pooled = layers.Multiply(name=f"{name}_attention_pool")([x, attention_weights])
+    return layers.Lambda(
+        lambda t: tf.reduce_sum(t, axis=1),
+        name=f"{name}_attention_sum",
+    )(pooled)
 
 
 def _json_maybe(value: Any) -> Any:
@@ -131,9 +149,9 @@ def group_feature_names(
     appears as an infix regardless of which raw sensor column produced them
     (e.g. ``"acc_x_stft0_stft_mean_power"``), so they are never miscounted as
     accelerometer features just because the name starts with ``"acc_"``.
-    Everything left over is grouped by its native sensor-column prefix; any
-    column that matches none of the known prefixes is kept in a catch-all
-    ``"misc"`` branch so no engineered feature is silently dropped.
+    Everything else is grouped by its native sensor-column prefix. Any feature
+    that still does not match the known modal prefixes is treated as a hard
+    error so nothing is silently dropped into a ``misc`` bucket.
     """
 
     groups: Dict[str, List[int]] = {name: [] for name in BRANCH_ORDER}
@@ -157,7 +175,10 @@ def group_feature_names(
         elif name.startswith("thm_"):
             groups["thermo"].append(idx)
         else:
-            groups["misc"].append(idx)
+            raise ValueError(
+                "Unmapped feature name while building branches: "
+                f"{name!r}. Update the branch prefixes to account for every feature."
+            )
 
     return {name: idxs for name, idxs in groups.items() if idxs}
 
@@ -197,7 +218,8 @@ def build_multibranch_model(
     branch_filters: Optional[Dict[str, int]] = None,
     branch_kernel_sizes: Optional[Dict[str, int]] = None,
     branch_pool_sizes: Optional[Dict[str, int]] = None,
-    branch_num_conv_layers: int = 2,
+    branch_num_conv_layers: Any = 2,
+    branch_filter_mode: str = "custom",
     branch_dense_units: int = 64,
     static_branch_units: int = 32,
     dense_units: int = 128,
@@ -211,13 +233,13 @@ def build_multibranch_model(
     Build a modality-specific multi-branch Keras classifier.
 
     Each key of ``time_series_shapes`` becomes its own ``Input`` followed by
-    a small Conv1D stack (depth ``branch_num_conv_layers``, filters/kernel/
-    pool taken from the matching entry of ``branch_filters`` /
-    ``branch_kernel_sizes`` / ``branch_pool_sizes``, doubling the filter
-    count each additional layer) and a ``GlobalAveragePooling1D`` head. Each
-    key of ``static_shapes`` becomes its own ``Input`` followed by a small
-    two-layer Dense stack. Every branch embedding is concatenated and passed
-    through a shared classification head.
+    a small Conv1D stack. The branch depth can be set globally or per-modality
+    via ``branch_num_conv_layers``; the common default is a small shallow stack,
+    while the custom mode lets you set exact per-branch schedules, such as
+    ``{'thermo': 1, 'acc': 3}`` or ``{'acc': [32, 64, 128], 'thermo': [32]}``.
+    Each key of ``static_shapes`` becomes its own ``Input`` followed by a small
+    Dense stack. Every branch embedding is concatenated and passed through a
+    shared classification head.
     """
 
     if not TENSORFLOW_AVAILABLE:
@@ -231,7 +253,15 @@ def build_multibranch_model(
     branch_filters = _json_maybe(branch_filters) or DEFAULT_BRANCH_FILTERS
     branch_kernel_sizes = _json_maybe(branch_kernel_sizes) or DEFAULT_BRANCH_KERNEL_SIZES
     branch_pool_sizes = _json_maybe(branch_pool_sizes) or DEFAULT_BRANCH_POOL_SIZES
-    branch_num_conv_layers = max(1, int(branch_num_conv_layers))
+    if isinstance(branch_num_conv_layers, dict):
+        branch_num_conv_layers = {
+            str(k): max(1, int(v)) for k, v in branch_num_conv_layers.items()
+        }
+    else:
+        branch_num_conv_layers = max(1, int(branch_num_conv_layers))
+    branch_filter_mode = str(branch_filter_mode).lower()
+    if branch_filter_mode not in {"custom", "double", "constant"}:
+        raise ValueError("branch_filter_mode must be 'custom', 'double', or 'constant'.")
 
     inputs = []
     branch_embeddings = []
@@ -241,13 +271,33 @@ def build_multibranch_model(
         branch_in = layers.Input(shape=shape, name=f"{name}_input")
         inputs.append(branch_in)
 
-        filters = int(branch_filters.get(name, 32))
+        raw_filter_value = branch_filters.get(name, 32)
+        if isinstance(raw_filter_value, (list, tuple, np.ndarray)):
+            filter_values = [int(v) for v in raw_filter_value]
+        else:
+            filter_values = [int(raw_filter_value)]
+
         kernel_size = int(branch_kernel_sizes.get(name, 3))
         pool_size = int(branch_pool_sizes.get(name, 2))
 
+        if isinstance(branch_num_conv_layers, dict):
+            branch_depth = max(1, int(branch_num_conv_layers.get(name, 1)))
+        else:
+            branch_depth = branch_num_conv_layers
+
         x = branch_in
-        for layer_idx in range(branch_num_conv_layers):
-            layer_filters = filters * (2**layer_idx)
+        for layer_idx in range(branch_depth):
+            if branch_filter_mode == "double":
+                layer_filters = int(raw_filter_value) * (2**layer_idx)
+            elif branch_filter_mode == "constant":
+                layer_filters = int(raw_filter_value)
+            else:
+                if len(filter_values) == 1:
+                    layer_filters = int(filter_values[0])
+                elif len(filter_values) > layer_idx:
+                    layer_filters = int(filter_values[layer_idx])
+                else:
+                    layer_filters = int(filter_values[-1])
             x = layers.Conv1D(
                 filters=layer_filters,
                 kernel_size=kernel_size,
@@ -263,7 +313,7 @@ def build_multibranch_model(
                 pool_size=pool_size, padding="same", name=f"{name}_pool{layer_idx + 1}"
             )(x)
 
-        x = layers.GlobalAveragePooling1D(name=f"{name}_gap")(x)
+        x = _attention_pool_over_time(name, x)
         x = layers.Dense(branch_dense_units, activation="relu", name=f"{name}_embed")(x)
         branch_embeddings.append(x)
 
@@ -332,6 +382,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         branch_kernel_sizes: Optional[Dict[str, int]] = None,
         branch_pool_sizes: Optional[Dict[str, int]] = None,
         branch_num_conv_layers: int = 2,
+        branch_filter_mode: str = "custom",
         branch_dense_units: int = 64,
         static_branch_units: int = 32,
         dense_units: int = 128,
@@ -353,6 +404,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         self.branch_kernel_sizes = branch_kernel_sizes
         self.branch_pool_sizes = branch_pool_sizes
         self.branch_num_conv_layers = branch_num_conv_layers
+        self.branch_filter_mode = branch_filter_mode
         self.branch_dense_units = branch_dense_units
         self.static_branch_units = static_branch_units
         self.dense_units = dense_units
@@ -541,6 +593,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
             branch_kernel_sizes=self.branch_kernel_sizes,
             branch_pool_sizes=self.branch_pool_sizes,
             branch_num_conv_layers=self.branch_num_conv_layers,
+            branch_filter_mode=self.branch_filter_mode,
             branch_dense_units=self.branch_dense_units,
             static_branch_units=self.static_branch_units,
             dense_units=self.dense_units,
