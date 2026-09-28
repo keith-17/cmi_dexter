@@ -222,6 +222,7 @@ def build_multibranch_model(
     branch_filter_mode: str = "custom",
     branch_dense_units: int = 64,
     static_branch_units: int = 32,
+    static_dropout: float = 0.1,
     dense_units: int = 128,
     dropout: float = 0.3,
     conv_dropout: float = 0.1,
@@ -325,6 +326,8 @@ def build_multibranch_model(
         x = layers.Dense(static_branch_units, activation="relu", name=f"{name}_dense1")(branch_in)
         if use_batchnorm:
             x = layers.BatchNormalization(name=f"{name}_bn")(x)
+        if static_dropout:
+            x = layers.Dropout(static_dropout, name=f"{name}_dropout")(x)
         x = layers.Dense(static_branch_units, activation="relu", name=f"{name}_embed")(x)
         branch_embeddings.append(x)
 
@@ -385,6 +388,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         branch_filter_mode: str = "custom",
         branch_dense_units: int = 64,
         static_branch_units: int = 32,
+        static_dropout: float = 0.1,
         dense_units: int = 128,
         dropout: float = 0.3,
         conv_dropout: float = 0.1,
@@ -407,6 +411,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         self.branch_filter_mode = branch_filter_mode
         self.branch_dense_units = branch_dense_units
         self.static_branch_units = static_branch_units
+        self.static_dropout = static_dropout
         self.dense_units = dense_units
         self.dropout = dropout
         self.conv_dropout = conv_dropout
@@ -596,6 +601,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
             branch_filter_mode=self.branch_filter_mode,
             branch_dense_units=self.branch_dense_units,
             static_branch_units=self.static_branch_units,
+            static_dropout=self.static_dropout,
             dense_units=self.dense_units,
             dropout=self.dropout,
             conv_dropout=self.conv_dropout,
