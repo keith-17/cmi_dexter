@@ -908,6 +908,9 @@ class ThermoExtractor(HoneycombBase):
 # ---------------------------------------------------------------------------
 
 
+_UNSET = object()
+
+
 class SequenceExtractor(HoneycombBase):
     """
     Orchestrates cleaning, motion filtering, and multi-domain extraction.
@@ -964,8 +967,8 @@ class SequenceExtractor(HoneycombBase):
         cwt_max_scale: int = 128,
         cwt_n_scales: int = 32,
         cwt_use_log_scale: bool = True,
-        stft_configs: Optional[List[Dict[str, Any]]] = None,
-        cwt_configs: Optional[List[Dict[str, Any]]] = None,
+        stft_configs: Optional[List[Dict[str, Any]]] = _UNSET,
+        cwt_configs: Optional[List[Dict[str, Any]]] = _UNSET,
         filter_problematic_sequences: bool = False,
         ideal_skew_threshold: float = 1.35,
         problematic_features_threshold: int = 6,
@@ -1069,34 +1072,54 @@ class SequenceExtractor(HoneycombBase):
     # ----------------------------- helpers -----------------------------
 
     def _build_time_frequency_extractors(self) -> None:
-        """Build one or many named STFT/CWT extractors from search-safe configs."""
+        """Build one or many named STFT/CWT extractors from search-safe configs.
+
+        ``None`` or ``[]`` explicitly disables the branch. Leaving the default
+        constructor value as the internal sentinel keeps the default behavior
+        active unless the user deliberately switches the branch off.
+        """
         stft_defaults = dict(nperseg=self.stft_nperseg, noverlap=self.stft_noverlap,
             window_type=self.stft_window_type, use_log_scale=self.stft_use_log_scale,
             sampling_rate=self.imu_native_sampling_rate, sequence_col=self.sequence_col)
         cwt_defaults = dict(wavelet=self.cwt_wavelet, max_scale=self.cwt_max_scale,
             n_scales=self.cwt_n_scales, use_log_scale=self.cwt_use_log_scale,
             sampling_rate=self.imu_native_sampling_rate, sequence_col=self.sequence_col)
-        stft_configs = self.stft_configs or [{}]
-        cwt_configs = self.cwt_configs or [{}]
-        # ``prepare_bayesian_space`` serializes list/dict categories. Accepting
-        # that representation keeps stacked configs usable in BayesSearchCV.
+
+        stft_raw = self.stft_configs
+        cwt_raw = self.cwt_configs
+
+        if stft_raw is _UNSET:
+            stft_configs = [{}]
+        elif stft_raw is None:
+            stft_configs = []
+        else:
+            stft_configs = stft_raw
+
+        if cwt_raw is _UNSET:
+            cwt_configs = [{}]
+        elif cwt_raw is None:
+            cwt_configs = []
+        else:
+            cwt_configs = cwt_raw
+
         if isinstance(stft_configs, str):
             stft_configs = json.loads(stft_configs)
         if isinstance(cwt_configs, str):
             cwt_configs = json.loads(cwt_configs)
+
         self.stft_extractors = []
         self.cwt_extractors = []
-        for i, config in enumerate(stft_configs):
+        for i, config in enumerate(stft_configs or []):
             config = dict(config)
             name = config.pop("name", f"stft{i}")
             self.stft_extractors.append(STFTExtractor(**(stft_defaults | config), feature_prefix=name))
-        for i, config in enumerate(cwt_configs):
+        for i, config in enumerate(cwt_configs or []):
             config = dict(config)
             name = config.pop("name", f"cwt{i}")
             self.cwt_extractors.append(CWTExtractor(**(cwt_defaults | config), feature_prefix=name))
-        # Backwards-compatible public handles.
-        self.stft_extractor = self.stft_extractors[0]
-        self.cwt_extractor = self.cwt_extractors[0]
+
+        self.stft_extractor = self.stft_extractors[0] if self.stft_extractors else None
+        self.cwt_extractor = self.cwt_extractors[0] if self.cwt_extractors else None
 
     def _non_feature_cols(self) -> List[str]:
         cols = {self.sequence_col, self.counter_col, "dt", "mask"}
