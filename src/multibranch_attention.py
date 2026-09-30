@@ -229,6 +229,9 @@ def build_multibranch_model(
     learning_rate: float = 1e-3,
     use_batchnorm: bool = True,
     random_state: int = 42,
+    optimizer_name: str = "adam",    # <-- ADD
+    weight_decay: float = 0.0,       # <-- ADD
+    momentum: float = 0.9,           # <-- ADD
 ):
     """
     Build a modality-specific multi-branch Keras classifier.
@@ -348,8 +351,18 @@ def build_multibranch_model(
     outputs = layers.Dense(n_classes, activation="softmax", name="predictions")(head)
 
     model = models.Model(inputs=inputs, outputs=outputs, name="multibranch_sequence_classifier")
+    opt_name = str(optimizer_name).lower()
+    if opt_name == "adamw":
+        opt = optimizers.AdamW(learning_rate=learning_rate, weight_decay=weight_decay)
+    elif opt_name == "sgd":
+        opt = optimizers.SGD(learning_rate=learning_rate, momentum=momentum, nesterov=True)
+    elif opt_name == "rmsprop":
+        opt = optimizers.RMSprop(learning_rate=learning_rate)
+    else:
+        opt = optimizers.Adam(learning_rate=learning_rate)
+
     model.compile(
-        optimizer=optimizers.Adam(learning_rate=learning_rate),
+        optimizer=opt,
         loss="sparse_categorical_crossentropy",
         metrics=["accuracy"],
     )
@@ -402,6 +415,16 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         class_weight_mode: Optional[str] = "balanced",
         verbose: int = 0,
         random_state: int = 42,
+                # --- NEW OPTIMIZER PARAMS ---
+        optimizer_name: str = "adam",      # 'adam', 'adamw', 'sgd', 'rmsprop'
+        weight_decay: float = 0.0,         # only used for adamw
+        momentum: float = 0.9,             # only used for sgd
+        
+        # --- NEW REDUCE LR PARAMS ---
+        use_lr_scheduler: bool = True,
+        lr_factor: float = 0.5,
+        lr_patience: int = 5,
+        min_lr: float = 1e-6,
     ):
         self.primary_target = primary_target
         self.extractor = extractor
@@ -425,6 +448,13 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         self.class_weight_mode = class_weight_mode
         self.verbose = verbose
         self.random_state = random_state
+        self.optimizer_name = optimizer_name
+        self.weight_decay = weight_decay
+        self.momentum = momentum
+        self.use_lr_scheduler = use_lr_scheduler
+        self.lr_factor = lr_factor
+        self.lr_patience = lr_patience
+        self.min_lr = min_lr
 
     # ----------------------------- defaults -----------------------------
 
@@ -609,6 +639,9 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
             learning_rate=self.learning_rate,
             use_batchnorm=self.use_batchnorm,
             random_state=self.random_state,
+            optimizer_name=self.optimizer_name,   # <-- ADD
+            weight_decay=self.weight_decay,       # <-- ADD
+            momentum=self.momentum,               # <-- ADD
         )
 
         self.input_order_ = list(time_series_shapes.keys()) + list(static_shapes.keys())
@@ -621,6 +654,17 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
                     monitor="val_loss" if self.validation_split else "loss",
                     patience=self.early_stopping_patience,
                     restore_best_weights=True,
+                )
+            )
+
+        if self.use_lr_scheduler and self.validation_split and self.validation_split > 0:
+            cb.append(
+                callbacks.ReduceLROnPlateau(
+                    monitor="val_loss",
+                    factor=self.lr_factor,
+                    patience=self.lr_patience,
+                    min_lr=self.min_lr,
+                    verbose=0,
                 )
             )
 
