@@ -296,7 +296,7 @@ def build_multibranch_model(
             )(x)
             if use_batchnorm:
                 x = layers.BatchNormalization(name=f"{name}_bn{layer_idx + 1}")(x)
-            x = _make_activation(activation)
+            x = _make_activation(activation)(x)
             if conv_dropout:
                 x = layers.SpatialDropout1D(conv_dropout, name=f"{name}_drop{layer_idx + 1}")(x)
             x = layers.MaxPooling1D(pool_size=pool_size, padding="same", name=f"{name}_pool{layer_idx + 1}")(x)

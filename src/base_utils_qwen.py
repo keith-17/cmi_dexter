@@ -33,7 +33,6 @@ try:
     from pywt import cwt
 except Exception:
     cwt = None
-    resample = None
 
 try:
     from skopt.space import Categorical
@@ -48,6 +47,24 @@ except Exception:
 
 class InvalidExtractorParams(ValueError):
     """Raised when extractor hyperparameters cannot produce valid features."""
+
+
+def _coerce_search_value(value: Any) -> Any:
+    """Decode JSON / literal strings produced by BayesSearchCV Categorical."""
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return value
+    if text[0] in "{[":
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            try:
+                return ast.literal_eval(text)
+            except (ValueError, SyntaxError):
+                return value
+    return value
 
 
 def _positive_int(value: Any, *, default: Optional[int] = None, name: str = "parameter") -> int:
@@ -644,6 +661,27 @@ class TOFExtractor(HoneycombBase):
         df = X[self.tof_cols_].astype(float).copy()
         df = df.replace(-1.0, np.nan)
 
+        sensor_map: Dict[str, List[str]] = {}
+        for col in df.columns:
+            parts_col = str(col).split("_")
+            key = parts_col[1] if len(parts_col) > 1 else "all"
+            sensor_map.setdefault(key, []).append(col)
+        if not sensor_map:
+            sensor_map = {"all": list(df.columns)}
+
+        n_keep = int(self.n_sensors) if self.n_sensors is not None else 0
+        if n_keep > 0 and len(sensor_map) > n_keep:
+            def _sensor_sort_key(item: str):
+                try:
+                    return (0, int(item))
+                except (TypeError, ValueError):
+                    return (1, str(item))
+            keep_keys = sorted(sensor_map.keys(), key=_sensor_sort_key)[:n_keep]
+            keep_set = set(keep_keys)
+            sensor_map = {k: v for k, v in sensor_map.items() if k in keep_set}
+            keep_cols = [c for cols in sensor_map.values() for c in cols]
+            df = df[keep_cols]
+
         if self.tof_fill_mode == "nan_interpolate":
             df = df.groupby(X[self.sequence_col].values, sort=False).transform(
                 lambda g: g.interpolate(method="linear", limit_direction="both").ffill().bfill()
@@ -658,14 +696,6 @@ class TOFExtractor(HoneycombBase):
             df = df.fillna(0.0)
 
         parts = []
-        sensor_map: Dict[str, List[str]] = {}
-        for col in df.columns:
-            parts_col = str(col).split("_")
-            key = parts_col[1] if len(parts_col) > 1 else "all"
-            sensor_map.setdefault(key, []).append(col)
-
-        if not sensor_map:
-            sensor_map = {"all": list(df.columns)}
 
         for mode in self.tof_modes_:
             if mode == "raw":
@@ -798,7 +828,8 @@ class STFTExtractor(HoneycombBase):
         self.scaling = scaling
         self.detrend = detrend
         self.use_log_scale = use_log_scale
-        self.frequency_bands = frequency_bands or {
+        bands = _coerce_search_value(frequency_bands)
+        self.frequency_bands = bands or {
             "ultra_low": (0.0, 1.0),
             "low": (1.0, 3.0),
             "mid": (3.0, 6.0),
@@ -820,6 +851,9 @@ class STFTExtractor(HoneycombBase):
             self.noverlap = max(0, self.nperseg // 2)
         else:
             self.noverlap = int(self.noverlap)
+        bands = _coerce_search_value(self.frequency_bands)
+        if isinstance(bands, dict):
+            self.frequency_bands = bands
         return self
 
     def _compute_stft_features(self, signal: np.ndarray) -> Dict[str, np.ndarray]:
@@ -870,7 +904,7 @@ class STFTExtractor(HoneycombBase):
             np.sum(((f - features['stft_spectral_centroid']) ** 2) * freq_mean) / (np.sum(freq_mean) + 1e-10)
         )
         features['stft_spectral_entropy'] = self._compute_entropy(freq_mean)
-        for band_name, (f_low, f_high) in self.frequency_bands.items():
+        for band_name, (f_low, f_high) in dict(self.frequency_bands or {}).items():
             band_mask = (f >= f_low) & (f < f_high)
             if np.any(band_mask):
                 band_power = Pxx[band_mask, :]
@@ -1248,6 +1282,11 @@ class SequenceExtractor(HoneycombBase):
 
         self._rebuild_components()
 
+    def set_params(self, **params):
+        super().set_params(**params)
+        self._rebuild_components()
+        return self
+
     # ---------- helpers ----------
 
     def _build_stft_defaults(self) -> Dict[str, Any]:
@@ -1258,7 +1297,7 @@ class SequenceExtractor(HoneycombBase):
             scaling=self.stft_scaling,
             detrend=self.stft_detrend,
             use_log_scale=self.stft_use_log_scale,
-            frequency_bands=self.stft_frequency_bands,
+            frequency_bands=_coerce_search_value(self.stft_frequency_bands),
             sampling_rate=self.imu_native_sampling_rate,
             sequence_col=self.sequence_col,
         )
@@ -1295,9 +1334,9 @@ class SequenceExtractor(HoneycombBase):
             cwt_configs = cwt_raw
 
         if isinstance(stft_configs, str):
-            stft_configs = json.loads(stft_configs)
+            stft_configs = _coerce_search_value(stft_configs)
         if isinstance(cwt_configs, str):
-            cwt_configs = json.loads(cwt_configs)
+            cwt_configs = _coerce_search_value(cwt_configs)
 
         self.stft_extractors = []
         self.cwt_extractors = []
@@ -1371,11 +1410,14 @@ class SequenceExtractor(HoneycombBase):
 
     def _parse_frame_stats(self) -> List[str]:
         known = {"mean","std","min","max","first","last","median","rms","abs_mean"}
-        stats = [
-            s.strip().lower()
-            for s in str(self.frame_stats).split(",")
-            if s.strip().lower() in known
-        ]
+        raw = _coerce_search_value(self.frame_stats)
+        if raw is None or (isinstance(raw, str) and raw.strip().lower() in {"", "none", "nan"}):
+            return ["mean"]
+        if isinstance(raw, (list, tuple)):
+            tokens = [str(s).strip().lower() for s in raw]
+        else:
+            tokens = [s.strip().lower() for s in str(raw).split(",")]
+        stats = [s for s in tokens if s in known]
         if not stats:
             stats = ["mean"]
         return stats
@@ -1515,7 +1557,7 @@ class SequenceExtractor(HoneycombBase):
         self.problematic_filter_ = ProblematicSequenceFilter(
             ideal_skew_threshold=self.ideal_skew_threshold,
             problematic_features_threshold=self.problematic_features_threshold,
-            feature_cols=self.problematic_feature_cols,
+            feature_cols=_coerce_search_value(self.problematic_feature_cols),
             sequence_col=self.sequence_col,
         ).fit(X)
         X_fit = self.problematic_filter_.transform(X) if self.filter_problematic_sequences else X
@@ -1607,12 +1649,14 @@ class SequenceExtractor(HoneycombBase):
                 continue
             arr = g[self.feature_names_in_].to_numpy(dtype=float)
             arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+            if self.maxlen is not None and int(self.maxlen) > 0:
+                arr = arr[: int(self.maxlen)]
             L = len(arr)
             if L == 0:
                 continue
             win = self.chunk_window_size
             if win is None or int(win) <= 0:
-                win = L
+                win = int(self.maxlen) if self.maxlen is not None and int(self.maxlen) > 0 else L
             stride = self.chunk_stride
             if stride is None or int(stride) <= 0:
                 stride = win
