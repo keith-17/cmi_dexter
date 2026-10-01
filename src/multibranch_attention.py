@@ -8,6 +8,8 @@ optimizer, loss, and scheduler knob exposed for search.
 from __future__ import annotations
 
 import json
+import math
+import warnings
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -156,6 +158,14 @@ def _build_optimizer(
     gradient_clip_value: Optional[float],
 ):
     name = str(optimizer_name).lower()
+    if gradient_clip_norm is not None and gradient_clip_value is not None:
+        warnings.warn(
+            "Both gradient_clip_norm and gradient_clip_value were set; keeping only "
+            "gradient_clip_norm and ignoring gradient_clip_value.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        gradient_clip_value = None
     clip_kwargs = {}
     if gradient_clip_norm is not None:
         clip_kwargs["clipnorm"] = float(gradient_clip_norm)
@@ -188,7 +198,22 @@ def _build_loss(loss_name: str, label_smoothing: float):
     if name == "cce":
         return losses.CategoricalCrossentropy(label_smoothing=label_smoothing)
     if name == "sparse_cce":
-        return losses.SparseCategoricalCrossentropy(label_smoothing=label_smoothing)
+        # Keras 3's SparseCategoricalCrossentropy does not accept
+        # ``label_smoothing``.  Convert sparse labels to one-hot only when
+        # smoothing is requested, preserving the native sparse path otherwise.
+        if not label_smoothing:
+            return losses.SparseCategoricalCrossentropy()
+
+        def sparse_cce_with_smoothing(y_true, y_pred):
+            y_true = tf.cast(tf.reshape(y_true, [-1]), tf.int32)
+            y_true_oh = tf.one_hot(y_true, depth=tf.shape(y_pred)[-1])
+            return losses.categorical_crossentropy(
+                y_true_oh,
+                y_pred,
+                label_smoothing=float(label_smoothing),
+            )
+
+        return sparse_cce_with_smoothing
     if name == "focal":
         # Basic focal-loss for sparse labels
         def sparse_focal(y_true, y_pred):
@@ -535,12 +560,18 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
                     verbose=0,
                 ))
             elif str(self.lr_scheduler_type).lower() == "cosine":
-                steps = max(1, int(self.epochs) - int(self.warmup_epochs))
-                cb.append(callbacks.CosineAnnealingLR(
-                    T_max=max(self.cosine_t_max, steps),
-                    eta_min=self.min_lr,
-                    verbose=0,
-                ))
+                base_lr = float(self.learning_rate)
+                warmup_epochs = max(0, int(self.warmup_epochs))
+                t_max = max(1, int(self.cosine_t_max))
+
+                def cosine_schedule(epoch, current_lr):
+                    if warmup_epochs and epoch < warmup_epochs:
+                        return base_lr * (epoch + 1) / warmup_epochs
+                    progress = (epoch - warmup_epochs) % t_max
+                    cosine = 0.5 * (1.0 + math.cos(math.pi * progress / t_max))
+                    return float(self.min_lr) + (base_lr - float(self.min_lr)) * cosine
+
+                cb.append(callbacks.LearningRateScheduler(cosine_schedule, verbose=0))
         return cb
 
     def fit(self, X, y=None, **fit_params):
