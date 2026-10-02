@@ -1546,6 +1546,16 @@ class SequenceExtractor(HoneycombBase):
     # ---------- fit ----------
 
     def fit(self, X: pd.DataFrame, y: Optional[pd.DataFrame] = None):
+        if (
+            str(self.output_format).lower() != "frame"
+            and self.chunk_window_size is not None
+            and self.chunk_stride is not None
+        ):
+            window = _positive_int(self.chunk_window_size, name="chunk_window_size")
+            stride = _positive_int(self.chunk_stride, name="chunk_stride")
+            if stride > window:
+                self.chunk_stride = window
+
         validate_sequence_extractor_params(
             self.get_params(),
             for_frame_output=str(self.output_format).lower() == "frame",
