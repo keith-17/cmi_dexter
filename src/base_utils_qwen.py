@@ -96,10 +96,52 @@ def validate_sequence_extractor_params(
         _positive_int(params.get("window_size"), name="window_size")
 
     if params.get("maxlen") is not None:
-        _positive_int(params.get("maxlen"), name="maxlen")
+        try:
+            int(params.get("maxlen"))
+        except (TypeError, ValueError) as exc:
+            raise InvalidExtractorParams(
+                f"maxlen must be an integer, got {params.get('maxlen')!r}"
+            ) from exc
 
-    if params.get("max_total_windows") is not None:
-        _positive_int(params.get("max_total_windows"), name="max_total_windows")
+    crop_mode = params.get("sequence_crop_mode", "tail")
+    if crop_mode not in {"head", "tail", "center", "none"}:
+        raise InvalidExtractorParams(
+            "sequence_crop_mode must be one of 'head', 'tail', 'center', or 'none'"
+        )
+
+    cap_policy = params.get("window_cap_policy", "last")
+    if cap_policy not in {"last", "first", "uniform"}:
+        raise InvalidExtractorParams(
+            "window_cap_policy must be one of 'last', 'first', or 'uniform'"
+        )
+
+    final_window_mode = params.get("final_window_mode", "pad")
+    if final_window_mode not in {"pad", "overlap"}:
+        raise InvalidExtractorParams("final_window_mode must be 'pad' or 'overlap'")
+
+    cap = params.get("max_windows_per_sequence")
+    if cap is not None:
+        _positive_int(cap, name="max_windows_per_sequence")
+
+    if params.get("chunk_window_size") is not None:
+        try:
+            int(params.get("chunk_window_size"))
+        except (TypeError, ValueError) as exc:
+            raise InvalidExtractorParams(
+                f"chunk_window_size must be an integer, got {params.get('chunk_window_size')!r}"
+            ) from exc
+
+    if bool(params.get("use_chunk_stride_ratio", False)):
+        try:
+            stride_ratio = float(params.get("chunk_stride_ratio"))
+        except (TypeError, ValueError) as exc:
+            raise InvalidExtractorParams(
+                f"chunk_stride_ratio must be between 0 and 1, got {params.get('chunk_stride_ratio')!r}"
+            ) from exc
+        if not 0 < stride_ratio <= 1:
+            raise InvalidExtractorParams(
+                f"chunk_stride_ratio must be between 0 and 1, got {stride_ratio!r}"
+            )
 
     resample_modalities = bool(params.get("resample_modalities", False))
 
@@ -125,16 +167,15 @@ def validate_sequence_extractor_params(
                     f"{target_key}/{native_key} ratio {ratio:.3f} is outside safe bounds"
                 )
 
-    if not for_frame_output:
-        chunk_window = params.get("chunk_window_size")
+    if not for_frame_output and not bool(params.get("use_chunk_stride_ratio", False)):
         chunk_stride = params.get("chunk_stride")
-        if chunk_window is not None and chunk_stride is not None:
-            win = _positive_int(chunk_window, name="chunk_window_size")
-            stride = _positive_int(chunk_stride, name="chunk_stride")
-            if stride > win:
+        if chunk_stride is not None:
+            try:
+                int(chunk_stride)
+            except (TypeError, ValueError) as exc:
                 raise InvalidExtractorParams(
-                    "chunk_stride must be <= chunk_window_size"
-                )
+                    f"chunk_stride must be an integer, got {chunk_stride!r}"
+                ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -1167,6 +1208,7 @@ class SequenceExtractor(HoneycombBase):
 
         # --- chunking ---
         maxlen: int = 160,
+        sequence_crop_mode: str = "tail",
         padding_value: float = -999.0,
         sequence_col: str = "sequence_id",
         counter_col: str = "sequence_counter",
@@ -1184,7 +1226,9 @@ class SequenceExtractor(HoneycombBase):
         # --- chunking for chunk output ---
         chunk_window_size: Optional[int] = 128,
         chunk_stride: Optional[int] = 64,
-        max_total_windows: Optional[int] = None,
+        max_windows_per_sequence: Optional[int] = None,
+        window_cap_policy: str = "last",
+        final_window_mode: str = "pad",
         use_chunk_stride_ratio: bool = False,
         chunk_stride_ratio: float = 0.5,
         output_format: str = "chunks",
@@ -1245,6 +1289,7 @@ class SequenceExtractor(HoneycombBase):
         self.interp_mode = interp_mode
 
         self.maxlen = maxlen
+        self.sequence_crop_mode = sequence_crop_mode
         self.padding_value = padding_value
         self.sequence_col = sequence_col
         self.counter_col = counter_col
@@ -1260,7 +1305,9 @@ class SequenceExtractor(HoneycombBase):
 
         self.chunk_window_size = chunk_window_size
         self.chunk_stride = chunk_stride
-        self.max_total_windows = max_total_windows
+        self.max_windows_per_sequence = max_windows_per_sequence
+        self.window_cap_policy = window_cap_policy
+        self.final_window_mode = final_window_mode
         self.use_chunk_stride_ratio = use_chunk_stride_ratio
         self.chunk_stride_ratio = chunk_stride_ratio
         self.output_format = output_format
@@ -1555,10 +1602,20 @@ class SequenceExtractor(HoneycombBase):
     # ---------- fit ----------
 
     def _normalize_chunk_stride(self) -> None:
-        if str(self.output_format).lower() == "frame" or self.chunk_window_size is None:
+        if str(self.output_format).lower() == "frame":
             return
 
-        window = _positive_int(self.chunk_window_size, name="chunk_window_size")
+        window = self.chunk_window_size
+        if window is not None:
+            try:
+                window = int(window)
+            except (TypeError, ValueError) as exc:
+                raise InvalidExtractorParams(
+                    f"chunk_window_size must be an integer, got {self.chunk_window_size!r}"
+                ) from exc
+            if window <= 0:
+                window = None
+
         if self.use_chunk_stride_ratio:
             try:
                 ratio = float(self.chunk_stride_ratio)
@@ -1570,11 +1627,17 @@ class SequenceExtractor(HoneycombBase):
                 raise InvalidExtractorParams(
                     f"chunk_stride_ratio must be between 0 and 1, got {ratio!r}"
                 )
-            self.chunk_stride = max(1, int(round(window * ratio)))
+            if window is not None:
+                self.chunk_stride = max(1, min(window, int(round(window * ratio))))
         elif self.chunk_stride is not None:
-            stride = _positive_int(self.chunk_stride, name="chunk_stride")
-            if stride > window:
-                self.chunk_stride = window
+            try:
+                stride = int(self.chunk_stride)
+            except (TypeError, ValueError) as exc:
+                raise InvalidExtractorParams(
+                    f"chunk_stride must be an integer, got {self.chunk_stride!r}"
+                ) from exc
+            if stride > 0 and window is not None:
+                self.chunk_stride = min(stride, window)
 
     def fit(self, X: pd.DataFrame, y: Optional[pd.DataFrame] = None):
         self._normalize_chunk_stride()
@@ -1655,6 +1718,7 @@ class SequenceExtractor(HoneycombBase):
             arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
             if arr.size == 0:
                 arr = np.zeros((1, len(self.base_feature_names_)), dtype=float)
+            arr = self._crop_sequence(arr)
             stat_vectors = [self._stat_vector(arr, stat) for stat in self.frame_stats_]
             row = np.concatenate(stat_vectors)
             row = np.nan_to_num(row, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1670,81 +1734,152 @@ class SequenceExtractor(HoneycombBase):
         self.sequence_ids_ = frame.index.values
         return frame
 
+    def _crop_sequence(self, arr: np.ndarray) -> np.ndarray:
+        if self.sequence_crop_mode == "none" or self.maxlen is None:
+            return arr
+        try:
+            maxlen = int(self.maxlen)
+        except (TypeError, ValueError) as exc:
+            raise InvalidExtractorParams(f"maxlen must be an integer, got {self.maxlen!r}") from exc
+        if maxlen <= 0 or len(arr) <= maxlen:
+            return arr
+        if self.sequence_crop_mode == "head":
+            return arr[:maxlen]
+        if self.sequence_crop_mode == "tail":
+            return arr[-maxlen:]
+        if self.sequence_crop_mode == "center":
+            crop_start = max(0, (len(arr) - maxlen) // 2)
+            return arr[crop_start : crop_start + maxlen]
+        raise InvalidExtractorParams(
+            "sequence_crop_mode must be one of 'head', 'tail', 'center', or 'none'"
+        )
+
     def transform_chunks(self, X: pd.DataFrame) -> Dict[str, Any]:
         check_is_fitted(self, ["feature_names_in_"])
+        self._normalize_chunk_stride()
+        validate_sequence_extractor_params(self.get_params(), for_frame_output=False)
         out = self._preprocess_features(X)
         for col in self.feature_names_in_:
             if col not in out.columns:
                 out[col] = 0.0
 
-        if self.max_total_windows is not None:
-            limit = _positive_int(self.max_total_windows, name="max_total_windows")
-            maxlen = int(self.maxlen) if self.maxlen is not None and int(self.maxlen) > 0 else None
-            total_windows = 0
-            for sequence_length in out.groupby(self.sequence_col, sort=False).size():
-                length = min(int(sequence_length), maxlen) if maxlen is not None else int(sequence_length)
-                if length <= 0:
-                    continue
-                window = self.chunk_window_size
-                if window is None or int(window) <= 0:
-                    window = maxlen if maxlen is not None else length
+        grouped_sequences = list(out.groupby(self.sequence_col, sort=False))
+        if not grouped_sequences:
+            raise ValueError("SequenceExtractor.transform_chunks produced no sequences.")
+
+        maxlen = None
+        if self.maxlen is not None:
+            try:
+                parsed_maxlen = int(self.maxlen)
+            except (TypeError, ValueError) as exc:
+                raise InvalidExtractorParams(f"maxlen must be an integer, got {self.maxlen!r}") from exc
+            if parsed_maxlen > 0 and self.sequence_crop_mode != "none":
+                maxlen = parsed_maxlen
+
+        window = self.chunk_window_size
+        if window is not None:
+            try:
                 window = int(window)
-                stride = self.chunk_stride
-                stride = window if stride is None or int(stride) <= 0 else int(stride)
-                if length <= window:
-                    total_windows += 1
-                else:
-                    total_windows += (length - window + stride - 1) // stride + 1
-            if total_windows > limit:
-                message = (
-                    f"Chunk window cap exceeded: estimated={total_windows:,}, cap={limit:,}, "
-                    f"sequences={out[self.sequence_col].nunique():,}, maxlen={self.maxlen}, "
-                    f"window={self.chunk_window_size}, stride={self.chunk_stride}."
-                )
-                print(message)
-                raise InvalidExtractorParams(message)
+            except (TypeError, ValueError) as exc:
+                raise InvalidExtractorParams(
+                    f"chunk_window_size must be an integer, got {self.chunk_window_size!r}"
+                ) from exc
+        if window is None or window <= 0:
+            window = max(
+                min(len(group), maxlen) if maxlen is not None else len(group)
+                for _, group in grouped_sequences
+            )
+        window = max(1, int(window))
+
+        if self.use_chunk_stride_ratio:
+            stride = max(1, int(round(window * float(self.chunk_stride_ratio))))
+        else:
+            stride = self.chunk_stride
+            stride = window if stride is None or int(stride) <= 0 else int(stride)
+        stride = min(stride, window)
+
+        window_cap = self.max_windows_per_sequence
+        if window_cap is not None:
+            window_cap = _positive_int(window_cap, name="max_windows_per_sequence")
 
         sequences, masks, seq_ids = [], [], []
-        for seq_id, g in out.groupby(self.sequence_col, sort=False):
-            if len(g) == 0:
+        sequences_total = 0
+        capped_sequences = 0
+        sequences_at_cap = 0
+        max_windows_before_cap = 0
+        max_windows_after_cap = 0
+
+        for seq_id, group in grouped_sequences:
+            if len(group) == 0:
                 continue
-            arr = g[self.feature_names_in_].to_numpy(dtype=float)
+            sequences_total += 1
+            arr = group[self.feature_names_in_].to_numpy(dtype=float)
             arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-            if self.maxlen is not None and int(self.maxlen) > 0:
-                arr = arr[: int(self.maxlen)]
-            L = len(arr)
-            if L == 0:
+            full_length = len(arr)
+            arr = self._crop_sequence(arr)
+            length = len(arr)
+            if length == 0:
                 continue
-            win = self.chunk_window_size
-            if win is None or int(win) <= 0:
-                win = int(self.maxlen) if self.maxlen is not None and int(self.maxlen) > 0 else L
-            stride = self.chunk_stride
-            if stride is None or int(stride) <= 0:
-                stride = win
-            if L <= win:
-                pad_len = win - L
-                if pad_len > 0:
-                    pad = np.full((pad_len, arr.shape[1]), self.padding_value, dtype=float)
-                    chunk = np.vstack([arr, pad])
-                    mask = np.concatenate([np.ones(L, dtype=bool), np.zeros(pad_len, dtype=bool)])
+
+            if length <= window:
+                starts = np.array([0], dtype=int)
+            elif self.final_window_mode == "pad":
+                starts = np.arange(0, length, stride, dtype=int)
+            else:
+                starts = np.arange(0, length - window + 1, stride, dtype=int)
+                if len(starts) == 0 or starts[-1] + window < length:
+                    starts = np.append(starts, length - window)
+
+            windows_before_cap = len(starts)
+            max_windows_before_cap = max(max_windows_before_cap, windows_before_cap)
+
+            if window_cap is not None and windows_before_cap > window_cap:
+                capped_sequences += 1
+                if self.window_cap_policy == "last":
+                    starts = starts[-window_cap:]
+                elif self.window_cap_policy == "first":
+                    starts = starts[:window_cap]
                 else:
-                    chunk = arr[:win]
-                    mask = np.ones(win, dtype=bool)
+                    indices = np.rint(np.linspace(0, len(starts) - 1, num=window_cap)).astype(int)
+                    indices[-1] = len(starts) - 1
+                    starts = starts[np.unique(indices)]
+
+            windows_after_cap = len(starts)
+            max_windows_after_cap = max(max_windows_after_cap, windows_after_cap)
+            if window_cap is not None and windows_after_cap == window_cap:
+                sequences_at_cap += 1
+
+            for start in starts:
+                chunk = arr[start : start + window]
+                real_length = len(chunk)
+                if real_length < window:
+                    pad_length = window - real_length
+                    padding = np.full((pad_length, arr.shape[1]), self.padding_value, dtype=float)
+                    chunk = np.vstack([chunk, padding])
+                    mask = np.concatenate([
+                        np.ones(real_length, dtype=bool),
+                        np.zeros(pad_length, dtype=bool),
+                    ])
+                else:
+                    mask = np.ones(window, dtype=bool)
                 sequences.append(chunk)
                 masks.append(mask)
                 seq_ids.append(seq_id)
-            else:
-                starts = np.arange(0, L - win + 1, stride)
-                if len(starts) == 0 or starts[-1] + win < L:
-                    starts = np.append(starts, L - win)
-                for start in starts:
-                    chunk = arr[start : start + win]
-                    mask = np.ones(win, dtype=bool)
-                    sequences.append(chunk)
-                    masks.append(mask)
-                    seq_ids.append(seq_id)
+
         if not sequences:
             raise ValueError("SequenceExtractor.transform_chunks produced no sequences.")
+
+        if capped_sequences:
+            print(
+                "Per-sequence chunk cap applied: "
+                f"crop_mode={self.sequence_crop_mode}, maxlen={self.maxlen}, "
+                f"window={window}, stride={stride}, cap={window_cap}, "
+                f"sequences={sequences_total}, capped_sequences={capped_sequences}, "
+                f"sequences_at_cap={sequences_at_cap}, "
+                f"max_windows_before_cap={max_windows_before_cap}, "
+                f"max_windows_after_cap={max_windows_after_cap}"
+            )
+
         return {
             "X": np.stack(sequences, axis=0).astype(np.float32),
             "mask": np.stack(masks, axis=0).astype(bool),

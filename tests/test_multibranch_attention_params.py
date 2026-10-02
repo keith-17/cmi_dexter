@@ -96,25 +96,164 @@ class NotebookParameterContractTests(unittest.TestCase):
             any(norm is not None and value is not None for norm in norm_values for value in value_values)
         )
 
-    def test_total_window_limit_rejects_before_chunk_creation(self):
+    def _make_chunk_extractor(self, **params):
         extractor = SequenceExtractor(
             output_format="chunks",
-            chunk_window_size=100,
-            chunk_stride=50,
-            max_total_windows=1,
+            **params,
         )
         extractor.feature_names_in_ = np.array(["feature"])
         extractor._preprocess_features = lambda frame: frame
-        frame = pd.DataFrame({
-            "sequence_id": ["sequence"] * 150,
-            "feature": np.arange(150),
-        })
+        return extractor
 
+    def _sequence_frame(self, sequence_lengths):
+        sequence_ids = []
+        values = []
+        for sequence_id, length in sequence_lengths.items():
+            sequence_ids.extend([sequence_id] * length)
+            values.extend(range(length))
+        return pd.DataFrame({"sequence_id": sequence_ids, "feature": values})
+
+    def test_per_sequence_cap_is_applied_independently(self):
+        extractor = self._make_chunk_extractor(
+            chunk_window_size=100,
+            chunk_stride=50,
+            max_windows_per_sequence=2,
+        )
+        frame = self._sequence_frame({"a": 150, "b": 150})
         output = StringIO()
-        with self.assertRaisesRegex(InvalidExtractorParams, "estimated=2, cap=1"):
-            with redirect_stdout(output):
-                extractor.transform_chunks(frame)
-        self.assertIn("sequences=1, maxlen=160, window=100, stride=50", output.getvalue())
+        with redirect_stdout(output):
+            chunks = extractor.transform_chunks(frame)
+        self.assertEqual(chunks["X"].shape, (4, 100, 1))
+        self.assertEqual(chunks["sequence_ids"].tolist(), ["a", "a", "b", "b"])
+        self.assertIn("sequences=2, capped_sequences=2", output.getvalue())
+        self.assertIn("max_windows_before_cap=3, max_windows_after_cap=2", output.getvalue())
+
+    def test_crop_modes_choose_expected_timesteps(self):
+        frame = self._sequence_frame({"long": 500})
+        expected_first_values = {"head": 0.0, "tail": 300.0, "center": 150.0, "none": 0.0}
+        expected_window_counts = {"head": 1, "tail": 1, "center": 1, "none": 3}
+
+        for crop_mode, expected_first in expected_first_values.items():
+            with self.subTest(crop_mode=crop_mode):
+                extractor = self._make_chunk_extractor(
+                    maxlen=200,
+                    sequence_crop_mode=crop_mode,
+                    chunk_window_size=200,
+                    use_chunk_stride_ratio=True,
+                    chunk_stride_ratio=1.0,
+                )
+                chunks = extractor.transform_chunks(frame)
+                self.assertEqual(chunks["X"].shape[0], expected_window_counts[crop_mode])
+                self.assertEqual(chunks["X"][0, 0, 0], expected_first)
+
+    def test_frame_output_uses_crop_mode_before_sequence_statistics(self):
+        extractor = SequenceExtractor(
+            output_format="frame",
+            maxlen=200,
+            sequence_crop_mode="tail",
+            frame_stats="mean",
+        )
+        extractor.base_feature_names_ = ["feature"]
+        extractor.frame_feature_names_ = ["feature_mean"]
+        extractor.frame_stats_ = ["mean"]
+        extractor._preprocess_features = lambda frame: frame
+        frame = self._sequence_frame({"long": 500})
+
+        result = extractor.transform_frame(frame)
+
+        self.assertEqual(result.loc["long", "feature_mean"], np.mean(np.arange(300, 500)))
+
+    def test_tail_crop_with_shorter_window_creates_expected_pad_mode_windows(self):
+        extractor = self._make_chunk_extractor(
+            maxlen=200,
+            sequence_crop_mode="tail",
+            chunk_window_size=100,
+            use_chunk_stride_ratio=True,
+            chunk_stride_ratio=1.0,
+            final_window_mode="pad",
+        )
+        chunks = extractor.transform_chunks(self._sequence_frame({"long": 500}))
+        self.assertEqual(chunks["X"][:, 0, 0].tolist(), [300.0, 400.0])
+
+    def test_overlap_mode_and_last_cap_keep_the_final_windows(self):
+        extractor = self._make_chunk_extractor(
+            maxlen=200,
+            sequence_crop_mode="none",
+            chunk_window_size=100,
+            use_chunk_stride_ratio=True,
+            chunk_stride_ratio=0.2,
+            final_window_mode="overlap",
+            max_windows_per_sequence=4,
+            window_cap_policy="last",
+        )
+        chunks = extractor.transform_chunks(self._sequence_frame({"long": 500}))
+        self.assertEqual(chunks["X"][:, 0, 0].tolist(), [340.0, 360.0, 380.0, 400.0])
+
+    def test_uniform_cap_includes_first_and_final_windows(self):
+        extractor = self._make_chunk_extractor(
+            sequence_crop_mode="none",
+            chunk_window_size=100,
+            use_chunk_stride_ratio=True,
+            chunk_stride_ratio=0.2,
+            final_window_mode="overlap",
+            max_windows_per_sequence=4,
+            window_cap_policy="uniform",
+        )
+        chunks = extractor.transform_chunks(self._sequence_frame({"long": 500}))
+        self.assertEqual(chunks["X"][:, 0, 0].tolist(), [0.0, 140.0, 260.0, 400.0])
+
+    def test_first_cap_policy_keeps_initial_windows(self):
+        extractor = self._make_chunk_extractor(
+            sequence_crop_mode="none",
+            chunk_window_size=100,
+            use_chunk_stride_ratio=True,
+            chunk_stride_ratio=0.2,
+            final_window_mode="overlap",
+            max_windows_per_sequence=4,
+            window_cap_policy="first",
+        )
+        chunks = extractor.transform_chunks(self._sequence_frame({"long": 500}))
+        self.assertEqual(chunks["X"][:, 0, 0].tolist(), [0.0, 20.0, 40.0, 60.0])
+
+    def test_absolute_stride_is_clamped_to_window_size(self):
+        extractor = self._make_chunk_extractor(
+            sequence_crop_mode="none",
+            chunk_window_size=100,
+            chunk_stride=200,
+        )
+        chunks = extractor.transform_chunks(self._sequence_frame({"sequence": 250}))
+        self.assertEqual(chunks["X"][:, 0, 0].tolist(), [0.0, 100.0, 200.0])
+
+    def test_short_sequence_is_padded_and_masked(self):
+        extractor = self._make_chunk_extractor(
+            maxlen=0,
+            chunk_window_size=100,
+            chunk_stride=100,
+        )
+        chunks = extractor.transform_chunks(self._sequence_frame({"short": 80}))
+        self.assertEqual(chunks["X"].shape, (1, 100, 1))
+        self.assertTrue(chunks["mask"][0, :80].all())
+        self.assertFalse(chunks["mask"][0, 80:].any())
+
+    def test_pad_and_overlap_final_window_modes(self):
+        frame = self._sequence_frame({"sequence": 250})
+        pad_extractor = self._make_chunk_extractor(
+            maxlen=0,
+            chunk_window_size=100,
+            chunk_stride=100,
+            final_window_mode="pad",
+        )
+        overlap_extractor = self._make_chunk_extractor(
+            maxlen=0,
+            chunk_window_size=100,
+            chunk_stride=100,
+            final_window_mode="overlap",
+        )
+        pad_chunks = pad_extractor.transform_chunks(frame)
+        overlap_chunks = overlap_extractor.transform_chunks(frame)
+        self.assertEqual(pad_chunks["X"][:, 0, 0].tolist(), [0.0, 100.0, 200.0])
+        self.assertFalse(pad_chunks["mask"][-1, 50:].any())
+        self.assertEqual(overlap_chunks["X"][:, 0, 0].tolist(), [0.0, 100.0, 150.0])
 
     def test_new_model_parameters_are_constructor_parameters(self):
         constructor_params = set(inspect.signature(mba.MultiBranchSequenceClassifier.__init__).parameters)
