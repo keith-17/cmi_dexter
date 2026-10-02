@@ -14,7 +14,9 @@ import inspect
 import json
 import sys
 import unittest
+from types import MethodType, SimpleNamespace
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -59,11 +61,16 @@ def notebook_grid_param_space():
 def make_pipeline():
     return Pipeline(
         [
-            ("augmentor", SensorAugmentor(sequence_col="sequence_id", counter_col="sequence_counter")),
             (
                 "estimator",
                 mba.MultiBranchSequenceClassifier(
                     extractor=SequenceExtractor(output_format="chunks"),
+                    augmentor=SensorAugmentor(
+                        sequence_col="sequence_id",
+                        counter_col="sequence_counter",
+                        prob=0.0,
+                        per_aug_prob=0.0,
+                    ),
                     primary_target="bfrb",
                 ),
             ),
@@ -127,6 +134,168 @@ class NotebookParameterContractTests(unittest.TestCase):
         self.assertEqual(chunks["sequence_ids"].tolist(), ["a", "a", "b", "b"])
         self.assertIn("sequences=2, capped_sequences=2", output.getvalue())
         self.assertIn("max_windows_before_cap=3, max_windows_after_cap=2", output.getvalue())
+
+    def test_internal_validation_chunk_ids_are_disjoint(self):
+        frame = self._sequence_frame({"a": 250, "b": 250, "c": 250, "d": 250})
+        extractor = self._make_chunk_extractor(
+            chunk_window_size=100,
+            chunk_stride=50,
+            maxlen=0,
+        )
+        classifier = mba.MultiBranchSequenceClassifier(
+            extractor=extractor,
+            validation_split=0.25,
+            random_state=13,
+        )
+        classifier.extractor_ = extractor
+        targets = pd.DataFrame({
+            "sequence_id": ["a", "b", "c", "d"],
+            "bfrb": ["A", "A", "B", "B"],
+        })
+        train_rows, validation_rows = classifier._split_validation_sequences(frame, targets)
+        train_chunks = extractor.transform_chunks(train_rows)
+        validation_chunks = extractor.transform_chunks(validation_rows)
+
+        train_ids = set(train_chunks["sequence_ids"])
+        validation_ids = set(validation_chunks["sequence_ids"])
+        self.assertTrue(train_ids)
+        self.assertTrue(validation_ids)
+        self.assertTrue(train_ids.isdisjoint(validation_ids))
+        self.assertEqual(train_ids, set(classifier.train_sequence_ids_))
+        self.assertEqual(validation_ids, set(classifier.validation_sequence_ids_))
+
+    def test_validation_split_stratifies_and_falls_back_for_rare_classes(self):
+        classifier = mba.MultiBranchSequenceClassifier(validation_split=0.4, random_state=13)
+        classifier.extractor_ = SequenceExtractor(output_format="chunks")
+        sequence_ids = [f"s{index}" for index in range(10)]
+        frame = self._sequence_frame({sequence_id: 2 for sequence_id in sequence_ids})
+        labels = pd.DataFrame({
+            "sequence_id": sequence_ids,
+            "bfrb": ["A"] * 5 + ["B"] * 5,
+        })
+
+        _, validation = classifier._split_validation_sequences(frame, labels)
+
+        validation_labels = validation[["sequence_id"]].drop_duplicates().merge(
+            labels, on="sequence_id"
+        )["bfrb"]
+        self.assertEqual(validation_labels.value_counts().to_dict(), {"A": 2, "B": 2})
+
+        rare_ids = [f"r{index}" for index in range(6)]
+        rare_frame = self._sequence_frame({sequence_id: 2 for sequence_id in rare_ids})
+        rare_labels = pd.DataFrame({"sequence_id": rare_ids, "bfrb": rare_ids})
+        train, validation = classifier._split_validation_sequences(rare_frame, rare_labels)
+        self.assertTrue(
+            set(train["sequence_id"].unique()).isdisjoint(validation["sequence_id"].unique())
+        )
+
+    def test_fit_uses_explicit_validation_and_augments_training_only(self):
+        class SpyAugmentor:
+            def __init__(self):
+                self.calls = 0
+
+            def fit_transform(self, frame):
+                self.calls += 1
+                self.seen_sequence_ids = set(frame["sequence_id"].unique())
+                return frame.copy()
+
+        class RecordingModel:
+            def fit(self, *args, **kwargs):
+                self.fit_kwargs = kwargs
+                return SimpleNamespace(history={
+                    "loss": [1.0],
+                    "val_loss": [1.1],
+                    "val_accuracy": [0.5],
+                })
+
+        extractor = SequenceExtractor(
+            output_format="chunks",
+            chunk_window_size=2,
+            chunk_stride=2,
+            maxlen=0,
+        )
+
+        def fake_fit(extractor_self, frame, y=None):
+            extractor_self.feature_names_in_ = np.array(["acc_x"])
+            return extractor_self
+
+        def fake_transform_chunks(extractor_self, frame):
+            chunk_ids = np.repeat(frame["sequence_id"].drop_duplicates().to_numpy(), 2)
+            return {
+                "X": np.zeros((len(chunk_ids), 2, 1), dtype=np.float32),
+                "mask": np.ones((len(chunk_ids), 2), dtype=bool),
+                "sequence_ids": chunk_ids,
+                "feature_names": ["acc_x"],
+            }
+
+        extractor.fit = MethodType(fake_fit, extractor)
+        extractor.transform_chunks = MethodType(fake_transform_chunks, extractor)
+        augmentor = SpyAugmentor()
+        classifier = mba.MultiBranchSequenceClassifier(
+            extractor=extractor,
+            augmentor=augmentor,
+            validation_split=0.25,
+            class_weight_mode=None,
+            early_stopping_patience=0,
+            random_state=13,
+        )
+        frame = self._sequence_frame({"a": 4, "b": 4, "c": 4, "d": 4})
+        labels = pd.DataFrame({"sequence_id": ["a", "b", "c", "d"], "bfrb": ["target"] * 4})
+        model = RecordingModel()
+
+        with patch.object(mba, "TENSORFLOW_AVAILABLE", True), \
+                patch.object(mba, "clone", side_effect=lambda estimator: estimator), \
+                patch.object(mba, "build_multibranch_model", return_value=model):
+            classifier.fit(frame, labels)
+
+        self.assertTrue(set(classifier.train_sequence_ids_).isdisjoint(classifier.validation_sequence_ids_))
+        self.assertEqual(augmentor.calls, 1)
+        self.assertEqual(augmentor.seen_sequence_ids, set(classifier.train_sequence_ids_))
+        self.assertIsNotNone(model.fit_kwargs["validation_data"])
+        self.assertEqual(model.fit_kwargs["validation_split"], 0.0)
+        self.assertIn("val_loss", classifier.history_)
+        self.assertIn("val_accuracy", classifier.history_)
+
+        validation_rows = frame[frame["sequence_id"].isin(classifier.validation_sequence_ids_)]
+        classifier._transform_to_branches(validation_rows)
+        self.assertEqual(augmentor.calls, 1)
+
+    def test_none_stft_cwt_configs_create_no_branches(self):
+        extractor = SequenceExtractor(
+            output_format="chunks",
+            stft_configs=None,
+            cwt_configs=None,
+        )
+        classifier = mba.MultiBranchSequenceClassifier(extractor=extractor)
+        classifier.extractor_ = extractor
+
+        self.assertEqual(extractor.stft_extractors, [])
+        self.assertEqual(extractor.cwt_extractors, [])
+        self.assertEqual(set(classifier._branch_groups(["acc_x"])), {"acc"})
+
+    def test_callbacks_monitor_validation_loss_only_when_validation_exists(self):
+        class Callback:
+            def __init__(self, monitor=None, **kwargs):
+                self.monitor = monitor
+
+        callback_module = SimpleNamespace(
+            EarlyStopping=Callback,
+            ReduceLROnPlateau=Callback,
+            LearningRateScheduler=Callback,
+        )
+        classifier = mba.MultiBranchSequenceClassifier(
+            early_stopping_patience=2,
+            use_lr_scheduler=True,
+            lr_scheduler_type="plateau",
+        )
+        with patch.object(mba, "callbacks", callback_module):
+            validation_callbacks = classifier._build_callbacks(has_validation_data=True)
+            no_validation_callbacks = classifier._build_callbacks(has_validation_data=False)
+
+        self.assertEqual(validation_callbacks[0].monitor, "val_loss")
+        self.assertEqual(no_validation_callbacks[0].monitor, "loss")
+        self.assertEqual(len(validation_callbacks), 2)
+        self.assertEqual(len(no_validation_callbacks), 1)
 
     def test_crop_modes_choose_expected_timesteps(self):
         frame = self._sequence_frame({"long": 500})

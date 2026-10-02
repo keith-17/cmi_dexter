@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from sklearn.base import BaseEstimator, ClassifierMixin, clone
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.utils.validation import check_is_fitted
 from sklearn.utils.class_weight import compute_class_weight
@@ -374,6 +375,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         self,
         primary_target: str = "bfrb",
         extractor: Optional[SequenceExtractor] = None,
+        augmentor: Optional[BaseEstimator] = None,
         branch_filters: Optional[Dict[str, int]] = None,
         branch_kernel_sizes: Optional[Dict[str, int]] = None,
         branch_pool_sizes: Optional[Dict[str, int]] = None,
@@ -425,6 +427,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
     ):
         self.primary_target = primary_target
         self.extractor = extractor
+        self.augmentor = augmentor
         self.branch_filters = branch_filters
         self.branch_kernel_sizes = branch_kernel_sizes
         self.branch_pool_sizes = branch_pool_sizes
@@ -516,6 +519,58 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
             return y_arr
         raise ValueError("Could not align y to sequence_ids.")
 
+    def _split_validation_sequences(self, X, y):
+        seq_col = getattr(self.extractor_, "sequence_col", "sequence_id")
+        if seq_col not in X.columns:
+            raise ValueError(f"X must contain sequence_id column {seq_col!r}.")
+
+        all_sequence_ids = pd.Index(X[seq_col].drop_duplicates(), name=seq_col)
+        if self.validation_split is None or self.validation_split <= 0:
+            self.train_sequence_ids_ = all_sequence_ids
+            self.validation_sequence_ids_ = pd.Index([], name=seq_col)
+            return X.copy(), None
+        if not 0 < self.validation_split < 1:
+            raise ValueError("validation_split must be in [0, 1).")
+        if len(all_sequence_ids) < 2:
+            raise ValueError("At least two unique sequence_ids are required for validation splitting.")
+
+        sequence_labels = self._align_y(all_sequence_ids, y)
+        try:
+            train_ids, validation_ids = train_test_split(
+                all_sequence_ids.to_numpy(),
+                test_size=self.validation_split,
+                random_state=self.random_state,
+                stratify=sequence_labels,
+            )
+        except ValueError:
+            splitter = GroupShuffleSplit(
+                n_splits=1,
+                test_size=self.validation_split,
+                random_state=self.random_state,
+            )
+            train_idx, validation_idx = next(
+                splitter.split(all_sequence_ids, groups=all_sequence_ids.to_numpy())
+            )
+            train_ids = all_sequence_ids.to_numpy()[train_idx]
+            validation_ids = all_sequence_ids.to_numpy()[validation_idx]
+
+        self.train_sequence_ids_ = pd.Index(train_ids, name=seq_col)
+        self.validation_sequence_ids_ = pd.Index(validation_ids, name=seq_col)
+        overlap = self.train_sequence_ids_.intersection(self.validation_sequence_ids_)
+        if not overlap.empty:
+            raise AssertionError(f"Sequence leakage in internal validation split: {overlap.tolist()}")
+
+        train_mask = X[seq_col].isin(self.train_sequence_ids_)
+        validation_mask = X[seq_col].isin(self.validation_sequence_ids_)
+        return X.loc[train_mask].copy(), X.loc[validation_mask].copy()
+
+    def _augment_training_sequences(self, X):
+        if self.augmentor is None:
+            self.augmentor_ = None
+            return X.copy()
+        self.augmentor_ = clone(self.augmentor)
+        return self.augmentor_.fit_transform(X)
+
     def _branch_groups(self, feature_names):
         stft_prefixes = [e.feature_prefix for e in getattr(self.extractor_, "stft_extractors", [])]
         cwt_prefixes = [e.feature_prefix for e in getattr(self.extractor_, "cwt_extractors", [])]
@@ -544,16 +599,16 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         branch_arrays = self._split_branches(chunks["X"], chunks["mask"], self.branch_groups_)
         return branch_arrays, chunks["sequence_ids"]
 
-    def _build_callbacks(self):
+    def _build_callbacks(self, has_validation_data: bool = False):
         cb = []
         if self.early_stopping_patience and self.early_stopping_patience > 0:
             cb.append(callbacks.EarlyStopping(
-                monitor="val_loss" if self.validation_split else "loss",
+                monitor="val_loss" if has_validation_data else "loss",
                 patience=self.early_stopping_patience,
                 restore_best_weights=True,
             ))
-        if self.use_lr_scheduler and self.validation_split and self.validation_split > 0:
-            if str(self.lr_scheduler_type).lower() == "plateau":
+        if self.use_lr_scheduler:
+            if str(self.lr_scheduler_type).lower() == "plateau" and has_validation_data:
                 cb.append(callbacks.ReduceLROnPlateau(
                     monitor="val_loss",
                     factor=self.lr_factor,
@@ -585,9 +640,23 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         self.extractor_ = clone(self.extractor) if self.extractor is not None else self._default_extractor()
         self._validate_extractor()
 
+        X_train, X_validation = self._split_validation_sequences(X, y)
+        validation_data = None
+        if X_validation is not None and X_validation.empty:
+            raise ValueError("Internal validation split produced no validation rows.")
+
+        X_train = self._augment_training_sequences(X_train)
+
         try:
-            self.extractor_.fit(X)
-            chunks = self.extractor_.transform_chunks(X)
+            # STFT/CWT features summarize each whole sequence; split sequences
+            # first, then fit/transform train and validation partitions separately.
+            self.extractor_.fit(X_train)
+            train_chunks = self.extractor_.transform_chunks(X_train)
+            validation_chunks = (
+                self.extractor_.transform_chunks(X_validation)
+                if X_validation is not None
+                else None
+            )
         except InvalidExtractorParams:
             raise
         except Exception as exc:
@@ -595,21 +664,48 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
                 f"MultiBranchSequenceClassifier fit failed during extraction: {exc}"
             ) from exc
 
-        self.feature_names_ = list(chunks["feature_names"])
+        self.feature_names_ = list(train_chunks["feature_names"])
         self.branch_groups_ = self._branch_groups(self.feature_names_)
         if not self.branch_groups_:
             raise InvalidExtractorParams("No modality branches could be built from the extracted features.")
 
-        branch_arrays = self._split_branches(chunks["X"], chunks["mask"], self.branch_groups_)
+        branch_arrays = self._split_branches(train_chunks["X"], train_chunks["mask"], self.branch_groups_)
         flat_check = np.concatenate([arr.reshape(len(arr), -1) for arr in branch_arrays.values()], axis=1)
         if not np.isfinite(flat_check).all():
             raise InvalidExtractorParams("Feature extraction produced non-finite branch values.")
 
-        y_aligned = self._align_y(chunks["sequence_ids"], y)
+        time_series_shapes = {name: arr.shape[1:] for name, arr in branch_arrays.items() if name in TIME_SERIES_BRANCHES}
+        static_shapes = {name: arr.shape[1] for name, arr in branch_arrays.items() if name in STATIC_BRANCHES}
+        self.input_order_ = list(time_series_shapes.keys()) + list(static_shapes.keys())
+        model_inputs = [branch_arrays[name] for name in self.input_order_]
+
+        y_aligned = self._align_y(train_chunks["sequence_ids"], y)
         self.le_ = LabelEncoder()
         self.le_.fit(y_aligned)
         self.classes_ = self.le_.classes_
         y_enc = self.le_.transform(y_aligned)
+
+        validation_arrays = None
+        validation_inputs = None
+        validation_labels = None
+        if validation_chunks is not None:
+            train_chunk_ids = pd.Index(train_chunks["sequence_ids"])
+            validation_chunk_ids = pd.Index(validation_chunks["sequence_ids"])
+            overlap = train_chunk_ids.unique().intersection(validation_chunk_ids.unique())
+            if not overlap.empty:
+                raise AssertionError(f"Sequence leakage between train and validation chunks: {overlap.tolist()}")
+            validation_arrays = self._split_branches(
+                validation_chunks["X"], validation_chunks["mask"], self.branch_groups_
+            )
+            validation_inputs = [validation_arrays[name] for name in self.input_order_]
+            validation_y = self._align_y(validation_chunks["sequence_ids"], y)
+            try:
+                validation_labels = self.le_.transform(validation_y)
+            except ValueError as exc:
+                raise ValueError(
+                    "Internal validation contains a target class absent from the training split."
+                ) from exc
+            validation_data = (validation_inputs, validation_labels)
 
         sample_weight = None
         if self.class_weight_mode == "balanced":
@@ -617,9 +713,6 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
             weights = compute_class_weight("balanced", classes=uniq_classes, y=y_enc)
             weight_map = dict(zip(uniq_classes, weights))
             sample_weight = np.array([weight_map[v] for v in y_enc], dtype=np.float32)
-
-        time_series_shapes = {name: arr.shape[1:] for name, arr in branch_arrays.items() if name in TIME_SERIES_BRANCHES}
-        static_shapes = {name: arr.shape[1] for name, arr in branch_arrays.items() if name in STATIC_BRANCHES}
 
         self.model_ = build_multibranch_model(
             time_series_shapes=time_series_shapes,
@@ -650,16 +743,15 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
             random_state=self.random_state,
         )
 
-        self.input_order_ = list(time_series_shapes.keys()) + list(static_shapes.keys())
-        model_inputs = [branch_arrays[name] for name in self.input_order_]
-        cb = self._build_callbacks()
+        cb = self._build_callbacks(has_validation_data=validation_data is not None)
 
         history = self.model_.fit(
             model_inputs, y_enc,
             sample_weight=sample_weight,
             epochs=self.epochs,
             batch_size=self.batch_size,
-            validation_split=self.validation_split or 0.0,
+            validation_data=validation_data,
+            validation_split=0.0,
             callbacks=cb,
             verbose=self.verbose,
         )
