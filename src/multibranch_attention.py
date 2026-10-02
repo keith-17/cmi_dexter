@@ -484,6 +484,8 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
                 self.extractor_.set_params(output_format="chunks")
             except Exception:
                 pass
+        if hasattr(self.extractor_, "_normalize_chunk_stride"):
+            self.extractor_._normalize_chunk_stride()
         validate_sequence_extractor_params(self.extractor_.get_params(), for_frame_output=False)
 
     def _align_y(self, sequence_ids, y):

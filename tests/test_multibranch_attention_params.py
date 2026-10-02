@@ -8,6 +8,8 @@ removed, or incorrectly serialised parameters before a long grid/Bayesian run.
 from __future__ import annotations
 
 import ast
+from contextlib import redirect_stdout
+from io import StringIO
 import inspect
 import json
 import sys
@@ -15,6 +17,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 from sklearn.base import clone
 from sklearn.pipeline import Pipeline
 
@@ -24,7 +27,7 @@ SRC = ROOT / "src"
 sys.path.insert(0, str(SRC))
 
 import multibranch_attention as mba  # noqa: E402
-from base_utils_qwen import SensorAugmentor, SequenceExtractor  # noqa: E402
+from base_utils_qwen import InvalidExtractorParams, SensorAugmentor, SequenceExtractor  # noqa: E402
 
 
 NOTEBOOK = ROOT / "notebooks" / "multibranch_attention.ipynb"
@@ -92,6 +95,26 @@ class NotebookParameterContractTests(unittest.TestCase):
         self.assertFalse(
             any(norm is not None and value is not None for norm in norm_values for value in value_values)
         )
+
+    def test_total_window_limit_rejects_before_chunk_creation(self):
+        extractor = SequenceExtractor(
+            output_format="chunks",
+            chunk_window_size=100,
+            chunk_stride=50,
+            max_total_windows=1,
+        )
+        extractor.feature_names_in_ = np.array(["feature"])
+        extractor._preprocess_features = lambda frame: frame
+        frame = pd.DataFrame({
+            "sequence_id": ["sequence"] * 150,
+            "feature": np.arange(150),
+        })
+
+        output = StringIO()
+        with self.assertRaisesRegex(InvalidExtractorParams, "estimated=2, cap=1"):
+            with redirect_stdout(output):
+                extractor.transform_chunks(frame)
+        self.assertIn("sequences=1, maxlen=160, window=100, stride=50", output.getvalue())
 
     def test_new_model_parameters_are_constructor_parameters(self):
         constructor_params = set(inspect.signature(mba.MultiBranchSequenceClassifier.__init__).parameters)

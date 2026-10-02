@@ -98,6 +98,9 @@ def validate_sequence_extractor_params(
     if params.get("maxlen") is not None:
         _positive_int(params.get("maxlen"), name="maxlen")
 
+    if params.get("max_total_windows") is not None:
+        _positive_int(params.get("max_total_windows"), name="max_total_windows")
+
     resample_modalities = bool(params.get("resample_modalities", False))
 
     rate_specs = [
@@ -1181,6 +1184,9 @@ class SequenceExtractor(HoneycombBase):
         # --- chunking for chunk output ---
         chunk_window_size: Optional[int] = 128,
         chunk_stride: Optional[int] = 64,
+        max_total_windows: Optional[int] = None,
+        use_chunk_stride_ratio: bool = False,
+        chunk_stride_ratio: float = 0.5,
         output_format: str = "chunks",
         frame_stats: str = "mean,std,min,max,last",
         add_global_context: bool = False,
@@ -1254,6 +1260,9 @@ class SequenceExtractor(HoneycombBase):
 
         self.chunk_window_size = chunk_window_size
         self.chunk_stride = chunk_stride
+        self.max_total_windows = max_total_windows
+        self.use_chunk_stride_ratio = use_chunk_stride_ratio
+        self.chunk_stride_ratio = chunk_stride_ratio
         self.output_format = output_format
         self.frame_stats = frame_stats
         self.add_global_context = add_global_context
@@ -1545,16 +1554,30 @@ class SequenceExtractor(HoneycombBase):
 
     # ---------- fit ----------
 
-    def fit(self, X: pd.DataFrame, y: Optional[pd.DataFrame] = None):
-        if (
-            str(self.output_format).lower() != "frame"
-            and self.chunk_window_size is not None
-            and self.chunk_stride is not None
-        ):
-            window = _positive_int(self.chunk_window_size, name="chunk_window_size")
+    def _normalize_chunk_stride(self) -> None:
+        if str(self.output_format).lower() == "frame" or self.chunk_window_size is None:
+            return
+
+        window = _positive_int(self.chunk_window_size, name="chunk_window_size")
+        if self.use_chunk_stride_ratio:
+            try:
+                ratio = float(self.chunk_stride_ratio)
+            except (TypeError, ValueError) as exc:
+                raise InvalidExtractorParams(
+                    f"chunk_stride_ratio must be between 0 and 1, got {self.chunk_stride_ratio!r}"
+                ) from exc
+            if not 0 < ratio <= 1:
+                raise InvalidExtractorParams(
+                    f"chunk_stride_ratio must be between 0 and 1, got {ratio!r}"
+                )
+            self.chunk_stride = max(1, int(round(window * ratio)))
+        elif self.chunk_stride is not None:
             stride = _positive_int(self.chunk_stride, name="chunk_stride")
             if stride > window:
                 self.chunk_stride = window
+
+    def fit(self, X: pd.DataFrame, y: Optional[pd.DataFrame] = None):
+        self._normalize_chunk_stride()
 
         validate_sequence_extractor_params(
             self.get_params(),
@@ -1653,6 +1676,34 @@ class SequenceExtractor(HoneycombBase):
         for col in self.feature_names_in_:
             if col not in out.columns:
                 out[col] = 0.0
+
+        if self.max_total_windows is not None:
+            limit = _positive_int(self.max_total_windows, name="max_total_windows")
+            maxlen = int(self.maxlen) if self.maxlen is not None and int(self.maxlen) > 0 else None
+            total_windows = 0
+            for sequence_length in out.groupby(self.sequence_col, sort=False).size():
+                length = min(int(sequence_length), maxlen) if maxlen is not None else int(sequence_length)
+                if length <= 0:
+                    continue
+                window = self.chunk_window_size
+                if window is None or int(window) <= 0:
+                    window = maxlen if maxlen is not None else length
+                window = int(window)
+                stride = self.chunk_stride
+                stride = window if stride is None or int(stride) <= 0 else int(stride)
+                if length <= window:
+                    total_windows += 1
+                else:
+                    total_windows += (length - window + stride - 1) // stride + 1
+            if total_windows > limit:
+                message = (
+                    f"Chunk window cap exceeded: estimated={total_windows:,}, cap={limit:,}, "
+                    f"sequences={out[self.sequence_col].nunique():,}, maxlen={self.maxlen}, "
+                    f"window={self.chunk_window_size}, stride={self.chunk_stride}."
+                )
+                print(message)
+                raise InvalidExtractorParams(message)
+
         sequences, masks, seq_ids = [], [], []
         for seq_id, g in out.groupby(self.sequence_col, sort=False):
             if len(g) == 0:
