@@ -14,6 +14,25 @@ spec.loader.exec_module(workflow)
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_two_iteration_test_changes_only_packaged_iteration_count(self):
+        original_bytes = (ROOT / 'notebooks/multibranch_attention.ipynb').read_bytes()
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(workflow, 'BUILD', Path(temporary)):
+                metadata = workflow.prepare(iterations=2)
+                packaged = json.loads((Path(temporary) / metadata['code_file']).read_text())
+                original = json.loads(original_bytes)
+                changed = 0
+                for before, after in zip(original['cells'], packaged['cells'][1:]):
+                    expected, actual = ''.join(before['source']), ''.join(after['source'])
+                    if expected != actual:
+                        changed += 1
+                        self.assertEqual(actual, expected.replace('n_iter = 37', 'n_iter = 2'))
+                self.assertEqual(changed, 1)
+                manifest = json.loads((Path(temporary) / 'submission.json').read_text())
+                self.assertEqual(manifest['search_iterations'], 2)
+                self.assertEqual(manifest['iteration_override'], 2)
+        self.assertEqual(original_bytes, (ROOT / 'notebooks/multibranch_attention.ipynb').read_bytes())
+
     def test_acknowledged_version_survives_prepare(self):
         with tempfile.TemporaryDirectory() as temporary:
             with patch.object(workflow, 'BUILD', Path(temporary)):

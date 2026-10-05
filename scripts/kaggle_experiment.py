@@ -32,7 +32,9 @@ def cli(*args):
     return result.stdout
 
 
-def prepare():
+def prepare(iterations=None):
+    if iterations is not None and iterations < 1:
+        raise RuntimeError('Iteration override must be a positive integer.')
     branch = subprocess.run(['git', 'branch', '--show-current'], cwd=ROOT,
                             capture_output=True, text=True, check=True).stdout.strip()
     if branch != 'multibranch/v0/develop':
@@ -40,6 +42,20 @@ def prepare():
     metadata = json.loads(METADATA.read_text(encoding='utf-8'))
     notebook_path = ROOT / 'notebooks' / 'multibranch_attention.ipynb'
     notebook = json.loads(notebook_path.read_text(encoding='utf-8'))
+    iteration_cells = [c for c in notebook['cells'] if c['cell_type'] == 'code'
+                       and re.search(r'^n_iter\s*=\s*\d+\b', ''.join(c['source']), re.MULTILINE)]
+    if len(iteration_cells) != 1:
+        raise RuntimeError('Expected exactly one literal n_iter configuration assignment.')
+    configuration = iteration_cells[0]
+    config_source = ''.join(configuration['source'])
+    original_iterations = int(re.search(r'^n_iter\s*=\s*(\d+)\b', config_source, re.MULTILINE).group(1))
+    if iterations is not None:
+        config_source, count = re.subn(r'^(n_iter\s*=\s*)\d+\b',
+                                     lambda match: match.group(1) + str(iterations),
+                                     config_source, flags=re.MULTILINE)
+        if count != 1:
+            raise RuntimeError('Iteration override must change exactly one assignment.')
+        configuration['source'] = config_source.splitlines(keepends=True)
     modules = sorted((ROOT / 'src').glob('*.py'))
     if not {'data_utils.py', 'base_utils_qwen.py', 'multibranch_attention.py'} <= {p.name for p in modules}:
         raise RuntimeError('Required Python utility modules are missing from src/.')
@@ -88,6 +104,8 @@ print('Data:', data_dir)
     (BUILD / metadata['code_file']).write_text(json.dumps(notebook, indent=1), encoding='utf-8')
     (BUILD / 'kernel-metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
     manifest = {'branch': branch, 'kernel': metadata['id'],
+                'search_iterations': iterations if iterations is not None else original_iterations,
+                'iteration_override': iterations,
                 'created_utc': datetime.now(timezone.utc).isoformat(),
                 'submitted_source_sha256': source_hash(notebook),
                 'sha256': {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
@@ -180,13 +198,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['auth', 'prepare', 'push', 'status', 'logs', 'wait', 'download', 'pull'])
     parser.add_argument('--interval', type=int, default=60, help='Polling interval in seconds for wait (minimum 15).')
+    parser.add_argument('--iterations', type=int, help='Override only the packaged Bayesian iteration count; local notebook stays unchanged.')
     args = parser.parse_args()
     metadata = json.loads(METADATA.read_text(encoding='utf-8'))
     try:
         if args.action == 'auth':
             subprocess.run([sys.executable, '-m', 'kaggle', 'auth', 'login'], check=True)
         elif args.action in ('prepare', 'push'):
-            prepare()
+            prepare(args.iterations)
             if args.action == 'push':
                 record_submission(cli('kernels', 'push', '-p', str(BUILD)))
         elif args.action == 'status':

@@ -83,11 +83,13 @@ Version **33** was accepted by Kaggle for `keithmarange/multibranch-attention`.
 Live streamed logs confirmed two Tesla T4 GPUs, successful local module imports,
 CMI data loading (8,151 sequences; 5,113 after filters), the existing 3,856/629
 train/holdout split, validation of 90 search parameters, and the first search fit.
-At the last check the full experiment was RUNNING. Completion and real CSV
-collection remain pending and are monitored by a five-minute chat follow-up.
+Version 33 was subsequently canceled at the user's request. Version 34 was
+submitted as a 2-iteration validation run. Its verified completion and all three
+CSV downloads are required before restarting the original 37-iteration run.
+A five-minute chat follow-up monitors both stages.
 No architecture or experiment source files were changed.
 
-Seven workflow tests pass, covering exact experiment/module packaging, acknowledged
+Eight workflow tests pass, covering exact experiment/module packaging, acknowledged
 version persistence, completed remote source verification, automatic collection,
 nested outputs, incomplete outputs and unsafe archives. Run them with:
 
@@ -98,3 +100,10 @@ nested outputs, incomplete outputs and unsafe archives. Run them with:
 The broader suite was exercised in `ds_kaggle` with TensorFlow available: 30 tests
 ran, with two existing behavior/expectation failures in gradient clipping and
 plateau callback construction. These were left unchanged to preserve ML behavior.
+
+## Short validation run
+
+Use push --iterations 2 to change only the packaged Bayesian iteration count.
+The local notebook and all other experiment parameters remain unchanged. The
+acknowledged manifest records search_iterations and iteration_override.
+Submit the original full experiment with push after validating the short run.
