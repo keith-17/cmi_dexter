@@ -1,0 +1,13 @@
+{
+  "id": "keithmarange/multibranch-attention",
+  "title": "multibranch attention",
+  "code_file": "multibranch_attention.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "competition_sources": ["cmi-detect-behavior-with-sensor-data"],
+  "kernel_sources": []
+}
