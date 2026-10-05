@@ -1,0 +1,483 @@
+diff --git a/.gitignore b/.gitignore
+index 9f662e4..91a8fcc 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -33,3 +33,15 @@ data/
+ # IDE
+ .idea/
+ .vscode/
++
++# Kaggle credentials and generated result directories
++kaggle.json
++.kaggle/
++.env
++results_*/
++# Share only project tasks/settings, never personal VS Code state
++!.vscode/
++.vscode/*
++!.vscode/tasks.json
++!.vscode/settings.json
++!requirements-kaggle.txt
+diff --git a/.vscode/settings.json b/.vscode/settings.json
+new file mode 100644
+index 0000000..dbd8e30
+--- /dev/null
++++ b/.vscode/settings.json
+@@ -0,0 +1,5 @@
++{
++  "python.analysis.extraPaths": [
++    "./src"
++  ]
++}
+diff --git a/.vscode/tasks.json b/.vscode/tasks.json
+new file mode 100644
+index 0000000..482f87c
+--- /dev/null
++++ b/.vscode/tasks.json
+@@ -0,0 +1,83 @@
++{
++  "version": "2.0.0",
++  "tasks": [
++    {
++      "label": "Kaggle: Sign in",
++      "type": "process",
++      "command": "${command:python.interpreterPath}",
++      "args": [
++        "${workspaceFolder}/scripts/kaggle_experiment.py",
++        "auth"
++      ],
++      "options": {
++        "cwd": "${workspaceFolder}"
++      },
++      "problemMatcher": []
++    },
++    {
++      "label": "Kaggle: Prepare experiment",
++      "type": "process",
++      "command": "${command:python.interpreterPath}",
++      "args": [
++        "${workspaceFolder}/scripts/kaggle_experiment.py",
++        "prepare"
++      ],
++      "options": {
++        "cwd": "${workspaceFolder}"
++      },
++      "problemMatcher": []
++    },
++    {
++      "label": "Kaggle: Push experiment (GPU)",
++      "type": "process",
++      "command": "${command:python.interpreterPath}",
++      "args": [
++        "${workspaceFolder}/scripts/kaggle_experiment.py",
++        "push"
++      ],
++      "options": {
++        "cwd": "${workspaceFolder}"
++      },
++      "problemMatcher": []
++    },
++    {
++      "label": "Kaggle: Check status",
++      "type": "process",
++      "command": "${command:python.interpreterPath}",
++      "args": [
++        "${workspaceFolder}/scripts/kaggle_experiment.py",
++        "status"
++      ],
++      "options": {
++        "cwd": "${workspaceFolder}"
++      },
++      "problemMatcher": []
++    },
++    {
++      "label": "Kaggle: Download results",
++      "type": "process",
++      "command": "${command:python.interpreterPath}",
++      "args": [
++        "${workspaceFolder}/scripts/kaggle_experiment.py",
++        "download"
++      ],
++      "options": {
++        "cwd": "${workspaceFolder}"
++      },
++      "problemMatcher": []
++    },
++    {
++      "label": "Kaggle: Pull remote copy",
++      "type": "process",
++      "command": "${command:python.interpreterPath}",
++      "args": [
++        "${workspaceFolder}/scripts/kaggle_experiment.py",
++        "pull"
++      ],
++      "options": {
++        "cwd": "${workspaceFolder}"
++      },
++      "problemMatcher": []
++    }
++  ]
++}
+diff --git a/KAGGLE_WORKFLOW.md b/KAGGLE_WORKFLOW.md
+new file mode 100644
+index 0000000..866cf86
+--- /dev/null
++++ b/KAGGLE_WORKFLOW.md
+@@ -0,0 +1,105 @@
++# Local VS Code development, Kaggle GPU execution
++
++PR #12 is based on `multibranch/v0/develop`. Keep working on that branch and
++`notebooks/multibranch_attention.ipynb`, with Python modules in `src/`.
++The similarly named `multi_branch/develop` is a different branch.
++
++## Install these additions on Windows
++
++Copy the files in this setup archive into your existing project root. The archive
++contains additions and a patch; it does not replace your notebook or utility files.
++Append `gitignore-additions.txt` to your existing `.gitignore`. Alternatively,
++apply only `cmi_kaggle_setup.patch` with `git apply` on the PR #12 branch instead
++of copying the additions. Do not use both installation methods.
++In PowerShell:
++
++```powershell
++Set-Location 'C:\Users\maran\OneDrive\Documents\Git Profile\cmi_dexter'
++git branch --show-current
++python -m pip install -r requirements-kaggle.txt
++python scripts/kaggle_experiment.py auth
++```
++
++Choose your intended Python environment in VS Code first. The tasks use that
++interpreter. CLI-only submission does not require a local TensorFlow/GPU install.
++For running the notebook locally, your existing ML environment is still required.
++This script requires Python 3.10 or newer.
++
++Sign in as `keithmarange` using Kaggle's browser authentication flow. Alternatively,
++generate an API token in https://www.kaggle.com/settings/api and save it in
++`C:\Users\maran\.kaggle\access_token`. Existing legacy credentials in
++`C:\Users\maran\.kaggle\kaggle.json` are also supported by the CLI.
++Never put credentials in the repository or notebook.
++
++Accept the competition rules while signed in at
++https://www.kaggle.com/competitions/cmi-detect-behavior-with-sensor-data/rules .
++Ensure your Kaggle account has GPU access and remaining quota.
++
++## Daily workflow
++
++Save the notebook and changed modules in VS Code, then run:
++
++```powershell
++python scripts/kaggle_experiment.py prepare
++python scripts/kaggle_experiment.py push
++python scripts/kaggle_experiment.py status
++# Run once the job reports COMPLETE:
++python scripts/kaggle_experiment.py download
++```
++
++The same commands are available under Terminal > Run Task > Kaggle in VS Code.
++`prepare` is optional before `push`: pushing always rebuilds from saved local files.
++`push` creates a new executable version of `keithmarange/multibranch-attention`.
++The metadata requests a private GPU notebook with internet access and attached
++CMI competition data. Inspect/edit `kaggle/kernel-metadata.json` if you want another
++kernel ID or visibility. This executes the existing full search, including its
++37 Bayesian iterations; it may consume substantial GPU time.
++
++Generated submission files live in `kaggle_build/multibranch_attention/`.
++An added first cell reconstructs the current `src/*.py` files in
++`/kaggle/working/src`, installs missing scikit-optimize/PyWavelets, checks TensorFlow
++GPU access and locates competition data. It preserves Kaggle's TensorFlow install.
++The original experiment cells and parameter spaces are unchanged.
++Working-directory routing places the notebook's existing result directories under
++`/kaggle/working`, where Kaggle retains outputs.
++
++Downloads go to `results/kaggle/<download-time>/<original-output-path>/` and include:
++
++- `multibranch_attention_cv.csv`
++- `multibranch_attention_best.csv` (best parameters and scores)
++- `multibranch_attention_holdout.csv`
++
++The downloader requests those CSVs, avoiding the large saved H5 model. It requires
++a complete set and uses fresh download folders to avoid stale outputs. Check status
++before downloading; a failed job will not yield a complete result set. The included
++`local_submission.json` records the last locally prepared source hashes and branch;
++it is local provenance, not a server-confirmed version association. Avoid concurrent
++submissions from multiple machines to the same kernel ID.
++
++To inspect the existing remote notebook without overwriting local work:
++
++```powershell
++python scripts/kaggle_experiment.py pull
++```
++
++This implements `kaggle kernels pull keithmarange/multibranch-attention -m` into
++`kaggle_build/multibranch_attention/remote/`. Do not pull into `notebooks/` while
++editing, because that may overwrite local work.
++
++## Validation and current limits
++
++```powershell
++python -m unittest discover -s tests -v
++```
++
++Offline packaging and result-collection integration tests pass. They verify that
++the submitted experiment cells are identical, embedded module bytes match `src/`,
++nested CSV output is collected, and incomplete/unsafe archives are rejected.
++The existing parameter contract tests also pass; TensorFlow construction tests were
++skipped in the setup session because TensorFlow was unavailable.
++
++Kaggle CLI 2.2.4 was installed and its status command exercised. Live API access
++stopped at Kaggle's authentication requirement: the setup session had no account
++credentials. No live kernel pull, GPU submission, training, or real result download
++has been verified. Complete the sign-in and daily workflow above on your computer
++before considering the remote workflow validated end-to-end.
+diff --git a/kaggle/kernel-metadata.json b/kaggle/kernel-metadata.json
+new file mode 100644
+index 0000000..9c7f963
+--- /dev/null
++++ b/kaggle/kernel-metadata.json
+@@ -0,0 +1,13 @@
++{
++  "id": "keithmarange/multibranch-attention",
++  "title": "multibranch attention",
++  "code_file": "multibranch_attention.ipynb",
++  "language": "python",
++  "kernel_type": "notebook",
++  "is_private": true,
++  "enable_gpu": true,
++  "enable_internet": true,
++  "dataset_sources": [],
++  "competition_sources": ["cmi-detect-behavior-with-sensor-data"],
++  "kernel_sources": []
++}
+diff --git a/requirements-kaggle.txt b/requirements-kaggle.txt
+new file mode 100644
+index 0000000..ea8e818
+--- /dev/null
++++ b/requirements-kaggle.txt
+@@ -0,0 +1 @@
++kaggle==2.2.4
+diff --git a/scripts/kaggle_experiment.py b/scripts/kaggle_experiment.py
+new file mode 100644
+index 0000000..5a38bc2
+--- /dev/null
++++ b/scripts/kaggle_experiment.py
+@@ -0,0 +1,151 @@
++"""Submit the current local notebook and src snapshot to Kaggle."""
++from __future__ import annotations
++
++import argparse
++import base64
++from datetime import datetime, timezone
++import hashlib
++import json
++from pathlib import Path
++import shutil
++import subprocess
++import sys
++import zipfile
++
++ROOT = Path(__file__).resolve().parents[1]
++BUILD = ROOT / 'kaggle_build' / 'multibranch_attention'
++METADATA = ROOT / 'kaggle' / 'kernel-metadata.json'
++CSV_NAMES = {f'multibranch_attention_{name}.csv' for name in ('cv', 'best', 'holdout')}
++
++
++def cli(*args):
++    command = [sys.executable, '-m', 'kaggle', *args]
++    result = subprocess.run(command, check=True, capture_output=True, text=True)
++    print(result.stdout, end='')
++    return result.stdout
++
++
++def prepare():
++    metadata = json.loads(METADATA.read_text(encoding='utf-8'))
++    notebook_path = ROOT / 'notebooks' / 'multibranch_attention.ipynb'
++    notebook = json.loads(notebook_path.read_text(encoding='utf-8'))
++    modules = sorted((ROOT / 'src').glob('*.py'))
++    if not {'data_utils.py', 'base_utils_qwen.py', 'multibranch_attention.py'} <= {p.name for p in modules}:
++        raise RuntimeError('Required Python utility modules are missing from src/.')
++    encoded = {p.name: base64.b64encode(p.read_bytes()).decode('ascii') for p in modules}
++    bootstrap = '''import base64, importlib.util, json, os, subprocess, sys
++from pathlib import Path
++os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
++workspace_root = Path('/kaggle/working')
++os.chdir(workspace_root)
++src_path = workspace_root / 'src'
++src_path.mkdir(exist_ok=True)
++for name, contents in MODULE_SNAPSHOT.items():
++    (src_path / name).write_bytes(base64.b64decode(contents))
++sys.path.insert(0, str(src_path))
++# Keep Kaggle's GPU TensorFlow stack; install only missing experiment dependencies.
++missing = [package for module, package in [('skopt', 'scikit-optimize==0.10.2'), ('pywt', 'PyWavelets>=1.6,<2')]
++           if importlib.util.find_spec(module) is None]
++if missing:
++    subprocess.check_call([sys.executable, '-m', 'pip', 'install', *missing])
++import tensorflow as tf
++if not tf.config.list_physical_devices('GPU'):
++    raise RuntimeError('No TensorFlow GPU detected. Check Kaggle accelerator and GPU quota.')
++data_dir = Path('/kaggle/input/cmi-detect-behavior-with-sensor-data')
++if not (data_dir / 'train.csv').exists():
++    matches = list(Path('/kaggle/input').rglob('train.csv'))
++    matches = [p for p in matches if (p.parent / 'train_demographics.csv').exists()]
++    if len(matches) != 1:
++        raise FileNotFoundError('Attach CMI competition data and accept its rules on Kaggle.')
++    data_dir = matches[0].parent
++# Existing data_utils.find_data_root() discovers this exact directory first.
++(workspace_root / 'data').symlink_to(data_dir, target_is_directory=True) if not (workspace_root / 'data').exists() else None
++print('GPU:', tf.config.list_physical_devices('GPU'))
++print('Data:', data_dir)
++'''
++    source = 'MODULE_SNAPSHOT = ' + repr(encoded) + '\n' + bootstrap
++    cell = {'cell_type': 'code', 'execution_count': None, 'metadata': {}, 'outputs': [],
++            'source': source.splitlines(keepends=True)}
++    notebook['cells'].insert(0, cell)
++    for original in notebook['cells'][1:]:
++        if original['cell_type'] == 'code':
++            original['outputs'] = []
++            original['execution_count'] = None
++            compile(''.join(original['source']), str(notebook_path), 'exec')
++    compile(source, '<kaggle bootstrap>', 'exec')
++    BUILD.mkdir(parents=True, exist_ok=True)
++    (BUILD / metadata['code_file']).write_text(json.dumps(notebook, indent=1), encoding='utf-8')
++    (BUILD / 'kernel-metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
++    branch = subprocess.run(['git', 'branch', '--show-current'], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
++    manifest = {'branch': branch, 'kernel': metadata['id'],
++                'created_utc': datetime.now(timezone.utc).isoformat(),
++                'sha256': {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
++                           for p in [notebook_path, *modules]}}
++    (BUILD / 'submission.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
++    print(f'Prepared {metadata["id"]} from branch {branch}: {BUILD}')
++    return metadata
++
++
++def collect(download_dir, destination):
++    # Some API versions package output as a zip; unpack with traversal protection.
++    for archive in download_dir.rglob('*.zip'):
++        with zipfile.ZipFile(archive) as zipped:
++            for name in zipped.namelist():
++                if not (archive.parent / name).resolve().is_relative_to(download_dir.resolve()):
++                    raise RuntimeError('Unsafe path in downloaded output archive')
++            zipped.extractall(archive.parent)
++    groups = {}
++    for path in download_dir.rglob('*.csv'):
++        if path.name in CSV_NAMES:
++            groups.setdefault(path.parent, set()).add(path.name)
++    complete = [parent for parent, names in groups.items() if names == CSV_NAMES]
++    if not complete:
++        raise RuntimeError('No complete CV/best/holdout CSV set found. Check status and downloaded logs.')
++    for parent in complete:
++        target = destination / parent.relative_to(download_dir)
++        target.mkdir(parents=True, exist_ok=True)
++        for name in CSV_NAMES:
++            shutil.copy2(parent / name, target / name)
++        print(f'Results downloaded to {target}')
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('action', choices=['auth', 'prepare', 'push', 'status', 'download', 'pull'])
++    args = parser.parse_args()
++    metadata = json.loads(METADATA.read_text(encoding='utf-8'))
++    try:
++        if args.action == 'auth':
++            subprocess.run([sys.executable, '-m', 'kaggle', 'auth', 'login'], check=True)
++        elif args.action in ('prepare', 'push'):
++            prepare()
++            if args.action == 'push':
++                cli('kernels', 'push', '-p', str(BUILD))
++        elif args.action == 'status':
++            cli('kernels', 'status', metadata['id'])
++        elif args.action == 'pull':
++            # Preserve the notebook being edited; remote copies go only in the build folder.
++            cli('kernels', 'pull', metadata['id'], '-p', str(BUILD / 'remote'), '-m')
++        else:
++            status = cli('kernels', 'status', metadata['id']).lower()
++            if 'complete' not in status:
++                raise RuntimeError('Kernel is not complete; result download postponed.')
++            stamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')
++            downloaded = BUILD / 'downloads' / stamp
++            downloaded.mkdir(parents=True)
++            cli('kernels', 'output', metadata['id'], '-p', str(downloaded),
++                '-f', r'multibranch_attention_(cv|best|holdout)\.csv$')
++            collect(downloaded, ROOT / 'results' / 'kaggle' / stamp)
++            manifest = BUILD / 'submission.json'
++            if manifest.exists():
++                shutil.copy2(manifest, ROOT / 'results' / 'kaggle' / stamp / 'local_submission.json')
++    except subprocess.CalledProcessError as error:
++        print(error.stdout or '', end='', file=sys.stderr)
++        print(error.stderr or '', end='', file=sys.stderr)
++        parser.exit(1, 'Kaggle command failed. Check CLI installation, authentication, competition rules and GPU quota.\n')
++    except (RuntimeError, FileNotFoundError) as error:
++        parser.exit(1, f'{error}\n')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tests/test_kaggle_workflow.py b/tests/test_kaggle_workflow.py
+new file mode 100644
+index 0000000..f25935d
+--- /dev/null
++++ b/tests/test_kaggle_workflow.py
+@@ -0,0 +1,63 @@
++"""Offline integration checks; no GPU or Kaggle credentials required."""
++import importlib.util
++import json
++from pathlib import Path
++import tempfile
++import unittest
++from unittest.mock import patch
++import zipfile
++
++ROOT = Path(__file__).resolve().parents[1]
++spec = importlib.util.spec_from_file_location('workflow', ROOT / 'scripts/kaggle_experiment.py')
++workflow = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(workflow)
++
++
++class WorkflowTests(unittest.TestCase):
++    def test_notebook_and_utility_snapshot_roundtrip(self):
++        original_bytes = (ROOT / 'notebooks/multibranch_attention.ipynb').read_bytes()
++        with tempfile.TemporaryDirectory() as temporary:
++            with patch.object(workflow, 'BUILD', Path(temporary)):
++                metadata = workflow.prepare()
++                notebook = json.loads((Path(temporary) / metadata['code_file']).read_text())
++            original = json.loads(original_bytes)
++            self.assertEqual(len(notebook['cells']), len(original['cells']) + 1)
++            for expected, actual in zip(original['cells'], notebook['cells'][1:]):
++                self.assertEqual(expected['source'], actual['source'])
++            source = ''.join(notebook['cells'][0]['source'])
++            namespace = {}
++            exec(source.split('import base64,')[0], namespace)
++            import base64
++            for name, content in namespace['MODULE_SNAPSHOT'].items():
++                self.assertEqual(base64.b64decode(content), (ROOT / 'src' / name).read_bytes())
++            self.assertTrue(metadata['enable_gpu'])
++            self.assertIn('cmi-detect-behavior-with-sensor-data', metadata['competition_sources'])
++        self.assertEqual(original_bytes, (ROOT / 'notebooks/multibranch_attention.ipynb').read_bytes())
++
++    def test_collect_nested_zipped_csv_outputs(self):
++        with tempfile.TemporaryDirectory() as temporary:
++            root = Path(temporary)
++            downloaded = root / 'downloads'
++            downloaded.mkdir()
++            with zipfile.ZipFile(downloaded / 'output.zip', 'w') as archive:
++                for name in workflow.CSV_NAMES:
++                    archive.writestr('results_multibranch_attention_bfrb_bayesian/20261005/' + name, 'score\n0.5\n')
++            workflow.collect(downloaded, root / 'results')
++            self.assertEqual({p.name for p in (root / 'results').rglob('*.csv')}, workflow.CSV_NAMES)
++
++    def test_incomplete_results_fail(self):
++        with tempfile.TemporaryDirectory() as temporary:
++            with self.assertRaisesRegex(RuntimeError, 'No complete'):
++                workflow.collect(Path(temporary), Path(temporary) / 'results')
++
++    def test_zip_path_traversal_is_rejected(self):
++        with tempfile.TemporaryDirectory() as temporary:
++            directory = Path(temporary)
++            with zipfile.ZipFile(directory / 'output.zip', 'w') as archive:
++                archive.writestr('../bad.csv', 'bad')
++            with self.assertRaisesRegex(RuntimeError, 'Unsafe path'):
++                workflow.collect(directory, directory / 'results')
++
++
++if __name__ == '__main__':
++    unittest.main()
