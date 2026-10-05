@@ -63,6 +63,7 @@ class WorkflowTests(unittest.TestCase):
                     (target / 'kernel-metadata.json').write_text(json.dumps(metadata))
                     (target / metadata['code_file']).write_text(json.dumps(notebook))
                 elif args[1] == 'output':
+                    self.assertIn('--file-pattern', args)
                     for name in workflow.CSV_NAMES:
                         (target / name).write_text('score\n0.5\n')
                 return ''

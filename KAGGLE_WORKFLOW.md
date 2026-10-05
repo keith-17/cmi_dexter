@@ -107,3 +107,8 @@ Use push --iterations 2 to change only the packaged Bayesian iteration count.
 The local notebook and all other experiment parameters remain unchanged. The
 acknowledged manifest records search_iterations and iteration_override.
 Submit the original full experiment with push after validating the short run.
+
+The 2-iteration version 34 completed and its remote source and all three CSVs
+were verified on 5 October 2026: 2 finite CV scores, best CV score
+0.7664143674, holdout score 0.7834296346, and 629 holdout rows. The local CLI
+download option was corrected to --file-pattern for Kaggle 2.2.4.

@@ -147,7 +147,7 @@ def download(metadata):
     if source_hash(notebook) != manifest['submitted_source_sha256']:
         raise RuntimeError('Latest completed remote source differs from the submitted source; outputs not collected.')
     cli('kernels', 'output', metadata['id'], '-p', str(downloaded),
-        '-f', r'multibranch_attention_(cv|best|holdout)\.csv$')
+        '--file-pattern', r'multibranch_attention_(cv|best|holdout)\.csv$')
     destination = ROOT / 'results' / 'kaggle' / stamp
     collect(downloaded, destination)
     shutil.copy2(submitted, destination / 'local_submission.json')
