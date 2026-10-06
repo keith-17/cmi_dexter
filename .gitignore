@@ -33,3 +33,18 @@ data/
 # IDE
 .idea/
 .vscode/
+
+# Kaggle workflow
+kaggle_build/
+kaggle.json
+.kaggle/
+.env
+results_*/
+!requirements-kaggle.txt
+!.vscode/
+.vscode/*
+!.vscode/tasks.json
+!.vscode/settings.json
+
+
+.venv-kaggle/

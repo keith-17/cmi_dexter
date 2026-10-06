@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import json
+from fractions import Fraction
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -23,16 +24,20 @@ from sklearn.metrics import classification_report, f1_score, make_scorer
 warnings.filterwarnings("ignore")
 
 try:
-    from scipy.signal import argrelextrema, resample, stft
+    from scipy.signal import argrelextrema, get_window, resample_poly, stft
+    from scipy.spatial.transform import Rotation, Slerp
 except Exception:
-    resample = None
+    resample_poly = None
+    get_window = None
     stft = None
     argrelextrema = None
+    Rotation = None
+    Slerp = None
 
 try:
-    from pywt import cwt
+    import pywt
 except Exception:
-    cwt = None
+    pywt = None
 
 try:
     from skopt.space import Categorical
@@ -47,6 +52,80 @@ except Exception:
 
 class InvalidExtractorParams(ValueError):
     """Raised when extractor hyperparameters cannot produce valid features."""
+
+
+def _positive_rate(value: Any, name: str) -> float:
+    try:
+        rate = float(value)
+    except (TypeError, ValueError) as exc:
+        raise InvalidExtractorParams(f"{name} must be a finite positive number") from exc
+    if not np.isfinite(rate) or rate <= 0:
+        raise InvalidExtractorParams(f"{name} must be a finite positive number, got {value!r}")
+    return rate
+
+
+def _signal_values(signal: np.ndarray, name: str) -> Optional[np.ndarray]:
+    values = np.asarray(signal, dtype=float).reshape(-1)
+    finite = np.isfinite(values)
+    if not finite.any():
+        return None
+    if not finite.all():
+        raise ValueError(
+            f"{name} received partially missing samples; interpolate within each sequence "
+            "or choose an explicit missing-sample policy before feature extraction"
+        )
+    return values
+
+
+def _one_sided_psd(coefficients: np.ndarray, nfft: int) -> np.ndarray:
+    """Convert legacy SciPy one-sided STFT coefficients to real-signal PSD."""
+    power = np.abs(coefficients) ** 2
+    weights = np.full(power.shape[0], 2.0)
+    weights[0] = 1.0
+    if nfft % 2 == 0:
+        weights[-1] = 1.0
+    return power * weights[:, None]
+
+
+def _stft_frame_coverage(
+    frame_times: np.ndarray,
+    signal_length: int,
+    sampling_rate: float,
+    nperseg: int,
+    window_type: Any,
+) -> np.ndarray:
+    """Fraction of squared window weight backed by observed, non-padding samples."""
+    if get_window is None:
+        raise ImportError("STFT edge correction requires SciPy.")
+    window = np.asarray(get_window(window_type, nperseg, fftbins=True), dtype=float)
+    sample_centers = np.rint(np.asarray(frame_times) * sampling_rate).astype(int)
+    frame_samples = (
+        sample_centers[:, None]
+        - nperseg // 2
+        + np.arange(nperseg, dtype=int)[None, :]
+    )
+    observed = (frame_samples >= 0) & (frame_samples < signal_length)
+    weights = np.square(window)
+    return (observed * weights[None, :]).sum(axis=1) / weights.sum()
+
+
+def _validate_counter_order(
+    frame: pd.DataFrame,
+    sequence_col: str,
+    counter_col: str,
+) -> Optional[pd.Series]:
+    if counter_col not in frame.columns:
+        return None
+    counter = pd.to_numeric(frame[counter_col], errors="coerce")
+    if counter.isna().any() or not np.isfinite(counter.to_numpy(dtype=float)).all():
+        raise ValueError(f"{counter_col} must contain finite numeric sample indices")
+    deltas = counter.groupby(frame[sequence_col], sort=False).diff()
+    if (deltas.dropna() <= 0).any():
+        raise ValueError(
+            f"{counter_col} must be strictly increasing within each {sequence_col}; "
+            "sort rows or remove duplicate/nonincreasing samples before extraction"
+        )
+    return counter
 
 
 def _coerce_search_value(value: Any) -> Any:
@@ -153,13 +232,13 @@ def validate_sequence_extractor_params(
     ]
 
     for native_key, target_key in rate_specs:
-        native = _positive_int(params.get(native_key, 20), name=native_key)
-        target = _positive_int(params.get(target_key, native), name=target_key)
+        native = _positive_rate(params.get(native_key, 20), native_key)
+        target = _positive_rate(params.get(target_key, native), target_key)
 
         if resample_modalities:
-            if resample is None:
+            if resample_poly is None:
                 raise InvalidExtractorParams(
-                    "resample_modalities=True requires scipy.signal.resample"
+                    "resample_modalities=True requires scipy.signal.resample_poly"
                 )
             ratio = target / float(native)
             if ratio > 25 or ratio < 0.04:
@@ -249,6 +328,10 @@ class SignalCleaner(HoneycombBase):
         linear_acc_mode: Optional[str] = None,
         use_highpass_fallback: bool = True,
         window_size: int = 5,
+        rot_native_sampling_rate: Optional[float] = None,
+        acceleration_units: str = "m/s^2",
+        linear_acc_frame: str = "world",
+        gravity_magnitude: float = 9.80665,
         sequence_col: str = "sequence_id",
         counter_col: str = "sequence_counter",
     ):
@@ -259,6 +342,10 @@ class SignalCleaner(HoneycombBase):
         self.linear_acc_mode = linear_acc_mode
         self.use_highpass_fallback = use_highpass_fallback
         self.window_size = window_size
+        self.rot_native_sampling_rate = rot_native_sampling_rate
+        self.acceleration_units = acceleration_units
+        self.linear_acc_frame = linear_acc_frame
+        self.gravity_magnitude = gravity_magnitude
         self.sequence_col = sequence_col
         self.counter_col = counter_col
 
@@ -269,42 +356,47 @@ class SignalCleaner(HoneycombBase):
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         df = X.copy()
+        fs = _positive_rate(self.native_sampling_rate, "native_sampling_rate")
+        rot_fs = _positive_rate(
+            self.rot_native_sampling_rate
+            if self.rot_native_sampling_rate is not None
+            else self.native_sampling_rate,
+            "rot_native_sampling_rate",
+        )
 
         num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
         num_cols = [
             c
             for c in num_cols
             if c not in {self.sequence_col, self.counter_col}
+            and not c.startswith("tof_")
         ]
 
+        counter = _validate_counter_order(df, self.sequence_col, self.counter_col)
         if num_cols:
             if self.interp_mode == "linear":
                 df[num_cols] = df.groupby(self.sequence_col, sort=False)[num_cols].transform(
                     lambda g: g.interpolate(method="linear", limit_direction="both").ffill().bfill()
                 )
             elif self.interp_mode == "ffill":
-                df[num_cols] = df.groupby(self.sequence_col, sort=False)[num_cols].ffill().bfill()
-
-        if self.compute_dt:
-            if self.counter_col in df.columns:
-                df[self.counter_col] = pd.to_numeric(df[self.counter_col], errors="coerce")
-                df["dt"] = (
-                    df.groupby(self.sequence_col, sort=False)[self.counter_col]
-                    .diff()
-                    .fillna(1.0)
-                    / float(self.native_sampling_rate)
+                df[num_cols] = df.groupby(self.sequence_col, sort=False)[num_cols].transform(
+                    lambda g: g.ffill().bfill()
                 )
             else:
-                df["dt"] = 1.0 / float(self.native_sampling_rate)
+                raise InvalidExtractorParams("interp_mode must be 'linear' or 'ffill'")
 
-            df["dt"] = (
-                df["dt"]
-                .replace([np.inf, -np.inf], np.nan)
-                .fillna(1.0 / float(self.native_sampling_rate))
-                .clip(lower=1e-6)
-            )
+        if self.compute_dt:
+            if counter is not None:
+                counter_delta = counter.groupby(df[self.sequence_col], sort=False).diff()
+                df["dt"] = counter_delta.fillna(1.0).div(fs)
+                df["rot_dt"] = counter_delta.fillna(1.0).div(rot_fs)
+            else:
+                df["dt"] = 1.0 / fs
+                df["rot_dt"] = 1.0 / rot_fs
         else:
-            df["dt"] = 1.0 / float(self.native_sampling_rate)
+            # compute_dt=False deliberately assumes a constant 1/fs interval.
+            df["dt"] = 1.0 / fs
+            df["rot_dt"] = 1.0 / rot_fs
 
         if self.clip_value is not None:
             acc_cols = [
@@ -321,39 +413,44 @@ class SignalCleaner(HoneycombBase):
 
         if self.linear_acc_mode == "baseline":
             df = self._add_linear_acceleration(df)
+        elif self.linear_acc_mode not in {None, "none"}:
+            raise InvalidExtractorParams(
+                "linear_acc_mode must be None, 'none', or 'baseline'"
+            )
 
         df["mask"] = 1.0
         return df
 
     def _add_linear_acceleration(self, df: pd.DataFrame) -> pd.DataFrame:
-        acc_cols = [c for c in ["acc_x", "acc_y", "acc_z"] if c in df.columns]
-        if len(acc_cols) < 3:
-            acc_cols = [c for c in self.acc_cols_ if c in df.columns][:3]
+        acc_cols = ["acc_x", "acc_y", "acc_z"]
+        rot_cols = ["rot_w", "rot_x", "rot_y", "rot_z"]
 
-        rot_cols = [c for c in ["rot_w", "rot_x", "rot_y", "rot_z"] if c in df.columns]
-        if len(rot_cols) < 4:
-            rot_cols = [c for c in self.rot_cols_ if c in df.columns][:4]
-
-        if len(acc_cols) != 3 or len(rot_cols) != 4:
+        if not all(c in df.columns for c in acc_cols + rot_cols):
             if self.use_highpass_fallback:
-                return self._linear_acc_highpass(df, acc_cols)
-            return df
+                available_acc = [c for c in acc_cols if c in df.columns]
+                return self._linear_acc_highpass(df, available_acc)
+            raise InvalidExtractorParams(
+                "Orientation-based gravity removal requires acc_x/y/z and rot_w/x/y/z"
+            )
+        if self.acceleration_units not in {"m/s^2", "g"}:
+            raise InvalidExtractorParams("acceleration_units must be 'm/s^2' or 'g'")
+        if self.linear_acc_frame not in {"world", "body"}:
+            raise InvalidExtractorParams("linear_acc_frame must be 'world' or 'body'")
+        gravity_magnitude = float(self.gravity_magnitude)
+        if not np.isfinite(gravity_magnitude) or gravity_magnitude <= 0:
+            raise InvalidExtractorParams("gravity_magnitude must be finite and positive")
 
         acc = df[acc_cols].to_numpy(dtype=float)
         q = df[rot_cols].to_numpy(dtype=float)
 
-        acc = np.nan_to_num(acc, nan=0.0, posinf=0.0, neginf=0.0)
-        q = np.nan_to_num(q, nan=0.0, posinf=0.0, neginf=0.0)
-
         norms = np.linalg.norm(q, axis=1, keepdims=True)
-        bad = (norms == 0) | ~np.isfinite(norms)
-        norms[bad] = 1.0
+        if not np.isfinite(acc).all() or not np.isfinite(q).all() or (norms <= 0).any():
+            raise ValueError("Acceleration and quaternion samples must be finite; quaternions nonzero")
         q = q / norms
-        q[bad[:, 0]] = np.array([1.0, 0.0, 0.0, 0.0])
 
         w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
 
-        R = np.zeros((len(q), 3, 3))
+        R = np.empty((len(q), 3, 3), dtype=float)
         R[:, 0, 0] = 1 - 2 * y**2 - 2 * z**2
         R[:, 0, 1] = 2 * x * y - 2 * w * z
         R[:, 0, 2] = 2 * x * z + 2 * w * y
@@ -364,9 +461,14 @@ class SignalCleaner(HoneycombBase):
         R[:, 2, 1] = 2 * y * z + 2 * w * x
         R[:, 2, 2] = 1 - 2 * x**2 - 2 * y**2
 
-        gravity = np.array([0.0, 0.0, 9.81])
-        acc_world = np.einsum("nij,nj->ni", R, acc)
-        lin_acc = acc_world - gravity
+        unit_scale = gravity_magnitude if self.acceleration_units == "g" else 1.0
+        acc = acc * unit_scale
+        gravity_world = np.array([0.0, 0.0, gravity_magnitude])
+        if self.linear_acc_frame == "world":
+            lin_acc = np.einsum("nij,nj->ni", R, acc) - gravity_world
+        else:
+            gravity_body = np.einsum("nji,j->ni", R, gravity_world)
+            lin_acc = acc - gravity_body
 
         for i, col in enumerate(["lin_acc_x", "lin_acc_y", "lin_acc_z"]):
             df[col] = lin_acc[:, i]
@@ -385,7 +487,8 @@ class SignalCleaner(HoneycombBase):
                     min_periods=1,
                 ).mean()
             )
-            df[f"lin_{col}"] = df[col] - baseline
+            axis = col.removeprefix("acc_")
+            df[f"lin_acc_{axis}_highpass_approx"] = df[col] - baseline
 
         return df
 
@@ -447,22 +550,32 @@ class MotionFilter(HoneycombBase):
         ]
 
         if self.motion_filter_mode in {"kalman", "extended_kalman"} and acc_cols:
+            if self.motion_filter_mode == "extended_kalman":
+                warnings.warn(
+                    "'extended_kalman' is a deprecated alias for the scalar random-walk "
+                    "Kalman filter; it is not an EKF.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
             for col in acc_cols:
                 df[col] = df.groupby(self.sequence_col, sort=False)[col].transform(
                     lambda g: self._kalman_filter_1d(g.to_numpy())
                 )
 
         if self.use_dead_reckoning and acc_cols and "dt" in df.columns:
+            integration_dt = df["dt"].astype(float).mask(
+                df.groupby(self.sequence_col, sort=False).cumcount().eq(0), 0.0
+            )
             for col in acc_cols:
-                vel_col = f"{col}_dr_vel"
-                pos_col = f"{col}_dr_pos"
-                vel_inc = df[col] * df["dt"]
+                vel_col = f"{col}_raw_dead_reckoning_velocity"
+                pos_col = f"{col}_raw_dead_reckoning_position"
+                vel_inc = df[col] * integration_dt
                 df[vel_col] = vel_inc.groupby(df[self.sequence_col], sort=False).cumsum()
                 if self.dead_reckoning_detrend:
                     df[vel_col] = df.groupby(self.sequence_col, sort=False)[vel_col].transform(
                         self._detrend_series
                     )
-                pos_inc = df[vel_col] * df["dt"]
+                pos_inc = df[vel_col] * integration_dt
                 df[pos_col] = pos_inc.groupby(df[self.sequence_col], sort=False).cumsum()
                 if self.dead_reckoning_detrend:
                     df[pos_col] = df.groupby(self.sequence_col, sort=False)[pos_col].transform(
@@ -477,9 +590,12 @@ class MotionFilter(HoneycombBase):
 
 
 class IMUExtractor(HoneycombBase):
+    """Build parallel accelerometer feature branches from the same source axes."""
+
     def __init__(
         self,
         acc_modes: str = "raw",
+        linear_acc_modes: str = "",
         use_acc_magnitude: bool = False,
         use_linear_acc_magnitude: bool = False,
         window_size: int = 5,
@@ -487,6 +603,7 @@ class IMUExtractor(HoneycombBase):
         sequence_col: str = "sequence_id",
     ):
         self.acc_modes = acc_modes
+        self.linear_acc_modes = linear_acc_modes
         self.use_acc_magnitude = use_acc_magnitude
         self.use_linear_acc_magnitude = use_linear_acc_magnitude
         self.window_size = window_size
@@ -495,12 +612,20 @@ class IMUExtractor(HoneycombBase):
 
     def fit(self, X: pd.DataFrame, y=None):
         self.acc_modes_ = self._parse_modes(self.acc_modes)
+        self.linear_acc_modes_ = self._parse_modes(self.linear_acc_modes)
+        derived_suffixes = (
+            "_vel", "_disp", "_jerk", "_mag", "_dr_vel", "_dr_pos",
+            "_raw_integrated_velocity", "_raw_integrated_displacement",
+        )
         self.acc_cols_ = [
-            c
-            for c in X.columns
-            if c.startswith("acc_") and not c.startswith("lin_acc")
+            c for c in ("acc_x", "acc_y", "acc_z")
+            if c in X.columns and not c.endswith(derived_suffixes)
         ]
-        self.lin_cols_ = [c for c in X.columns if c.startswith("lin_acc")]
+        self.lin_cols_ = [c for c in ("lin_acc_x", "lin_acc_y", "lin_acc_z") if c in X.columns]
+        self.highpass_cols_ = [
+            c for c in X.columns
+            if c.startswith("lin_acc_") and c.endswith("_highpass_approx")
+        ]
         return self
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
@@ -510,6 +635,8 @@ class IMUExtractor(HoneycombBase):
         if "dt" not in df.columns:
             df["dt"] = 1.0
         dt = df["dt"].astype(float)
+        first_sample = df.groupby(self.sequence_col, sort=False).cumcount().eq(0)
+        integration_dt = dt.mask(first_sample, 0.0)
 
         for mode in self.acc_modes_:
             if not self.acc_cols_:
@@ -528,26 +655,62 @@ class IMUExtractor(HoneycombBase):
                 parts.append(out.add_suffix("_smooth"))
             elif mode == "velocity":
                 vel = (
-                    df[self.acc_cols_].mul(dt, axis=0)
+                    df[self.acc_cols_].mul(integration_dt, axis=0)
                     .groupby(df[self.sequence_col].values, sort=False).cumsum()
                 )
-                parts.append(vel.add_suffix("_vel"))
+                parts.append(vel.add_suffix("_raw_integrated_velocity"))
             elif mode == "displacement":
                 vel = (
-                    df[self.acc_cols_].mul(dt, axis=0)
+                    df[self.acc_cols_].mul(integration_dt, axis=0)
                     .groupby(df[self.sequence_col].values, sort=False).cumsum()
                 )
                 disp = (
-                    vel.mul(dt, axis=0)
+                    vel.mul(integration_dt, axis=0)
                     .groupby(df[self.sequence_col].values, sort=False).cumsum()
                 )
-                parts.append(disp.add_suffix("_disp"))
+                parts.append(disp.add_suffix("_raw_integrated_displacement"))
             elif mode == "jerk":
                 jerk = (
                     df.groupby(self.sequence_col, sort=False)[self.acc_cols_]
                     .diff().div(dt, axis=0).fillna(0.0)
                 )
                 parts.append(jerk.add_suffix("_jerk"))
+
+        if self.linear_acc_modes_ and self.lin_cols_:
+            lin = df[self.lin_cols_].astype(float)
+            for mode in self.linear_acc_modes_:
+                if mode == "raw":
+                    parts.append(lin.add_suffix("_linear"))
+                elif mode == "velocity":
+                    vel = (
+                        lin.mul(integration_dt, axis=0)
+                        .groupby(df[self.sequence_col].values, sort=False).cumsum()
+                    )
+                    parts.append(vel.add_suffix("_linear_integrated_velocity"))
+                elif mode == "displacement":
+                    vel = (
+                        lin.mul(integration_dt, axis=0)
+                        .groupby(df[self.sequence_col].values, sort=False).cumsum()
+                    )
+                    disp = (
+                        vel.mul(integration_dt, axis=0)
+                        .groupby(df[self.sequence_col].values, sort=False).cumsum()
+                    )
+                    parts.append(disp.add_suffix("_linear_integrated_displacement"))
+                elif mode == "jerk":
+                    jerk = (
+                        df.groupby(self.sequence_col, sort=False)[self.lin_cols_]
+                        .diff().div(dt, axis=0).fillna(0.0)
+                    )
+                    parts.append(jerk.add_suffix("_linear_jerk"))
+                else:
+                    raise InvalidExtractorParams(
+                        f"Unsupported linear_acc_modes entry {mode!r}"
+                    )
+        elif self.linear_acc_modes_:
+            raise InvalidExtractorParams(
+                "linear_acc_modes require orientation-based corrected lin_acc_x/y/z axes"
+            )
 
         if self.use_acc_magnitude and self.acc_cols_:
             mag = np.sqrt(df[self.acc_cols_].pow(2).sum(axis=1))
@@ -556,6 +719,9 @@ class IMUExtractor(HoneycombBase):
         if self.use_linear_acc_magnitude and self.lin_cols_:
             mag = np.sqrt(df[self.lin_cols_].pow(2).sum(axis=1))
             parts.append(pd.DataFrame({"lin_acc_mag": mag}, index=df.index))
+        elif self.use_linear_acc_magnitude and self.highpass_cols_:
+            mag = np.sqrt(df[self.highpass_cols_].pow(2).sum(axis=1))
+            parts.append(pd.DataFrame({"lin_acc_highpass_approx_mag": mag}, index=df.index))
 
         if not parts:
             return pd.DataFrame(index=df.index)
@@ -580,26 +746,31 @@ class RotationExtractor(HoneycombBase):
 
     def fit(self, X: pd.DataFrame, y=None):
         self.rot_modes_ = self._parse_modes(self.rotation_modes)
-        self.rot_cols_ = [c for c in X.columns if c.startswith("rot_")]
+        expected = ["rot_w", "rot_x", "rot_y", "rot_z"]
+        self.rot_cols_ = expected if all(c in X.columns for c in expected) else []
+        if self.rot_modes_ and not self.rot_cols_:
+            raise InvalidExtractorParams(
+                "Rotation features require quaternion columns rot_w, rot_x, rot_y, rot_z"
+            )
+        if "angular_velocity" in self.rot_modes_ and Rotation is None:
+            raise ImportError("RotationExtractor angular_velocity requires scipy.spatial.transform")
         return self
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         check_is_fitted(self, ["rot_modes_", "rot_cols_"])
         df = X.copy()
         parts = []
-        if "dt" not in df.columns:
-            df["dt"] = 1.0
-        dt = df["dt"].astype(float)
+        dt = df.get("rot_dt", df.get("dt", pd.Series(1.0, index=df.index))).astype(float)
         if not self.rot_cols_:
             return pd.DataFrame(index=df.index)
 
         q = df[self.rot_cols_].to_numpy(dtype=float, copy=True)
-        q = np.nan_to_num(q, nan=0.0, posinf=0.0, neginf=0.0)
         norms = np.linalg.norm(q, axis=1, keepdims=True)
-        bad = (norms == 0) | ~np.isfinite(norms)
-        norms[bad] = 1.0
+        if not np.isfinite(q).all() or (norms <= 0).any():
+            raise ValueError(
+                "Quaternion samples must be finite and nonzero in rot_w, rot_x, rot_y, rot_z"
+            )
         q = q / norms
-        q[bad[:, 0]] = np.array([1.0, 0.0, 0.0, 0.0])
 
         if self.fix_quaternion_sign:
             for _, positions in df.groupby(self.sequence_col, sort=False).indices.items():
@@ -642,26 +813,51 @@ class RotationExtractor(HoneycombBase):
                 )
                 delta = (
                     euler_df.groupby(df[self.sequence_col].values, sort=False)
-                    .diff().fillna(0.0)
+                    .diff()
                 )
+                delta = np.arctan2(np.sin(delta), np.cos(delta)).fillna(0.0)
                 parts.append(delta.add_suffix("_delta"))
             elif mode == "angular_velocity":
-                ang_vel = (
-                    df.groupby(self.sequence_col, sort=False)[self.rot_cols_]
-                    .diff().div(dt, axis=0).fillna(0.0)
-                )
-                parts.append(ang_vel.add_suffix("_angvel"))
-                ang_vel_mag = np.sqrt(ang_vel.pow(2).sum(axis=1))
-                parts.append(pd.DataFrame({"ang_vel_mag": ang_vel_mag}, index=df.index))
+                later_sample = ~df.groupby(self.sequence_col, sort=False).cumcount().eq(0).to_numpy()
+                intervals = dt.to_numpy()[later_sample]
+                if not np.isfinite(intervals).all() or np.any(intervals <= 0):
+                    raise ValueError("Rotation intervals must be finite and positive")
+                angular_velocity = np.zeros((len(q), 3), dtype=float)
+                for _, positions in df.groupby(self.sequence_col, sort=False).indices.items():
+                    positions = np.asarray(positions)
+                    if len(positions) < 2:
+                        continue
+                    # The relative increment R_previous.inv() * R_current is a
+                    # local/body-frame rotation under the body-to-world convention.
+                    # q is scalar-first wxyz; SciPy expects scalar-last xyzw.
+                    rotations = Rotation.from_quat(q[positions][:, [1, 2, 3, 0]])
+                    for idx, cur in enumerate(positions[1:], start=1):
+                        local_increment = rotations[idx - 1].inv() * rotations[idx]
+                        angular_velocity[cur] = local_increment.as_rotvec() / float(dt.iloc[cur])
+                names = [
+                    "rot_angular_velocity_body_x_rad_s",
+                    "rot_angular_velocity_body_y_rad_s",
+                    "rot_angular_velocity_body_z_rad_s",
+                ]
+                parts.append(pd.DataFrame(angular_velocity, columns=names, index=df.index))
+                parts.append(pd.DataFrame(
+                    {"rot_angular_velocity_body_magnitude_rad_s":
+                     np.linalg.norm(angular_velocity, axis=1)},
+                    index=df.index,
+                ))
             elif mode == "rot6d":
                 w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-                R = np.zeros((len(q), 3, 3))
+                R = np.empty((len(q), 3, 3), dtype=float)
                 R[:, 0, 0] = 1 - 2 * y**2 - 2 * z**2
                 R[:, 0, 1] = 2 * x * y - 2 * w * z
                 R[:, 0, 2] = 2 * x * z + 2 * w * y
                 R[:, 1, 0] = 2 * x * y + 2 * w * z
                 R[:, 1, 1] = 1 - 2 * x**2 - 2 * z**2
                 R[:, 1, 2] = 2 * y * z - 2 * w * x
+                R[:, 2, 0] = 2 * x * z - 2 * w * y
+                R[:, 2, 1] = 2 * y * z + 2 * w * x
+                R[:, 2, 2] = 1 - 2 * x**2 - 2 * y**2
+                # Column-major: first rotation-matrix column, then the second.
                 rot6d = np.concatenate([R[:, :, 0], R[:, :, 1]], axis=1)
                 cols = [
                     "rot6d_c1_x", "rot6d_c1_y", "rot6d_c1_z",
@@ -702,16 +898,23 @@ class TOFExtractor(HoneycombBase):
         if not self.tof_cols_:
             return pd.DataFrame(index=X.index)
 
-        df = X[self.tof_cols_].astype(float).copy()
-        df = df.replace(-1.0, np.nan)
-
+        observed = X[self.tof_cols_].astype(float).replace(-1.0, np.nan)
+        valid = observed.notna()
         sensor_map: Dict[str, List[str]] = {}
-        for col in df.columns:
-            parts_col = str(col).split("_")
-            key = parts_col[1] if len(parts_col) > 1 else "all"
+        for col in observed.columns:
+            pieces = str(col).split("_")
+            key = pieces[1] if len(pieces) > 1 else "all"
             sensor_map.setdefault(key, []).append(col)
-        if not sensor_map:
-            sensor_map = {"all": list(df.columns)}
+
+        def pixel_index(column: str) -> Tuple[int, str]:
+            suffix = str(column).rsplit("_v", 1)
+            try:
+                return int(suffix[1]), str(column)
+            except (IndexError, ValueError):
+                return 0, str(column)
+
+        for sensor_key in sensor_map:
+            sensor_map[sensor_key] = sorted(sensor_map[sensor_key], key=pixel_index)
 
         n_keep = int(self.n_sensors) if self.n_sensors is not None else 0
         if n_keep > 0 and len(sensor_map) > n_keep:
@@ -724,72 +927,118 @@ class TOFExtractor(HoneycombBase):
             keep_set = set(keep_keys)
             sensor_map = {k: v for k, v in sensor_map.items() if k in keep_set}
             keep_cols = [c for cols in sensor_map.values() for c in cols]
-            df = df[keep_cols]
+            observed = observed[keep_cols]
+            valid = valid[keep_cols]
 
+        imputed = observed.copy()
         if self.tof_fill_mode == "nan_interpolate":
-            df = df.groupby(X[self.sequence_col].values, sort=False).transform(
+            imputed = imputed.groupby(X[self.sequence_col].values, sort=False).transform(
                 lambda g: g.interpolate(method="linear", limit_direction="both").ffill().bfill()
             ).fillna(255.0)
         elif self.tof_fill_mode == "zero":
-            df = df.fillna(0.0)
+            imputed = imputed.fillna(0.0)
         elif self.tof_fill_mode == "far_255":
-            df = df.fillna(255.0)
+            imputed = imputed.fillna(255.0)
         elif self.tof_fill_mode == "far_500":
-            df = df.fillna(500.0)
+            imputed = imputed.fillna(500.0)
         else:
-            df = df.fillna(0.0)
+            raise InvalidExtractorParams(
+                "tof_fill_mode must be 'nan_interpolate', 'zero', 'far_255', or 'far_500'"
+            )
 
         parts = []
 
         for mode in self.tof_modes_:
             if mode == "raw":
-                parts.append(df.add_suffix("_raw"))
+                parts.append(imputed.add_suffix("_imputed"))
+                parts.append(valid.astype(float).add_suffix("_valid"))
             elif mode == "sensor_stats":
                 for sensor_key, cols in sensor_map.items():
                     if not cols:
                         continue
-                    arr = df[cols].to_numpy(dtype=float)
-                    parts.append(
-                        pd.DataFrame(
-                            {
-                                f"tof_{sensor_key}_mean": np.nanmean(arr, axis=1),
-                                f"tof_{sensor_key}_std": np.nanstd(arr, axis=1),
-                                f"tof_{sensor_key}_min": np.nanmin(arr, axis=1),
-                                f"tof_{sensor_key}_max": np.nanmax(arr, axis=1),
-                            },
-                            index=X.index,
-                        )
+                    data = imputed[cols].to_numpy(dtype=float)
+                    mask = valid[cols].to_numpy(dtype=bool)
+                    count = mask.sum(axis=1)
+                    observed_data = np.where(mask, data, 0.0)
+                    valid_mean = np.divide(
+                        observed_data.sum(axis=1), count,
+                        out=np.zeros(len(X), dtype=float), where=count > 0,
                     )
+                    valid_var = np.divide(
+                        np.where(mask, (data - valid_mean[:, None]) ** 2, 0.0).sum(axis=1),
+                        count,
+                        out=np.zeros(len(X), dtype=float), where=count > 0,
+                    )
+                    valid_min = np.where(mask, data, np.inf).min(axis=1)
+                    valid_max = np.where(mask, data, -np.inf).max(axis=1)
+                    valid_min[count == 0] = 0.0
+                    valid_max[count == 0] = 0.0
+                    parts.append(pd.DataFrame({
+                        f"tof_{sensor_key}_imputed_mean": data.mean(axis=1),
+                        f"tof_{sensor_key}_imputed_std": data.std(axis=1),
+                        f"tof_{sensor_key}_imputed_min": data.min(axis=1),
+                        f"tof_{sensor_key}_imputed_max": data.max(axis=1),
+                        f"tof_{sensor_key}_valid_mean": valid_mean,
+                        f"tof_{sensor_key}_valid_std": np.sqrt(valid_var),
+                        f"tof_{sensor_key}_valid_min": valid_min,
+                        f"tof_{sensor_key}_valid_max": valid_max,
+                        f"tof_{sensor_key}_valid_fraction": count / len(cols),
+                    }, index=X.index))
             elif mode == "pooled_stats":
-                arr = df.to_numpy(dtype=float)
-                parts.append(
-                    pd.DataFrame(
-                        {
-                            "tof_pooled_mean": np.nanmean(arr, axis=1),
-                            "tof_pooled_std": np.nanstd(arr, axis=1),
-                            "tof_pooled_min": np.nanmin(arr, axis=1),
-                            "tof_pooled_max": np.nanmax(arr, axis=1),
-                        },
-                        index=X.index,
-                    )
+                data = imputed.to_numpy(dtype=float)
+                mask = valid.to_numpy(dtype=bool)
+                count = mask.sum(axis=1)
+                valid_data = np.where(mask, data, 0.0)
+                valid_mean = np.divide(
+                    valid_data.sum(axis=1), count,
+                    out=np.zeros(len(X), dtype=float), where=count > 0,
                 )
+                valid_var = np.divide(
+                    np.where(mask, (data - valid_mean[:, None]) ** 2, 0.0).sum(axis=1),
+                    count,
+                    out=np.zeros(len(X), dtype=float), where=count > 0,
+                )
+                valid_min = np.where(mask, data, np.inf).min(axis=1)
+                valid_max = np.where(mask, data, -np.inf).max(axis=1)
+                valid_min[count == 0] = 0.0
+                valid_max[count == 0] = 0.0
+                parts.append(pd.DataFrame({
+                    "tof_pooled_imputed_mean": data.mean(axis=1),
+                    "tof_pooled_imputed_std": data.std(axis=1),
+                    "tof_pooled_imputed_min": data.min(axis=1),
+                    "tof_pooled_imputed_max": data.max(axis=1),
+                    "tof_pooled_valid_mean": valid_mean,
+                    "tof_pooled_valid_std": np.sqrt(valid_var),
+                    "tof_pooled_valid_min": valid_min,
+                    "tof_pooled_valid_max": valid_max,
+                    "tof_pooled_valid_fraction": count / max(data.shape[1], 1),
+                }, index=X.index))
             elif mode == "pooled":
                 for sensor_key, cols in sensor_map.items():
                     if len(cols) != 64:
                         continue
-                    arr = df[cols].to_numpy(dtype=float).reshape(-1, 8, 8)
+                    arr = imputed[cols].to_numpy(dtype=float).reshape(-1, 8, 8)
+                    mask = valid[cols].to_numpy(dtype=float).reshape(-1, 8, 8)
                     pool = (
                         arr.reshape(-1, 4, 2, 4, 2)
                         .mean(axis=(2, 4))
                         .reshape(-1, 16)
                     )
-                    parts.append(
-                        pd.DataFrame(
-                            pool,
-                            columns=[f"tof_{sensor_key}_pool_{i}" for i in range(16)],
-                            index=X.index,
-                        )
+                    pool_validity = (
+                        mask.reshape(-1, 4, 2, 4, 2)
+                        .mean(axis=(2, 4))
+                        .reshape(-1, 16)
                     )
+                    parts.append(pd.DataFrame(
+                        np.concatenate([pool, pool_validity], axis=1),
+                        columns=(
+                            [f"tof_{sensor_key}_pool_imputed_{i}" for i in range(16)]
+                            + [f"tof_{sensor_key}_pool_valid_fraction_{i}" for i in range(16)]
+                        ),
+                        index=X.index,
+                    ))
+            else:
+                raise InvalidExtractorParams(f"Unsupported tof_modes entry {mode!r}")
 
         if not parts:
             return pd.DataFrame(index=X.index)
@@ -821,6 +1070,7 @@ class ThermoExtractor(HoneycombBase):
             return pd.DataFrame(index=X.index)
 
         raw = X[self.thm_cols_].astype(float).copy()
+        dt = X.get("dt", pd.Series(1.0, index=X.index)).astype(float)
         parts = []
 
         for mode in self.thm_modes_:
@@ -838,6 +1088,18 @@ class ThermoExtractor(HoneycombBase):
                 diff = centered.groupby(X[self.sequence_col].values, sort=False).diff().fillna(0.0)
                 parts.append(centered.add_suffix("_centered"))
                 parts.append(diff.add_suffix("_centered_diff"))
+            elif mode in {"diff_per_second", "centered_diff_per_second"}:
+                source = raw
+                if mode == "centered_diff_per_second":
+                    means = raw.groupby(X[self.sequence_col].values, sort=False).transform("mean")
+                    source = raw - means
+                derivative = (
+                    source.groupby(X[self.sequence_col].values, sort=False)
+                    .diff().div(dt, axis=0).fillna(0.0)
+                )
+                parts.append(derivative.add_suffix("_temperature_rate_per_s"))
+            else:
+                raise InvalidExtractorParams(f"Unsupported thm_modes entry {mode!r}")
 
         if not parts:
             return pd.DataFrame(index=X.index)
@@ -860,7 +1122,9 @@ class STFTExtractor(HoneycombBase):
         detrend: str = "constant",
         use_log_scale: bool = True,
         frequency_bands: Optional[Dict[str, Tuple[float, float]]] = None,
-        sampling_rate: int = 20,
+        sampling_rate: float = 20,
+        window_seconds: Optional[float] = None,
+        counter_col: str = "sequence_counter",
         sequence_col: str = "sequence_id",
         feature_prefix: str = "stft0",
         signal_columns: Optional[List[str]] = None,
@@ -880,104 +1144,183 @@ class STFTExtractor(HoneycombBase):
             "high": (6.0, 10.0),
         }
         self.sampling_rate = sampling_rate
+        self.window_seconds = window_seconds
+        self.counter_col = counter_col
         self.sequence_col = sequence_col
         self.feature_prefix = feature_prefix
         self.signal_columns = signal_columns
 
     def fit(self, X: pd.DataFrame, y=None):
+        fs = _positive_rate(self.sampling_rate, "STFT sampling_rate")
+        derived_suffixes = (
+            "_vel", "_disp", "_jerk", "_mag", "_dr_vel", "_dr_pos",
+            "_raw_integrated_velocity", "_raw_integrated_displacement",
+            "_raw_dead_reckoning_velocity", "_raw_dead_reckoning_position",
+        )
         candidates = [
             c for c in X.columns
-            if c.startswith("acc_") and not c.endswith(("_vel", "_disp", "_jerk", "_mag", "_dr_vel", "_dr_pos"))
+            if c.startswith("acc_") and not c.endswith(derived_suffixes)
         ]
         self.acc_cols_ = candidates if self.signal_columns is None else [c for c in self.signal_columns if c in X.columns]
-        self.nperseg = int(self.nperseg) if self.nperseg is not None else 32
-        if self.noverlap is None:
-            self.noverlap = max(0, self.nperseg // 2)
+        if self.window_seconds is not None:
+            duration = float(self.window_seconds)
+            if not np.isfinite(duration) or duration <= 0:
+                raise InvalidExtractorParams("STFT window_seconds must be finite and positive")
+            self.nperseg_ = max(1, int(round(duration * fs)))
         else:
-            self.noverlap = int(self.noverlap)
+            self.nperseg_ = _positive_int(self.nperseg, default=32, name="STFT nperseg")
+        self.noverlap_ = (
+            self.nperseg_ // 2 if self.noverlap is None else int(self.noverlap)
+        )
+        if not 0 <= self.noverlap_ < self.nperseg_:
+            raise InvalidExtractorParams(
+                f"STFT noverlap must be in [0, nperseg), got {self.noverlap_}"
+            )
+        scaling = str(self.scaling).strip().lower()
+        aliases = {
+            "density": "psd", "psd": "psd",
+            "spectrum": "power_spectrum", "power_spectrum": "power_spectrum",
+            "magnitude": "magnitude",
+        }
+        if scaling not in aliases:
+            raise InvalidExtractorParams(
+                "STFT scaling must be 'psd'/'density', 'power_spectrum'/'spectrum', or 'magnitude'"
+            )
+        self.representation_ = aliases[scaling]
         bands = _coerce_search_value(self.frequency_bands)
-        if isinstance(bands, dict):
-            self.frequency_bands = bands
+        if not isinstance(bands, dict):
+            raise InvalidExtractorParams("STFT frequency_bands must be a mapping of names to ranges")
+        self.frequency_bands_ = {}
+        nyquist = fs / 2.0
+        for name, bounds in bands.items():
+            if len(bounds) != 2:
+                raise InvalidExtractorParams(f"STFT band {name!r} must have (low, high) bounds")
+            low, high = map(float, bounds)
+            if not np.isfinite([low, high]).all() or low < 0 or high <= low or high > nyquist:
+                raise InvalidExtractorParams(
+                    f"STFT band {name!r} must satisfy 0 <= low < high <= Nyquist ({nyquist:g} Hz)"
+                )
+            self.frequency_bands_[str(name)] = (low, high)
         return self
 
     def _compute_stft_features(self, signal: np.ndarray) -> Dict[str, np.ndarray]:
         if stft is None:
             raise ImportError("STFTExtractor requires SciPy.")
-        signal = np.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0)
-        nperseg = int(self.nperseg)
-        if nperseg <= 0:
-            nperseg = min(len(signal), 32) or 1
+        signal = _signal_values(signal, "STFTExtractor")
+        if signal is None:
+            signal = np.zeros(0, dtype=float)
+        observed_length = len(signal)
+        fs = _positive_rate(self.sampling_rate, "STFT sampling_rate")
+        nperseg = int(self.nperseg_)
         if len(signal) < nperseg:
             signal = np.pad(signal, (0, nperseg - len(signal)), mode='constant')
-        noverlap = int(self.noverlap) if self.noverlap is not None else max(0, nperseg // 2)
-        if noverlap >= nperseg:
-            noverlap = max(0, nperseg // 2)
-        scipy_scaling = self.scaling.lower()
-        if scipy_scaling == 'density':
-            scipy_scaling = 'psd'
-        elif scipy_scaling not in {'spectrum', 'psd'}:
-            raise ValueError(f"Unsupported STFT scaling '{self.scaling}'.")
+        scipy_scaling = "psd" if self.representation_ == "psd" else "spectrum"
         f, t, Zxx = stft(
-            signal, fs=self.sampling_rate, window=self.window_type,
-            nperseg=nperseg, noverlap=noverlap, nfft=None, detrend=self.detrend,
+            signal, fs=fs, window=self.window_type,
+            nperseg=nperseg, noverlap=self.noverlap_, nfft=None, detrend=self.detrend,
             return_onesided=True, scaling=scipy_scaling, axis=-1,
-            boundary=None, padded=False,
+            boundary="zeros", padded=True,
         )
-        if self.scaling.lower() == 'density':
-            Pxx = np.abs(Zxx) ** 2
+        if self.representation_ == "magnitude":
+            representation = np.abs(Zxx)
         else:
-            Pxx = np.abs(Zxx)
+            if self.representation_ == "psd":
+                representation = _one_sided_psd(Zxx, nperseg)
+                coverage = _stft_frame_coverage(
+                    t, observed_length, fs, nperseg, self.window_type
+                )
+                representation = np.divide(
+                    representation,
+                    coverage[None, :],
+                    out=np.zeros_like(representation),
+                    where=coverage[None, :] > 0,
+                )
+            else:
+                representation = np.abs(Zxx) ** 2
+                if len(f) > 1:
+                    one_sided = np.full(len(f), 2.0)
+                    one_sided[0] = 1.0
+                    if nperseg % 2 == 0:
+                        one_sided[-1] = 1.0
+                    representation *= one_sided[:, None]
+
+        rep_name = {
+            "psd": "psd",
+            "power_spectrum": "power_spectrum",
+            "magnitude": "magnitude",
+        }[self.representation_]
+        features: Dict[str, float] = {}
+        features[f"stft_{rep_name}_mean"] = float(np.mean(representation))
+        features[f"stft_{rep_name}_std"] = float(np.std(representation))
+        features[f"stft_{rep_name}_max"] = float(np.max(representation))
+        features[f"stft_{rep_name}_min"] = float(np.min(representation))
+        features[f"stft_{rep_name}_median"] = float(np.median(representation))
+        features[f"stft_{rep_name}_sum"] = float(np.sum(representation))
+        max_idx = np.unravel_index(np.argmax(representation), representation.shape)
+        features["stft_peak_frequency_hz"] = float(f[max_idx[0]])
+        features["stft_peak_time_s"] = float(t[max_idx[1]]) if len(t) else 0.0
+
+        if self.representation_ == "psd":
+            dfreq = fs / nperseg
+            mean_psd = np.mean(representation, axis=1)
+            mean_power = float(np.sum(mean_psd) * dfreq)
+            features["stft_mean_power"] = mean_power
+            features["stft_power_std_across_frames"] = float(
+                np.std(np.sum(representation, axis=0) * dfreq)
+            )
+            weights = mean_psd * dfreq
+            weight_sum = float(weights.sum())
+            centroid = float(np.sum(f * weights) / weight_sum) if weight_sum else 0.0
+            spread = (
+                float(np.sqrt(np.sum(((f - centroid) ** 2) * weights) / weight_sum))
+                if weight_sum else 0.0
+            )
+            features["stft_spectral_centroid_hz"] = centroid
+            features["stft_spectral_spread_hz"] = spread
+            features["stft_spectral_entropy_bits"] = self._compute_entropy(weights)
+            frame_power = np.sum(representation, axis=0) * dfreq
+            features["stft_temporal_power_mean"] = float(np.mean(frame_power))
+            features["stft_temporal_power_std"] = float(np.std(frame_power))
+            features["stft_temporal_power_slope_per_s"] = (
+                float(np.polyfit(t, frame_power, 1)[0]) if len(t) > 1 else 0.0
+            )
+            for band_name, (f_low, f_high) in self.frequency_bands_.items():
+                band_mask = (f >= f_low) & (f < f_high)
+                band_power = (
+                    float(np.mean(np.sum(representation[band_mask], axis=0) * dfreq))
+                    if band_mask.any() else 0.0
+                )
+                features[f"stft_band_{band_name}_mean_power"] = band_power
+                features[f"stft_band_{band_name}_power_fraction"] = (
+                    band_power / mean_power if mean_power > 0 else 0.0
+                )
+                features[f"stft_band_{band_name}_resolved"] = float(band_mask.any())
+
         if self.use_log_scale:
-            Pxx = np.log1p(Pxx)
-        features = {}
-        features['stft_mean_power'] = np.mean(Pxx)
-        features['stft_std_power'] = np.std(Pxx)
-        features['stft_max_power'] = np.max(Pxx)
-        features['stft_min_power'] = np.min(Pxx)
-        features['stft_median_power'] = np.median(Pxx)
-        features['stft_total_power'] = np.sum(Pxx)
-        time_mean = np.mean(Pxx, axis=0)
-        features['stft_temporal_mean'] = np.mean(time_mean)
-        features['stft_temporal_std'] = np.std(time_mean)
-        features['stft_temporal_slope'] = (
-            np.polyfit(np.arange(len(time_mean)), time_mean, 1)[0] if len(time_mean) > 1 else 0.0
+            log_representation = np.log1p(representation)
+            features[f"stft_log1p_{rep_name}_mean"] = float(np.mean(log_representation))
+            features[f"stft_log1p_{rep_name}_std"] = float(np.std(log_representation))
+            features[f"stft_log1p_{rep_name}_max"] = float(np.max(log_representation))
+
+        frame_distribution = representation / np.maximum(
+            representation.sum(axis=0, keepdims=True), np.finfo(float).tiny
         )
-        freq_mean = np.mean(Pxx, axis=1)
-        features['stft_spectral_centroid'] = np.sum(f * freq_mean) / (np.sum(freq_mean) + 1e-10)
-        features['stft_spectral_spread'] = np.sqrt(
-            np.sum(((f - features['stft_spectral_centroid']) ** 2) * freq_mean) / (np.sum(freq_mean) + 1e-10)
+        normalized_flux = (
+            np.abs(np.diff(frame_distribution, axis=1)).sum(axis=0)
+            if representation.shape[1] > 1 else np.zeros(1)
         )
-        features['stft_spectral_entropy'] = self._compute_entropy(freq_mean)
-        for band_name, (f_low, f_high) in dict(self.frequency_bands or {}).items():
-            band_mask = (f >= f_low) & (f < f_high)
-            if np.any(band_mask):
-                band_power = Pxx[band_mask, :]
-                features[f'stft_band_{band_name}_mean'] = np.mean(band_power)
-                features[f'stft_band_{band_name}_total'] = np.sum(band_power)
-                features[f'stft_band_{band_name}_ratio'] = np.sum(band_power) / (np.sum(Pxx) + 1e-10)
-        max_idx = np.unravel_index(np.argmax(Pxx), Pxx.shape)
-        features['stft_peak_freq'] = f[max_idx[0]]
-        features['stft_peak_time'] = t[max_idx[1]] if len(t) > max_idx[1] else 0.0
-        features['stft_peak_power'] = Pxx[max_idx]
-        if Pxx.shape[1] > 1:
-            spectral_diff = np.diff(Pxx, axis=1)
-            features['stft_spectral_flux_mean'] = np.mean(np.abs(spectral_diff))
-            features['stft_spectral_flux_std'] = np.std(np.abs(spectral_diff))
-            features['stft_spectral_flux_max'] = np.max(np.abs(spectral_diff))
-        else:
-            features['stft_spectral_flux_mean'] = 0.0
-            features['stft_spectral_flux_std'] = 0.0
-            features['stft_spectral_flux_max'] = 0.0
+        features[f"stft_{rep_name}_normalized_flux_mean"] = float(np.mean(normalized_flux))
+        features[f"stft_{rep_name}_normalized_flux_std"] = float(np.std(normalized_flux))
+        features[f"stft_{rep_name}_normalized_flux_max"] = float(np.max(normalized_flux))
         return features
 
     def _compute_entropy(self, x: np.ndarray) -> float:
-        x = np.abs(x)
-        total = np.sum(x)
-        if total == 0:
+        weights = np.asarray(x, dtype=float)
+        total = float(np.sum(weights))
+        if total <= 0:
             return 0.0
-        p = x / total
-        p = p[p > 0]
-        return -np.sum(p * np.log2(p + 1e-10))
+        p = weights[weights > 0] / total
+        return float(-np.sum(p * np.log2(p)))
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         check_is_fitted(self, ["acc_cols_"])
@@ -986,6 +1329,7 @@ class STFTExtractor(HoneycombBase):
         for col in self.acc_cols_:
             feat_dict = {}
             for seq_id, group in df.groupby(self.sequence_col, sort=False):
+                self._validate_uniform_counter(group)
                 signal = group[col].to_numpy(dtype=float)
                 seq_features = self._compute_stft_features(signal)
                 for feat_name, value in seq_features.items():
@@ -1001,6 +1345,16 @@ class STFTExtractor(HoneycombBase):
             return pd.DataFrame(index=df.index)
         return pd.concat(parts, axis=1)
 
+    def _validate_uniform_counter(self, group: pd.DataFrame) -> None:
+        if self.counter_col not in group.columns or len(group) < 2:
+            return
+        values = pd.to_numeric(group[self.counter_col], errors="coerce").to_numpy(dtype=float)
+        if not np.isfinite(values).all() or np.any(np.diff(values) != 1):
+            raise ValueError(
+                "STFT requires uniformly spaced samples; sequence_counter must increase by "
+                "one for every row. Interpolate missing samples on a uniform grid first."
+            )
+
 
 class CWTExtractor(HoneycombBase):
     def __init__(
@@ -1011,7 +1365,10 @@ class CWTExtractor(HoneycombBase):
         max_scale: int = 128,
         n_scales: int = 32,
         use_log_scale: bool = True,
-        sampling_rate: int = 20,
+        sampling_rate: float = 20,
+        min_scale: Optional[float] = None,
+        max_frequency: Optional[float] = None,
+        counter_col: str = "sequence_counter",
         sequence_col: str = "sequence_id",
         feature_prefix: str = "cwt0",
         signal_columns: Optional[List[str]] = None,
@@ -1023,67 +1380,166 @@ class CWTExtractor(HoneycombBase):
         self.n_scales = n_scales
         self.use_log_scale = use_log_scale
         self.sampling_rate = sampling_rate
+        self.min_scale = min_scale
+        self.max_frequency = max_frequency
+        self.counter_col = counter_col
         self.sequence_col = sequence_col
         self.feature_prefix = feature_prefix
         self.signal_columns = signal_columns
 
     def fit(self, X: pd.DataFrame, y=None):
+        if pywt is None:
+            raise ImportError("CWTExtractor requires PyWavelets.")
+        fs = _positive_rate(self.sampling_rate, "CWT sampling_rate")
+        derived_suffixes = (
+            "_vel", "_disp", "_jerk", "_mag", "_dr_vel", "_dr_pos",
+            "_raw_integrated_velocity", "_raw_integrated_displacement",
+            "_raw_dead_reckoning_velocity", "_raw_dead_reckoning_position",
+        )
         candidates = [
             c for c in X.columns
-            if c.startswith("acc_") and not c.endswith(("_vel", "_disp", "_jerk", "_mag", "_dr_vel", "_dr_pos"))
+            if c.startswith("acc_") and not c.endswith(derived_suffixes)
         ]
         self.acc_cols_ = candidates if self.signal_columns is None else [c for c in self.signal_columns if c in X.columns]
+        try:
+            wavelet = pywt.ContinuousWavelet(self.wavelet)
+            central_frequency = float(pywt.central_frequency(wavelet))
+        except (TypeError, ValueError) as exc:
+            raise InvalidExtractorParams(
+                f"CWT wavelet {self.wavelet!r} is not a valid continuous wavelet"
+            ) from exc
+        if not np.isfinite(central_frequency) or central_frequency <= 0:
+            raise InvalidExtractorParams(f"CWT wavelet {self.wavelet!r} has invalid central frequency")
+        max_frequency = (
+            min(0.4 * fs, fs / 2.0)
+            if self.max_frequency is None
+            else float(self.max_frequency)
+        )
+        if not np.isfinite(max_frequency) or not 0 < max_frequency <= fs / 2.0:
+            raise InvalidExtractorParams(
+                f"CWT max_frequency must be in (0, Nyquist={fs / 2.0:g}] Hz"
+            )
+        max_scale = float(self.max_scale)
+        if not np.isfinite(max_scale) or max_scale <= 0:
+            raise InvalidExtractorParams("CWT max_scale must be finite and positive")
         if self.widths is None:
-            self.widths_ = np.logspace(np.log10(1), np.log10(self.max_scale), self.n_scales)
+            safe_minimum = central_frequency * fs / max_frequency
+            minimum = safe_minimum if self.min_scale is None else float(self.min_scale)
+            if not np.isfinite(minimum) or minimum <= 0:
+                raise InvalidExtractorParams("CWT min_scale must be finite and positive")
+            if max_scale < minimum:
+                raise InvalidExtractorParams(
+                    f"CWT max_scale ({max_scale:g}) is below the safe minimum scale "
+                    f"({minimum:g}) for {max_frequency:g} Hz"
+                )
+            n_scales = _positive_int(self.n_scales, name="CWT n_scales")
+            self.widths_ = np.geomspace(minimum, max_scale, n_scales)
         else:
-            self.widths_ = np.asarray(self.widths)
+            self.widths_ = np.asarray(self.widths, dtype=float)
+        if (
+            self.widths_.ndim != 1
+            or len(self.widths_) == 0
+            or not np.isfinite(self.widths_).all()
+            or np.any(self.widths_ <= 0)
+            or np.any(np.diff(self.widths_) <= 0)
+        ):
+            raise InvalidExtractorParams("CWT scales must be finite, positive, and strictly increasing")
+        self.scale_frequencies_hz_ = (
+            pywt.scale2frequency(wavelet, self.widths_) * fs
+        )
+        if np.any(self.scale_frequencies_hz_ > fs / 2.0):
+            raise InvalidExtractorParams(
+                "CWT scales include frequencies above Nyquist; increase the minimum scale"
+            )
+        self._wavelet_lower_bound = float(wavelet.lower_bound)
+        self._wavelet_upper_bound = float(wavelet.upper_bound)
         return self
 
     def _compute_cwt_features(self, signal: np.ndarray) -> Dict[str, np.ndarray]:
-        if cwt is None:
+        if pywt is None:
             raise ImportError("CWTExtractor requires PyWavelets.")
-        signal = np.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0)
-        if len(signal) < 4:
+        signal = _signal_values(signal, "CWTExtractor")
+        if signal is None:
             return self._empty_features()
-        try:
-            coefficients, frequencies = cwt(signal, self.wavelet, self.widths_)
-        except Exception:
-            return self._empty_features()
-        scalogram = np.abs(coefficients)
-        if self.use_log_scale:
-            scalogram = np.log1p(scalogram)
-        features = {}
-        features['cwt_mean_power'] = np.mean(scalogram)
-        features['cwt_std_power'] = np.std(scalogram)
-        features['cwt_max_power'] = np.max(scalogram)
-        features['cwt_min_power'] = np.min(scalogram)
-        features['cwt_median_power'] = np.median(scalogram)
-        features['cwt_total_power'] = np.sum(scalogram)
-        scale_mean = np.mean(scalogram, axis=1)
-        features['cwt_scale_mean_max'] = np.max(scale_mean)
-        features['cwt_scale_mean_min'] = np.min(scale_mean)
-        features['cwt_scale_mean_std'] = np.std(scale_mean)
-        dominant_scale_idx = np.argmax(scale_mean)
-        features['cwt_dominant_scale'] = self.widths_[dominant_scale_idx]
-        features['cwt_dominant_scale_power'] = scale_mean[dominant_scale_idx]
-        features['cwt_scale_entropy'] = self._compute_entropy(scale_mean)
-        time_mean = np.mean(scalogram, axis=0)
-        features['cwt_temporal_mean'] = np.mean(time_mean)
-        features['cwt_temporal_std'] = np.std(time_mean)
-        features['cwt_temporal_entropy'] = self._compute_entropy(time_mean)
-        if len(time_mean) > 1:
-            features['cwt_temporal_slope'] = np.polyfit(np.arange(len(time_mean)), time_mean, 1)[0]
-        else:
-            features['cwt_temporal_slope'] = 0.0
-        total_energy = np.sum(scalogram)
+        fs = _positive_rate(self.sampling_rate, "CWT sampling_rate")
+        coefficients, frequencies = pywt.cwt(
+            signal,
+            self.widths_,
+            self.wavelet,
+            sampling_period=1.0 / fs,
+        )
+        magnitude = np.abs(coefficients)
+        valid = np.ones(magnitude.shape, dtype=bool)
+        for idx, scale in enumerate(self.widths_):
+            edge = int(np.ceil(
+                max(abs(self._wavelet_lower_bound), abs(self._wavelet_upper_bound))
+                * float(scale) / 2.0
+            ))
+            if edge:
+                valid[idx, :min(edge, len(signal))] = False
+                valid[idx, max(0, len(signal) - edge):] = False
+        valid_counts = valid.sum(axis=1)
+        scale_mean = np.divide(
+            np.where(valid, magnitude, 0.0).sum(axis=1),
+            valid_counts,
+            out=np.zeros(len(self.widths_), dtype=float),
+            where=valid_counts > 0,
+        )
+        valid_values = magnitude[valid]
+        if valid_values.size == 0:
+            valid_values = np.zeros(1, dtype=float)
+        time_counts = valid.sum(axis=0)
+        time_mean = np.divide(
+            np.where(valid, magnitude, 0.0).sum(axis=0),
+            time_counts,
+            out=np.zeros(len(signal), dtype=float),
+            where=time_counts > 0,
+        )
+        features: Dict[str, float] = {
+            "cwt_mean_magnitude": float(np.mean(valid_values)),
+            "cwt_std_magnitude": float(np.std(valid_values)),
+            "cwt_max_magnitude": float(np.max(valid_values)),
+            "cwt_min_magnitude": float(np.min(valid_values)),
+            "cwt_median_magnitude": float(np.median(valid_values)),
+            "cwt_sum_magnitude": float(np.sum(valid_values)),
+            "cwt_coefficient_power_mean": float(np.mean(valid_values ** 2)),
+            "cwt_scale_mean_max_magnitude": float(np.max(scale_mean)),
+            "cwt_scale_mean_min_magnitude": float(np.min(scale_mean)),
+            "cwt_scale_mean_std_magnitude": float(np.std(scale_mean)),
+            "cwt_dominant_scale": float(self.widths_[int(np.argmax(scale_mean))]),
+            "cwt_dominant_frequency_hz": float(frequencies[int(np.argmax(scale_mean))]),
+            "cwt_dominant_scale_mean_magnitude": float(np.max(scale_mean)),
+            "cwt_scale_entropy_bits": self._compute_entropy(scale_mean),
+            "cwt_temporal_mean_magnitude": float(np.mean(time_mean)),
+            "cwt_temporal_std_magnitude": float(np.std(time_mean)),
+            "cwt_temporal_entropy_bits": self._compute_entropy(time_mean),
+            "cwt_temporal_slope_per_s": (
+                float(np.polyfit(np.arange(len(time_mean)) / fs, time_mean, 1)[0])
+                if len(time_mean) > 1 else 0.0
+            ),
+            "cwt_boundary_fraction": float(1.0 - valid.mean()),
+        }
         n_thirds = len(self.widths_) // 3
+        scale_total = float(scale_mean.sum())
         if n_thirds > 0:
-            features['cwt_low_scale_ratio'] = np.sum(scalogram[:n_thirds, :]) / (total_energy + 1e-10)
-            features['cwt_mid_scale_ratio'] = np.sum(scalogram[n_thirds:2*n_thirds, :]) / (total_energy + 1e-10)
-            features['cwt_high_scale_ratio'] = np.sum(scalogram[2*n_thirds:, :]) / (total_energy + 1e-10)
+            features["cwt_low_scale_magnitude_fraction"] = float(
+                scale_mean[:n_thirds].sum() / scale_total if scale_total > 0 else 0.0
+            )
+            features["cwt_mid_scale_magnitude_fraction"] = float(
+                scale_mean[n_thirds:2*n_thirds].sum() / scale_total if scale_total > 0 else 0.0
+            )
+            features["cwt_high_scale_magnitude_fraction"] = float(
+                scale_mean[2*n_thirds:].sum() / scale_total if scale_total > 0 else 0.0
+            )
+        else:
+            features.update({
+                "cwt_low_scale_magnitude_fraction": 0.0,
+                "cwt_mid_scale_magnitude_fraction": 0.0,
+                "cwt_high_scale_magnitude_fraction": 0.0,
+            })
         ridge_energy = []
-        for t_idx in range(scalogram.shape[1]):
-            col = scalogram[:, t_idx]
+        for t_idx in range(magnitude.shape[1]):
+            col = np.where(valid[:, t_idx], magnitude[:, t_idx], 0.0)
             if len(col) > 2:
                 maxima_idx = argrelextrema(col, np.greater)[0] if argrelextrema is not None else []
                 if len(maxima_idx) > 0:
@@ -1091,35 +1547,56 @@ class CWTExtractor(HoneycombBase):
         if ridge_energy:
             features['cwt_ridge_mean'] = np.mean(ridge_energy)
             features['cwt_ridge_std'] = np.std(ridge_energy)
-            features['cwt_ridge_count'] = len(ridge_energy) / max(len(time_mean), 1)
+            features['cwt_ridge_count_per_sample'] = len(ridge_energy) / max(len(time_mean), 1)
         else:
             features['cwt_ridge_mean'] = 0.0
             features['cwt_ridge_std'] = 0.0
-            features['cwt_ridge_count'] = 0.0
-        features['cwt_variance_ratio'] = np.var(scale_mean) / (np.mean(scale_mean) + 1e-10)
+            features['cwt_ridge_count_per_sample'] = 0.0
+        features['cwt_variance_to_mean_scale_magnitude'] = (
+            float(np.var(scale_mean) / np.mean(scale_mean))
+            if np.mean(scale_mean) > 0 else 0.0
+        )
+        features["cwt_valid_coefficient_fraction"] = float(valid.mean())
+        if self.use_log_scale:
+            log_magnitude = np.log1p(valid_values)
+            features["cwt_log1p_magnitude_mean"] = float(np.mean(log_magnitude))
+            features["cwt_log1p_magnitude_std"] = float(np.std(log_magnitude))
+            features["cwt_log1p_magnitude_max"] = float(np.max(log_magnitude))
         return features
 
     def _empty_features(self) -> Dict[str, float]:
-        return {
-            'cwt_mean_power': 0.0, 'cwt_std_power': 0.0, 'cwt_max_power': 0.0,
-            'cwt_min_power': 0.0, 'cwt_median_power': 0.0, 'cwt_total_power': 0.0,
-            'cwt_scale_mean_max': 0.0, 'cwt_scale_mean_min': 0.0, 'cwt_scale_mean_std': 0.0,
-            'cwt_dominant_scale': 0.0, 'cwt_dominant_scale_power': 0.0,
-            'cwt_scale_entropy': 0.0, 'cwt_temporal_mean': 0.0, 'cwt_temporal_std': 0.0,
-            'cwt_temporal_entropy': 0.0, 'cwt_temporal_slope': 0.0,
-            'cwt_low_scale_ratio': 0.0, 'cwt_mid_scale_ratio': 0.0, 'cwt_high_scale_ratio': 0.0,
-            'cwt_ridge_mean': 0.0, 'cwt_ridge_std': 0.0, 'cwt_ridge_count': 0.0,
-            'cwt_variance_ratio': 0.0,
-        }
+        keys = (
+            "cwt_mean_magnitude", "cwt_std_magnitude", "cwt_max_magnitude",
+            "cwt_min_magnitude", "cwt_median_magnitude", "cwt_sum_magnitude",
+            "cwt_coefficient_power_mean", "cwt_scale_mean_max_magnitude",
+            "cwt_scale_mean_min_magnitude", "cwt_scale_mean_std_magnitude",
+            "cwt_dominant_scale", "cwt_dominant_frequency_hz",
+            "cwt_dominant_scale_mean_magnitude", "cwt_scale_entropy_bits",
+            "cwt_temporal_mean_magnitude", "cwt_temporal_std_magnitude",
+            "cwt_temporal_entropy_bits", "cwt_temporal_slope_per_s",
+            "cwt_low_scale_magnitude_fraction", "cwt_mid_scale_magnitude_fraction",
+            "cwt_high_scale_magnitude_fraction", "cwt_ridge_mean", "cwt_ridge_std",
+            "cwt_ridge_count_per_sample", "cwt_variance_to_mean_scale_magnitude",
+            "cwt_boundary_fraction", "cwt_valid_coefficient_fraction",
+        )
+        result = dict.fromkeys(keys, 0.0)
+        result["cwt_boundary_fraction"] = 1.0
+        if self.use_log_scale:
+            result.update({
+                "cwt_log1p_magnitude_mean": 0.0,
+                "cwt_log1p_magnitude_std": 0.0,
+                "cwt_log1p_magnitude_max": 0.0,
+            })
+        return result
 
     def _compute_entropy(self, x: np.ndarray) -> float:
-        x = np.abs(x)
-        total = np.sum(x)
+        x = np.asarray(x, dtype=float)
+        total = float(np.sum(x))
         if total == 0:
             return 0.0
-        p = x / total
+        p = x[x > 0] / total
         p = p[p > 0]
-        return -np.sum(p * np.log2(p + 1e-10))
+        return float(-np.sum(p * np.log2(p)))
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         check_is_fitted(self, ["acc_cols_", "widths_"])
@@ -1128,6 +1605,7 @@ class CWTExtractor(HoneycombBase):
         for col in self.acc_cols_:
             feat_dict = {}
             for seq_id, group in df.groupby(self.sequence_col, sort=False):
+                self._validate_uniform_counter(group)
                 signal = group[col].to_numpy(dtype=float)
                 seq_features = self._compute_cwt_features(signal)
                 for feat_name, value in seq_features.items():
@@ -1142,6 +1620,16 @@ class CWTExtractor(HoneycombBase):
         if not parts:
             return pd.DataFrame(index=df.index)
         return pd.concat(parts, axis=1)
+
+    def _validate_uniform_counter(self, group: pd.DataFrame) -> None:
+        if self.counter_col not in group.columns or len(group) < 2:
+            return
+        values = pd.to_numeric(group[self.counter_col], errors="coerce").to_numpy(dtype=float)
+        if not np.isfinite(values).all() or np.any(np.diff(values) != 1):
+            raise ValueError(
+                "CWT requires uniformly spaced samples; sequence_counter must increase by "
+                "one for every row. Interpolate missing samples on a uniform grid first."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1175,10 +1663,14 @@ class SequenceExtractor(HoneycombBase):
         self,
         # --- accelerometer ---
         acc_modes: str = "raw|velocity|displacement|jerk",
+        linear_acc_modes: str = "",
         use_acc_magnitude: bool = False,                    # NEW
         use_linear_acc_magnitude: bool = False,             # NEW
         linear_acc_mode: Optional[str] = None,              # NEW  ('baseline' or None)
         use_highpass_fallback: bool = True,                 # NEW
+        acceleration_units: str = "m/s^2",
+        linear_acc_frame: str = "world",
+        gravity_magnitude: float = 9.80665,
 
         # --- rotation ---
         rotation_modes: str = "quaternion",
@@ -1214,14 +1706,14 @@ class SequenceExtractor(HoneycombBase):
         counter_col: str = "sequence_counter",
 
         # --- rates ---
-        imu_native_sampling_rate: int = 20,
-        imu_target_sampling_rate: int = 20,
-        rot_native_sampling_rate: int = 20,
-        rot_target_sampling_rate: int = 20,
-        tof_native_sampling_rate: int = 5,
-        tof_target_sampling_rate: int = 5,
-        thm_native_sampling_rate: int = 5,
-        thm_target_sampling_rate: int = 5,
+        imu_native_sampling_rate: float = 20,
+        imu_target_sampling_rate: float = 20,
+        rot_native_sampling_rate: float = 20,
+        rot_target_sampling_rate: float = 20,
+        tof_native_sampling_rate: float = 5,
+        tof_target_sampling_rate: float = 5,
+        thm_native_sampling_rate: float = 5,
+        thm_target_sampling_rate: float = 5,
 
         # --- chunking for chunk output ---
         chunk_window_size: Optional[int] = 128,
@@ -1244,12 +1736,15 @@ class SequenceExtractor(HoneycombBase):
         stft_detrend: str = "constant",                     # NEW
         stft_use_log_scale: bool = True,
         stft_frequency_bands: Optional[Dict[str, Tuple[float, float]]] = None,  # NEW
+        stft_window_seconds: Optional[float] = None,
 
         # --- CWT ---
         cwt_wavelet: str = "morl",
         cwt_max_scale: int = 128,
         cwt_n_scales: int = 32,
         cwt_use_log_scale: bool = True,
+        cwt_min_scale: Optional[float] = None,
+        cwt_max_frequency: Optional[float] = None,
 
         # --- configs (list-of-dicts path) ---
         stft_configs: Optional[List[Dict[str, Any]]] = _UNSET,
@@ -1262,10 +1757,14 @@ class SequenceExtractor(HoneycombBase):
         problematic_feature_cols: Optional[List[str]] = None,
     ):
         self.acc_modes = acc_modes
+        self.linear_acc_modes = linear_acc_modes
         self.use_acc_magnitude = use_acc_magnitude
         self.use_linear_acc_magnitude = use_linear_acc_magnitude
         self.linear_acc_mode = linear_acc_mode
         self.use_highpass_fallback = use_highpass_fallback
+        self.acceleration_units = acceleration_units
+        self.linear_acc_frame = linear_acc_frame
+        self.gravity_magnitude = gravity_magnitude
 
         self.rotation_modes = rotation_modes
         self.fix_quaternion_sign = fix_quaternion_sign
@@ -1322,11 +1821,14 @@ class SequenceExtractor(HoneycombBase):
         self.stft_detrend = stft_detrend
         self.stft_use_log_scale = stft_use_log_scale
         self.stft_frequency_bands = stft_frequency_bands
+        self.stft_window_seconds = stft_window_seconds
 
         self.cwt_wavelet = cwt_wavelet
         self.cwt_max_scale = cwt_max_scale
         self.cwt_n_scales = cwt_n_scales
         self.cwt_use_log_scale = cwt_use_log_scale
+        self.cwt_min_scale = cwt_min_scale
+        self.cwt_max_frequency = cwt_max_frequency
 
         self.stft_configs = stft_configs
         self.cwt_configs = cwt_configs
@@ -1355,6 +1857,8 @@ class SequenceExtractor(HoneycombBase):
             use_log_scale=self.stft_use_log_scale,
             frequency_bands=_coerce_search_value(self.stft_frequency_bands),
             sampling_rate=self.imu_native_sampling_rate,
+            window_seconds=self.stft_window_seconds,
+            counter_col=self.counter_col,
             sequence_col=self.sequence_col,
         )
 
@@ -1364,7 +1868,10 @@ class SequenceExtractor(HoneycombBase):
             max_scale=self.cwt_max_scale,
             n_scales=self.cwt_n_scales,
             use_log_scale=self.cwt_use_log_scale,
+            min_scale=self.cwt_min_scale,
+            max_frequency=self.cwt_max_frequency,
             sampling_rate=self.imu_native_sampling_rate,
+            counter_col=self.counter_col,
             sequence_col=self.sequence_col,
         )
 
@@ -1412,11 +1919,15 @@ class SequenceExtractor(HoneycombBase):
         """Rebuild every sub-extractor from current params (fit and __init__)."""
         self.cleaner = SignalCleaner(
             native_sampling_rate=self.imu_native_sampling_rate,
+            rot_native_sampling_rate=self.rot_native_sampling_rate,
             compute_dt=self.compute_dt,
             clip_value=self.clip_value,
             interp_mode=self.interp_mode,
             linear_acc_mode=self.linear_acc_mode,
             use_highpass_fallback=self.use_highpass_fallback,
+            acceleration_units=self.acceleration_units,
+            linear_acc_frame=self.linear_acc_frame,
+            gravity_magnitude=self.gravity_magnitude,
             sequence_col=self.sequence_col,
             counter_col=self.counter_col,
             window_size=self.window_size,
@@ -1433,6 +1944,7 @@ class SequenceExtractor(HoneycombBase):
 
         self.imu = IMUExtractor(
             acc_modes=self.acc_modes,
+            linear_acc_modes=self.linear_acc_modes,
             use_acc_magnitude=self.use_acc_magnitude,
             use_linear_acc_magnitude=self.use_linear_acc_magnitude,
             window_size=self.window_size,
@@ -1461,7 +1973,7 @@ class SequenceExtractor(HoneycombBase):
         self._build_time_frequency_extractors()
 
     def _non_feature_cols(self) -> List[str]:
-        cols = {self.sequence_col, self.counter_col, "dt", "mask"}
+        cols = {self.sequence_col, self.counter_col, "dt", "rot_dt", "mask"}
         return [c for c in cols if c is not None]
 
     def _parse_frame_stats(self) -> List[str]:
@@ -1479,8 +1991,10 @@ class SequenceExtractor(HoneycombBase):
         return stats
 
     def _maybe_resample(self, df: pd.DataFrame) -> pd.DataFrame:
-        if not self.resample_modalities or resample is None:
+        if not self.resample_modalities:
             return df
+        if resample_poly is None:
+            raise ImportError("resample_modalities=True requires scipy.signal.resample_poly")
         try:
             return self._maybe_resample_inner(df)
         except InvalidExtractorParams:
@@ -1489,6 +2003,11 @@ class SequenceExtractor(HoneycombBase):
             raise InvalidExtractorParams(f"Multimodal resampling failed: {exc}") from exc
 
     def _maybe_resample_inner(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Rate-convert then align back to the shared fixed-length sequence grid.
+
+        This is normalized-time feature preparation, not a change to the sequence's
+        physical duration or output sampling rate. The source intervals remain attached.
+        """
         rows = []
         rate_map = {
             "acc_": (self.imu_native_sampling_rate, self.imu_target_sampling_rate),
@@ -1502,42 +2021,131 @@ class SequenceExtractor(HoneycombBase):
             max_len = len(g)
             new_df = pd.DataFrame(index=range(max_len))
             new_df[self.sequence_col] = seq_id
+            if self.counter_col in g.columns:
+                counter = pd.to_numeric(g[self.counter_col], errors="coerce").to_numpy(dtype=float)
+                if not np.isfinite(counter).all() or (len(counter) > 1 and np.any(np.diff(counter) <= 0)):
+                    raise ValueError("Resampling requires strictly increasing finite sequence counters")
+                if len(counter) > 1 and np.any(np.diff(counter) != 1):
+                    raise ValueError(
+                        "Polyphase resampling requires a uniform input grid; interpolate missing "
+                        "counter positions before enabling resample_modalities"
+                    )
+                new_df[self.counter_col] = g[self.counter_col].to_numpy()
+            else:
+                counter = np.arange(len(g), dtype=float)
             for prefix, (native_rate, target_rate) in rate_map.items():
                 cols = [
                     c for c in g.columns
-                    if c.startswith(prefix) and c not in {self.sequence_col, self.counter_col, "dt", "mask"}
+                    if c.startswith(prefix)
+                    and c not in {self.sequence_col, self.counter_col, "dt", "rot_dt", "mask"}
                 ]
                 if not cols:
                     continue
-                native_rate = max(1, int(native_rate or 1))
-                target_rate = max(1, int(target_rate or native_rate))
-                target_len = int(round(len(g) * target_rate / native_rate))
+                native_rate = _positive_rate(native_rate, f"{prefix} native sampling rate")
+                target_rate = _positive_rate(target_rate, f"{prefix} target sampling rate")
+                ratio = target_rate / native_rate
+                target_len = max(1, int(round(len(g) * ratio)))
                 if target_len <= 0:
                     continue
-                vals = g[cols].fillna(0.0).to_numpy(dtype=float)
-                if target_len != len(g):
-                    vals = resample(vals, target_len, axis=0)
-                s = pd.DataFrame(vals, columns=cols)
-                if len(s) != max_len:
-                    old_index = np.linspace(0.0, 1.0, len(s))
-                    new_index = np.linspace(0.0, 1.0, max_len)
-                    s = s.copy()
-                    s.index = pd.Index(old_index)
-                    s = s.reindex(new_index)
-                    s = s.interpolate(method="linear", limit_direction="both").ffill().bfill()
-                if len(s) != max_len:
-                    raise InvalidExtractorParams(
-                        f"Resampling {prefix} columns failed to align to sequence length"
-                    )
-                for col in cols:
-                    if col in s.columns:
-                        new_df[col] = s[col].to_numpy()
+                vals = g[cols].to_numpy(dtype=float)
+                if prefix == "tof_":
+                    valid = np.isfinite(vals) & (vals != -1.0)
+                    fill_value = 500.0 if self.tof_fill_mode == "far_500" else 255.0
+                    if target_len != len(g):
+                        source_samples = np.arange(len(g), dtype=float)
+                        for col_idx in range(vals.shape[1]):
+                            valid_samples = np.flatnonzero(valid[:, col_idx])
+                            vals[:, col_idx] = (
+                                np.interp(
+                                    source_samples,
+                                    valid_samples,
+                                    vals[valid_samples, col_idx],
+                                )
+                                if len(valid_samples)
+                                else fill_value
+                            )
                     else:
-                        new_df[col] = 0.0
+                        vals = np.where(valid, vals, fill_value)
+                elif not np.isfinite(vals).all():
+                    raise ValueError(
+                        f"Cannot resample {prefix} columns with missing values; "
+                        "apply the sequence-local imputation policy first"
+                    )
+                if target_len != len(g):
+                    if prefix == "rot_":
+                        if Rotation is None or Slerp is None:
+                            raise ImportError("Quaternion resampling requires scipy.spatial.transform")
+                        q_cols = ["rot_w", "rot_x", "rot_y", "rot_z"]
+                        if not all(col in cols for col in q_cols):
+                            raise ValueError("Rotation resampling requires rot_w/x/y/z quaternion columns")
+                        q = g[q_cols].to_numpy(dtype=float)
+                        norms = np.linalg.norm(q, axis=1, keepdims=True)
+                        if not np.isfinite(q).all() or np.any(norms <= 0):
+                            raise ValueError("Quaternion resampling requires finite nonzero quaternions")
+                        q = q / norms
+                        for i in range(1, len(q)):
+                            if np.dot(q[i - 1], q[i]) < 0:
+                                q[i] *= -1.0
+                        source_times = (counter - counter[0]) / native_rate
+                        target_times = np.linspace(source_times[0], source_times[-1], target_len)
+                        if len(q) == 1:
+                            q_aligned = np.repeat(q, max_len, axis=0)
+                        else:
+                            rotations = Rotation.from_quat(q[:, [1, 2, 3, 0]])
+                            q_target = Slerp(source_times, rotations)(target_times).as_quat()[:, [3, 0, 1, 2]]
+                            if target_len == 1:
+                                q_aligned = np.repeat(q_target, max_len, axis=0)
+                            else:
+                                aligned_rotations = Slerp(target_times, Rotation.from_quat(
+                                    q_target[:, [1, 2, 3, 0]]
+                                ))(source_times)
+                                q_aligned = aligned_rotations.as_quat()[:, [3, 0, 1, 2]]
+                        vals = np.column_stack([
+                            q_aligned[:, q_cols.index(col)] if col in q_cols
+                            else np.interp(
+                                np.linspace(0.0, 1.0, max_len),
+                                np.linspace(0.0, 1.0, target_len),
+                                np.interp(
+                                    np.linspace(0.0, 1.0, target_len),
+                                    np.linspace(0.0, 1.0, len(g)),
+                                    g[col].to_numpy(dtype=float),
+                                ),
+                            )
+                            for col in cols
+                        ])
+                    else:
+                        ratio_fraction = Fraction(ratio).limit_denominator(1000)
+                        filtered = resample_poly(
+                            vals,
+                            ratio_fraction.numerator,
+                            ratio_fraction.denominator,
+                            axis=0,
+                        )
+                        target_grid = np.linspace(0.0, 1.0, target_len)
+                        filtered_grid = np.linspace(0.0, 1.0, len(filtered))
+                        rate_converted = np.column_stack([
+                            np.interp(target_grid, filtered_grid, filtered[:, col_idx])
+                            for col_idx in range(filtered.shape[1])
+                        ])
+                        source_grid = np.linspace(0.0, 1.0, max_len)
+                        vals = np.column_stack([
+                            np.interp(source_grid, target_grid, rate_converted[:, col_idx])
+                            for col_idx in range(rate_converted.shape[1])
+                        ])
+                        if prefix == "tof_":
+                            vals[~valid] = -1.0
+                elif prefix == "tof_":
+                    vals[~valid] = -1.0
+                for col_idx, col in enumerate(cols):
+                    new_df[col] = vals[:, col_idx]
             if "dt" in g.columns:
-                new_df["dt"] = float(np.nanmean(g["dt"].fillna(1.0 / 20.0)))
+                new_df["dt"] = g["dt"].to_numpy(dtype=float)
             else:
-                new_df["dt"] = 1.0 / 20.0
+                new_df["dt"] = 1.0 / float(self.imu_native_sampling_rate)
+            if "rot_dt" in g.columns:
+                new_df["rot_dt"] = g["rot_dt"].to_numpy(dtype=float)
+            else:
+                new_df["rot_dt"] = 1.0 / float(self.rot_native_sampling_rate)
             new_df["mask"] = 1.0
             rows.append(new_df)
         if not rows:
