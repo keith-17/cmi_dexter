@@ -1,7 +1,7 @@
 # Local development and Kaggle GPU execution
 
 Use branch `multibranch/v0/develop`, notebook
-`notebooks/multibranch_attention.ipynb`, and the modules in `src/`.
+`notebooks/multibranch_alpha.ipynb`, and the modules in `src/`.
 The workflow packages the saved notebook and module bytes, adding only a first
 bootstrap cell. It does not change architecture, search candidates, data filters,
 splits, or the 37 Bayesian iterations.

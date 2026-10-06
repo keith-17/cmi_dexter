@@ -15,7 +15,7 @@ spec.loader.exec_module(workflow)
 
 class WorkflowTests(unittest.TestCase):
     def test_two_iteration_test_changes_only_packaged_iteration_count(self):
-        original_bytes = (ROOT / 'notebooks/multibranch_attention.ipynb').read_bytes()
+        original_bytes = (ROOT / 'notebooks/multibranch_alpha.ipynb').read_bytes()
         with tempfile.TemporaryDirectory() as temporary:
             with patch.object(workflow, 'BUILD', Path(temporary)):
                 metadata = workflow.prepare(iterations=2)
@@ -31,7 +31,7 @@ class WorkflowTests(unittest.TestCase):
                 manifest = json.loads((Path(temporary) / 'submission.json').read_text())
                 self.assertEqual(manifest['search_iterations'], 2)
                 self.assertEqual(manifest['iteration_override'], 2)
-        self.assertEqual(original_bytes, (ROOT / 'notebooks/multibranch_attention.ipynb').read_bytes())
+        self.assertEqual(original_bytes, (ROOT / 'notebooks/multibranch_alpha.ipynb').read_bytes())
 
     def test_acknowledged_version_survives_prepare(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -86,7 +86,7 @@ class WorkflowTests(unittest.TestCase):
                 download.assert_called_once_with(metadata)
 
     def test_notebook_and_utility_snapshot_roundtrip(self):
-        original_bytes = (ROOT / 'notebooks/multibranch_attention.ipynb').read_bytes()
+        original_bytes = (ROOT / 'notebooks/multibranch_alpha.ipynb').read_bytes()
         with tempfile.TemporaryDirectory() as temporary:
             with patch.object(workflow, 'BUILD', Path(temporary)):
                 metadata = workflow.prepare()
@@ -103,7 +103,7 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(base64.b64decode(content), (ROOT / 'src' / name).read_bytes())
             self.assertTrue(metadata['enable_gpu'])
             self.assertIn('cmi-detect-behavior-with-sensor-data', metadata['competition_sources'])
-        self.assertEqual(original_bytes, (ROOT / 'notebooks/multibranch_attention.ipynb').read_bytes())
+        self.assertEqual(original_bytes, (ROOT / 'notebooks/multibranch_alpha.ipynb').read_bytes())
 
     def test_collect_nested_zipped_csv_outputs(self):
         with tempfile.TemporaryDirectory() as temporary:

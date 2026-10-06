@@ -32,7 +32,7 @@ import multibranch_attention_sol as mba  # noqa: E402
 from base_utils_sol import InvalidExtractorParams, SensorAugmentor, SequenceExtractor  # noqa: E402
 
 
-NOTEBOOK = ROOT / "notebooks" / "multibranch_v2.ipynb"
+NOTEBOOK = ROOT / "notebooks" / "multibranch_v1.ipynb"
 
 
 def notebook_grid_param_space():

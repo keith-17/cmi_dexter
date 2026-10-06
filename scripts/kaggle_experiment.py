@@ -40,7 +40,7 @@ def prepare(iterations=None):
     if branch != 'multibranch/v0/develop':
         raise RuntimeError('Switch to multibranch/v0/develop before preparing this experiment.')
     metadata = json.loads(METADATA.read_text(encoding='utf-8'))
-    notebook_path = ROOT / 'notebooks' / 'multibranch_attention.ipynb'
+    notebook_path = ROOT / 'notebooks' / 'multibranch_alpha.ipynb'
     notebook = json.loads(notebook_path.read_text(encoding='utf-8'))
     iteration_cells = [c for c in notebook['cells'] if c['cell_type'] == 'code'
                        and re.search(r'^n_iter\s*=\s*\d+\b', ''.join(c['source']), re.MULTILINE)]
