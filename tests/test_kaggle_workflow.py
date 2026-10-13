@@ -22,7 +22,7 @@ class WorkflowTests(unittest.TestCase):
                 packaged = json.loads((Path(temporary) / metadata['code_file']).read_text())
                 original = json.loads(original_bytes)
                 changed = 0
-                for before, after in zip(original['cells'], packaged['cells'][1:]):
+                for before, after in zip(original['cells'], packaged['cells']):
                     expected, actual = ''.join(before['source']), ''.join(after['source'])
                     if expected != actual:
                         changed += 1
@@ -85,22 +85,18 @@ class WorkflowTests(unittest.TestCase):
                 sleep.assert_called_once_with(60)
                 download.assert_called_once_with(metadata)
 
-    def test_notebook_and_utility_snapshot_roundtrip(self):
+    def test_notebook_packaged_without_module_snapshot_bloat(self):
         original_bytes = (ROOT / 'notebooks/multibranch_alpha.ipynb').read_bytes()
         with tempfile.TemporaryDirectory() as temporary:
             with patch.object(workflow, 'BUILD', Path(temporary)):
                 metadata = workflow.prepare()
                 notebook = json.loads((Path(temporary) / metadata['code_file']).read_text())
             original = json.loads(original_bytes)
-            self.assertEqual(len(notebook['cells']), len(original['cells']) + 1)
-            for expected, actual in zip(original['cells'], notebook['cells'][1:]):
+            self.assertEqual(len(notebook['cells']), len(original['cells']))
+            for expected, actual in zip(original['cells'], notebook['cells']):
                 self.assertEqual(expected['source'], actual['source'])
-            source = ''.join(notebook['cells'][0]['source'])
-            namespace = {}
-            exec(source.split('import base64,')[0], namespace)
-            import base64
-            for name, content in namespace['MODULE_SNAPSHOT'].items():
-                self.assertEqual(base64.b64decode(content), (ROOT / 'src' / name).read_bytes())
+            full_text = '\n'.join(''.join(c.get('source', [])) for c in notebook['cells'])
+            self.assertNotIn('MODULE_SNAPSHOT', full_text)
             self.assertTrue(metadata['enable_gpu'])
             self.assertIn('cmi-detect-behavior-with-sensor-data', metadata['competition_sources'])
         self.assertEqual(original_bytes, (ROOT / 'notebooks/multibranch_alpha.ipynb').read_bytes())

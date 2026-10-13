@@ -45,6 +45,19 @@ except Exception:
     Categorical = None
 
 try:
+    from sklearn_genetic import GASearchCV as _ExternalGASearchCV
+    from sklearn_genetic.space import (
+        Categorical as _ExternalECat,
+        Continuous as _ExternalEFloat,
+        Integer as _ExternalEInt,
+    )
+    SKLEARN_GENETIC_AVAILABLE = True
+except Exception:
+    _ExternalGASearchCV = None
+    _ExternalECat = _ExternalEInt = _ExternalEFloat = None
+    SKLEARN_GENETIC_AVAILABLE = False
+
+try:
     from scipy.interpolate import CubicSpline
 except Exception:
     CubicSpline = None
@@ -2047,7 +2060,7 @@ class SequenceExtractor(HoneycombBase):
                 target_len = max(1, int(round(len(g) * ratio)))
                 if target_len <= 0:
                     continue
-                vals = g[cols].to_numpy(dtype=float)
+                vals = g[cols].to_numpy(dtype=float).copy()
                 if prefix == "tof_":
                     valid = np.isfinite(vals) & (vals != -1.0)
                     fill_value = 500.0 if self.tof_fill_mode == "far_500" else 255.0
@@ -2793,7 +2806,7 @@ def evaluate_holdout(y_test_df: pd.DataFrame, y_pred, target_col: str = "bfrb", 
 
 
 def prepare_multitask_param_space(param_space: Dict[str, Any], search_mode: str) -> Dict[str, Any]:
-    if search_mode != "bayesian":
+    if search_mode not in {"bayesian", "evolutionary"}:
         return param_space
     out = {}
     for key, val in param_space.items():
@@ -2829,6 +2842,513 @@ def prepare_bayesian_space(param_space: Dict[str, Any]) -> Dict[str, Any]:
         else:
             out[key] = space
     return out
+
+
+class ECat:
+    """Categorical parameter space descriptor for evolutionary search."""
+
+    def __init__(self, choices, priors=None, random_state=None):
+        if isinstance(choices, (set, tuple)):
+            choices = list(choices)
+        elif not isinstance(choices, list):
+            choices = list(choices)
+        if not choices:
+            raise ValueError("ECat choices must not be empty.")
+        self.choices = choices
+        self.categories = choices
+        self.priors = priors
+        self.random_state = random_state
+
+    def sample(self, rng=None):
+        rng = rng or np.random.default_rng(self.random_state)
+        idx = int(rng.choice(len(self.choices), p=self.priors))
+        return self.choices[idx]
+
+    def __iter__(self):
+        return iter(self.choices)
+
+    def __len__(self):
+        return len(self.choices)
+
+    def __repr__(self):
+        return f"ECat({self.choices!r})"
+
+
+class EInt:
+    """Integer range parameter space descriptor for evolutionary search."""
+
+    def __init__(self, lower: int, upper: int, distribution: str = "uniform", random_state=None):
+        self.lower = int(lower)
+        self.upper = int(upper)
+        if self.lower > self.upper:
+            raise ValueError(f"EInt lower ({self.lower}) must be <= upper ({self.upper}).")
+        self.low = self.lower
+        self.high = self.upper
+        self.distribution = distribution
+        self.random_state = random_state
+
+    def sample(self, rng=None) -> int:
+        rng = rng or np.random.default_rng(self.random_state)
+        return int(rng.integers(self.lower, self.upper + 1))
+
+    def __repr__(self):
+        return f"EInt({self.lower}, {self.upper})"
+
+
+class EFloat:
+    """Continuous range parameter space descriptor for evolutionary search."""
+
+    def __init__(self, lower: float, upper: float, distribution: str = "uniform", random_state=None):
+        self.lower = float(lower)
+        self.upper = float(upper)
+        if self.lower > self.upper:
+            raise ValueError(f"EFloat lower ({self.lower}) must be <= upper ({self.upper}).")
+        self.low = self.lower
+        self.high = self.upper
+        self.distribution = str(distribution).lower()
+        self.random_state = random_state
+
+    def sample(self, rng=None) -> float:
+        rng = rng or np.random.default_rng(self.random_state)
+        if self.lower == self.upper:
+            return float(self.lower)
+        if self.distribution in {"log-uniform", "log_uniform", "log"} and self.lower > 0:
+            log_lo = np.log(self.lower)
+            log_hi = np.log(self.upper)
+            return float(np.exp(rng.uniform(log_lo, log_hi)))
+        return float(rng.uniform(self.lower, self.upper))
+
+    def __repr__(self):
+        return f"EFloat({self.lower}, {self.upper}, distribution={self.distribution!r})"
+
+
+def prepare_evolutionary_space(param_space: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert candidate lists and complex objects into evolutionary search descriptors."""
+    out: Dict[str, Any] = {}
+    for key, space in param_space.items():
+        if isinstance(space, ECat) or (_ExternalECat is not None and isinstance(space, _ExternalECat)):
+            raw_choices = getattr(space, "choices", getattr(space, "categories", []))
+            new_cats = [
+                json.dumps(cat, sort_keys=True) if isinstance(cat, (tuple, list, dict, set)) else cat
+                for cat in raw_choices
+            ]
+            out[key] = ECat(new_cats, priors=getattr(space, "priors", None))
+        elif isinstance(space, (EInt, EFloat)) or (
+            (_ExternalEInt is not None and isinstance(space, _ExternalEInt))
+            or (_ExternalEFloat is not None and isinstance(space, _ExternalEFloat))
+        ):
+            out[key] = space
+        elif Categorical is not None and isinstance(space, Categorical):
+            new_cats = [
+                json.dumps(cat, sort_keys=True) if isinstance(cat, (tuple, list, dict, set)) else cat
+                for cat in space.categories
+            ]
+            out[key] = ECat(new_cats)
+        elif isinstance(space, (list, tuple)):
+            new_cats = [
+                json.dumps(cat, sort_keys=True) if isinstance(cat, (tuple, list, dict, set)) else cat
+                for cat in space
+            ]
+            out[key] = ECat(new_cats)
+        else:
+            out[key] = ECat([space])
+    return out
+
+
+def _sample_evolutionary_gene(descriptor: Any, rng: np.random.Generator) -> Any:
+    if hasattr(descriptor, "sample"):
+        try:
+            return descriptor.sample(rng=rng)
+        except TypeError:
+            return descriptor.sample()
+    if isinstance(descriptor, (list, tuple)):
+        if len(descriptor) == 0:
+            return None
+        return descriptor[int(rng.integers(0, len(descriptor)))]
+    return descriptor
+
+
+def _slice_subset(data, indices):
+    if data is None:
+        return None
+    if hasattr(data, "iloc"):
+        return data.iloc[indices]
+    return np.asarray(data)[indices]
+
+
+class GASearchCV(BaseEstimator):
+    """Evolutionary hyperparameter search with CV and group-aware splitting."""
+
+    def __init__(
+        self,
+        estimator,
+        cv=5,
+        scoring=None,
+        population_size: int = 10,
+        generations: int = 5,
+        tournament_size: int = 3,
+        elitism: bool = True,
+        crossover_probability: float = 0.8,
+        mutation_probability: float = 0.2,
+        param_grid: Optional[Dict[str, Any]] = None,
+        criteria: str = "max",
+        refit: bool = True,
+        verbose: int = 1,
+        return_train_score: bool = True,
+        error_score=np.nan,
+        random_state: Optional[int] = 42,
+    ):
+        self.estimator = estimator
+        self.cv = cv
+        self.scoring = scoring
+        self.population_size = population_size
+        self.generations = generations
+        self.tournament_size = tournament_size
+        self.elitism = elitism
+        self.crossover_probability = crossover_probability
+        self.mutation_probability = mutation_probability
+        self.param_grid = param_grid
+        self.criteria = criteria
+        self.refit = refit
+        self.verbose = verbose
+        self.return_train_score = return_train_score
+        self.error_score = error_score
+        self.random_state = random_state
+
+    def _sample_individual(self, space: Dict[str, Any], rng: np.random.Generator) -> Dict[str, Any]:
+        return {k: _sample_evolutionary_gene(v, rng) for k, v in space.items()}
+
+    def _canonical_key(self, individual: Dict[str, Any]) -> str:
+        return json.dumps(individual, sort_keys=True, default=str)
+
+    def _tournament_select(
+        self,
+        population: List[Dict[str, Any]],
+        scores: List[float],
+        rng: np.random.Generator,
+        maximize: bool,
+    ) -> Dict[str, Any]:
+        k = max(1, min(int(self.tournament_size), len(population)))
+        contenders = rng.choice(len(population), size=k, replace=False)
+        best_idx = int(contenders[0])
+        best_val = scores[best_idx]
+        for idx in contenders[1:]:
+            val = scores[int(idx)]
+            if np.isnan(best_val) or (
+                not np.isnan(val) and ((val > best_val) if maximize else (val < best_val))
+            ):
+                best_idx = int(idx)
+                best_val = val
+        return dict(population[best_idx])
+
+    def _crossover(
+        self,
+        parent1: Dict[str, Any],
+        parent2: Dict[str, Any],
+        rng: np.random.Generator,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        child1, child2 = dict(parent1), dict(parent2)
+        if rng.random() <= float(self.crossover_probability):
+            for key in child1:
+                if rng.random() < 0.5:
+                    child1[key], child2[key] = child2[key], child1[key]
+        return child1, child2
+
+    def _mutate(
+        self,
+        individual: Dict[str, Any],
+        space: Dict[str, Any],
+        rng: np.random.Generator,
+    ) -> Dict[str, Any]:
+        mutated = dict(individual)
+        for key, descriptor in space.items():
+            if rng.random() <= float(self.mutation_probability):
+                mutated[key] = _sample_evolutionary_gene(descriptor, rng)
+        return mutated
+
+    def _evaluate_individual(
+        self,
+        params: Dict[str, Any],
+        X,
+        y,
+        splits: List[Tuple[np.ndarray, np.ndarray]],
+        fit_params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        import time
+
+        fit_times: List[float] = []
+        score_times: List[float] = []
+        test_scores: List[float] = []
+        train_scores: List[float] = []
+
+        n_splits = len(splits)
+        for fold_idx, (train_idx, test_idx) in enumerate(splits):
+            X_tr = _slice_subset(X, train_idx)
+            y_tr = _slice_subset(y, train_idx)
+            X_te = _slice_subset(X, test_idx)
+            y_te = _slice_subset(y, test_idx)
+
+            t0 = time.perf_counter()
+            try:
+                est = clone(self.estimator).set_params(**params)
+                est.fit(X_tr, y_tr, **fit_params)
+                fit_time = time.perf_counter() - t0
+
+                t1 = time.perf_counter()
+                if callable(self.scoring):
+                    te_score = float(self.scoring(est, X_te, y_te))
+                else:
+                    te_score = float(est.score(X_te, y_te))
+                score_time = time.perf_counter() - t1
+
+                if self.return_train_score:
+                    if callable(self.scoring):
+                        tr_score = float(self.scoring(est, X_tr, y_tr))
+                    else:
+                        tr_score = float(est.score(X_tr, y_tr))
+                else:
+                    tr_score = np.nan
+            except Exception:
+                if self.error_score == "raise":
+                    raise
+                fit_time = time.perf_counter() - t0
+                score_time = 0.0
+                te_score = float(self.error_score)
+                tr_score = float(self.error_score)
+
+            fit_times.append(fit_time)
+            score_times.append(score_time)
+            test_scores.append(te_score)
+            train_scores.append(tr_score)
+
+            if self.verbose:
+                param_str = ", ".join(f"{k}={v}" for k, v in sorted(params.items()))
+                total_min = (fit_time + score_time) / 60.0
+                if self.return_train_score:
+                    score_str = f"(train={tr_score:.3f}, test={te_score:.3f})"
+                else:
+                    score_str = f"{te_score:.3f}"
+                print(
+                    f"[CV {fold_idx + 1}/{n_splits}] END {param_str};, "
+                    f"score={score_str} total time= {total_min:.1f}min"
+                )
+
+        return {
+            "params": dict(params),
+            "fit_times": fit_times,
+            "score_times": score_times,
+            "test_scores": test_scores,
+            "train_scores": train_scores,
+            "mean_test_score": float(np.nanmean(test_scores)) if not np.all(np.isnan(test_scores)) else np.nan,
+            "std_test_score": float(np.nanstd(test_scores)) if not np.all(np.isnan(test_scores)) else np.nan,
+            "mean_train_score": float(np.nanmean(train_scores)) if not np.all(np.isnan(train_scores)) else np.nan,
+            "std_train_score": float(np.nanstd(train_scores)) if not np.all(np.isnan(train_scores)) else np.nan,
+        }
+
+    def fit(self, X, y=None, groups=None, **fit_params):
+        if not self.param_grid:
+            raise ValueError("GASearchCV requires a non-empty param_grid.")
+        for name, minimum in (("population_size", 2), ("generations", 0), ("tournament_size", 1)):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < minimum:
+                raise ValueError(f"{name} must be a single integer >= {minimum}.")
+        if self.tournament_size > self.population_size:
+            raise ValueError("tournament_size must not exceed population_size.")
+        for name in ("crossover_probability", "mutation_probability"):
+            value = getattr(self, name)
+            if not np.isscalar(value) or not 0 <= float(value) <= 1:
+                raise ValueError(f"{name} must be a single probability between 0 and 1.")
+        space = prepare_evolutionary_space(self.param_grid)
+        rng = np.random.default_rng(self.random_state)
+
+        if hasattr(self.cv, "split"):
+            splits = list(self.cv.split(X, y, groups=groups))
+        elif isinstance(self.cv, int):
+            from sklearn.model_selection import KFold
+
+            splits = list(KFold(n_splits=self.cv, shuffle=True, random_state=self.random_state).split(X, y))
+        else:
+            splits = list(self.cv)
+
+        self.n_splits_ = len(splits)
+        maximize = str(self.criteria).lower() != "min"
+        pop_size = int(self.population_size)
+        n_generations = int(self.generations)
+
+        history_records: List[Dict[str, Any]] = []
+        cache: Dict[str, Dict[str, Any]] = {}
+
+        def evaluate_or_Lookup(ind: Dict[str, Any]) -> Dict[str, Any]:
+            key = self._canonical_key(ind)
+            if key not in cache:
+                cache[key] = self._evaluate_individual(ind, X, y, splits, fit_params)
+                history_records.append(cache[key])
+            return cache[key]
+
+        population = [self._sample_individual(space, rng) for _ in range(pop_size)]
+        pop_records = [evaluate_or_Lookup(ind) for ind in population]
+        pop_scores = [rec["mean_test_score"] for rec in pop_records]
+
+        for gen in range(1, n_generations + 1):
+            if self.verbose:
+                best_gen = np.nanmax(pop_scores) if maximize else np.nanmin(pop_scores)
+                print(f"Generation {gen}/{n_generations} - current best CV score: {best_gen:.4f}")
+
+            offspring: List[Dict[str, Any]] = []
+            while len(offspring) < pop_size:
+                p1 = self._tournament_select(population, pop_scores, rng, maximize)
+                p2 = self._tournament_select(population, pop_scores, rng, maximize)
+                c1, c2 = self._crossover(p1, p2, rng)
+                offspring.append(self._mutate(c1, space, rng))
+                if len(offspring) < pop_size:
+                    offspring.append(self._mutate(c2, space, rng))
+
+            off_records = [evaluate_or_Lookup(ind) for ind in offspring]
+            off_scores = [rec["mean_test_score"] for rec in off_records]
+
+            if self.elitism:
+                combined_pop = population + offspring
+                combined_scores = pop_scores + off_scores
+
+                def sort_key(idx: int):
+                    s = combined_scores[idx]
+                    if np.isnan(s):
+                        return -np.inf if maximize else np.inf
+                    return s if maximize else -s
+
+                ranked_indices = sorted(range(len(combined_pop)), key=sort_key, reverse=True)
+                next_pop: List[Dict[str, Any]] = []
+                next_scores: List[float] = []
+                seen_keys = set()
+                for idx in ranked_indices:
+                    k = self._canonical_key(combined_pop[idx])
+                    if k not in seen_keys:
+                        seen_keys.add(k)
+                        next_pop.append(combined_pop[idx])
+                        next_scores.append(combined_scores[idx])
+                    if len(next_pop) == pop_size:
+                        break
+                while len(next_pop) < pop_size:
+                    idx = ranked_indices[len(next_pop) % len(ranked_indices)]
+                    next_pop.append(combined_pop[idx])
+                    next_scores.append(combined_scores[idx])
+                population, pop_scores = next_pop, next_scores
+            else:
+                population, pop_scores = offspring, off_scores
+
+        self.cv_results_ = self._build_cv_results(history_records, maximize)
+        self.best_index_ = int(np.argmin(self.cv_results_["rank_test_score"]))
+        self.best_score_ = float(self.cv_results_["mean_test_score"][self.best_index_])
+        self.best_params_ = dict(self.cv_results_["params"][self.best_index_])
+
+        if self.refit:
+            self.best_estimator_ = clone(self.estimator).set_params(**self.best_params_)
+            self.best_estimator_.fit(X, y, **fit_params)
+
+        return self
+
+    def _build_cv_results(self, records: List[Dict[str, Any]], maximize: bool) -> Dict[str, Any]:
+        n_candidates = len(records)
+        cv_results: Dict[str, Any] = {
+            "mean_fit_time": np.array([np.mean(r["fit_times"]) for r in records], dtype=float),
+            "std_fit_time": np.array([np.std(r["fit_times"]) for r in records], dtype=float),
+            "mean_score_time": np.array([np.mean(r["score_times"]) for r in records], dtype=float),
+            "std_score_time": np.array([np.std(r["score_times"]) for r in records], dtype=float),
+        }
+        param_keys = list(records[0]["params"].keys()) if records else []
+        for k in param_keys:
+            cv_results[f"param_{k}"] = [r["params"].get(k) for r in records]
+        cv_results["params"] = [dict(r["params"]) for r in records]
+
+        for fold_idx in range(self.n_splits_):
+            cv_results[f"split{fold_idx}_test_score"] = np.array(
+                [r["test_scores"][fold_idx] for r in records], dtype=float
+            )
+        mean_test = np.array([r["mean_test_score"] for r in records], dtype=float)
+        std_test = np.array([r["std_test_score"] for r in records], dtype=float)
+        cv_results["mean_test_score"] = mean_test
+        cv_results["std_test_score"] = std_test
+
+        order_vals = np.where(
+            np.isnan(mean_test),
+            np.inf,
+            -mean_test if maximize else mean_test,
+        )
+        ranks = np.empty(n_candidates, dtype=np.int32)
+        ranks[np.argsort(order_vals, kind="mergesort")] = np.arange(1, n_candidates + 1, dtype=np.int32)
+        cv_results["rank_test_score"] = ranks
+
+        if self.return_train_score:
+            for fold_idx in range(self.n_splits_):
+                cv_results[f"split{fold_idx}_train_score"] = np.array(
+                    [r["train_scores"][fold_idx] for r in records], dtype=float
+                )
+            cv_results["mean_train_score"] = np.array([r["mean_train_score"] for r in records], dtype=float)
+            cv_results["std_train_score"] = np.array([r["std_train_score"] for r in records], dtype=float)
+
+        return cv_results
+
+    def predict(self, X):
+        check_is_fitted(self, ["best_estimator_"])
+        return self.best_estimator_.predict(X)
+
+    def predict_proba(self, X):
+        check_is_fitted(self, ["best_estimator_"])
+        return self.best_estimator_.predict_proba(X)
+
+    def score(self, X, y=None):
+        check_is_fitted(self, ["best_estimator_"])
+        return self.best_estimator_.score(X, y)
+
+
+def build_quick_results_df(search_or_cv_results: Any, holdout_score: Optional[float] = None) -> pd.DataFrame:
+    """Build CV results DataFrame with best_score (train, test) and holdout_score appended at the bottom."""
+    if hasattr(search_or_cv_results, "cv_results_"):
+        cv_df = pd.DataFrame(search_or_cv_results.cv_results_).copy()
+        best_idx = getattr(search_or_cv_results, "best_index_", None)
+        best_test_score = getattr(search_or_cv_results, "best_score_", None)
+    elif isinstance(search_or_cv_results, pd.DataFrame):
+        cv_df = search_or_cv_results.copy()
+        best_idx = None
+        best_test_score = None
+    else:
+        cv_df = pd.DataFrame(search_or_cv_results).copy()
+        best_idx = None
+        best_test_score = None
+
+    while len(cv_df.columns) < 3:
+        cv_df[f"col_{len(cv_df.columns)}"] = np.nan
+
+    if best_idx is None and not cv_df.empty:
+        if "rank_test_score" in cv_df.columns and cv_df["rank_test_score"].notna().any():
+            best_idx = int(cv_df["rank_test_score"].astype(float).idxmin())
+        elif "mean_test_score" in cv_df.columns and cv_df["mean_test_score"].notna().any():
+            best_idx = int(cv_df["mean_test_score"].astype(float).idxmax())
+
+    if best_idx is not None and 0 <= int(best_idx) < len(cv_df):
+        if "mean_train_score" in cv_df.columns:
+            best_train_score = float(cv_df["mean_train_score"].iloc[int(best_idx)])
+        elif "split0_train_score" in cv_df.columns:
+            best_train_score = float(cv_df["split0_train_score"].iloc[int(best_idx)])
+        else:
+            best_train_score = np.nan
+        if best_test_score is None and "mean_test_score" in cv_df.columns:
+            best_test_score = float(cv_df["mean_test_score"].iloc[int(best_idx)])
+    else:
+        best_train_score = np.nan
+
+    best_test_val = float(best_test_score) if best_test_score is not None else np.nan
+
+    n_cols = len(cv_df.columns)
+    best_row = ["best_score", best_train_score, best_test_val] + [np.nan] * (n_cols - 3)
+    summary_rows = [best_row]
+
+    if holdout_score is not None:
+        holdout_row = ["holdout_score", float(holdout_score)] + [np.nan] * (n_cols - 2)
+        summary_rows.append(holdout_row)
+
+    summary_df = pd.DataFrame(summary_rows, columns=cv_df.columns)
+    return pd.concat([cv_df, summary_df], ignore_index=True)
 
 
 # ============================================================

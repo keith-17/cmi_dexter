@@ -32,15 +32,15 @@ def cli(*args):
     return result.stdout
 
 
-def prepare(iterations=None):
+def prepare(iterations=None, notebook_name=None):
     if iterations is not None and iterations < 1:
         raise RuntimeError('Iteration override must be a positive integer.')
     branch = subprocess.run(['git', 'branch', '--show-current'], cwd=ROOT,
                             capture_output=True, text=True, check=True).stdout.strip()
-    if branch != 'multibranch/v0/develop':
-        raise RuntimeError('Switch to multibranch/v0/develop before preparing this experiment.')
+    if not branch.startswith('multibranch/'):
+        raise RuntimeError('Switch to a multibranch/* branch before preparing this experiment.')
     metadata = json.loads(METADATA.read_text(encoding='utf-8'))
-    notebook_path = ROOT / 'notebooks' / 'multibranch_alpha.ipynb'
+    notebook_path = ROOT / 'notebooks' / (notebook_name or 'multibranch_alpha.ipynb')
     notebook = json.loads(notebook_path.read_text(encoding='utf-8'))
     iteration_cells = [c for c in notebook['cells'] if c['cell_type'] == 'code'
                        and re.search(r'^n_iter\s*=\s*\d+\b', ''.join(c['source']), re.MULTILINE)]
@@ -59,47 +59,11 @@ def prepare(iterations=None):
     modules = sorted((ROOT / 'src').glob('*.py'))
     if not {'data_utils.py', 'base_utils_qwen.py', 'multibranch_attention.py'} <= {p.name for p in modules}:
         raise RuntimeError('Required Python utility modules are missing from src/.')
-    encoded = {p.name: base64.b64encode(p.read_bytes()).decode('ascii') for p in modules}
-    bootstrap = '''import base64, importlib.util, json, os, subprocess, sys
-from pathlib import Path
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-workspace_root = Path('/kaggle/working')
-os.chdir(workspace_root)
-src_path = workspace_root / 'src'
-src_path.mkdir(exist_ok=True)
-for name, contents in MODULE_SNAPSHOT.items():
-    (src_path / name).write_bytes(base64.b64decode(contents))
-sys.path.insert(0, str(src_path))
-# Keep Kaggle's GPU TensorFlow stack; install only missing experiment dependencies.
-missing = [package for module, package in [('skopt', 'scikit-optimize==0.10.2'), ('pywt', 'PyWavelets>=1.6,<2')]
-           if importlib.util.find_spec(module) is None]
-if missing:
-    subprocess.check_call([sys.executable, '-m', 'pip', 'install', *missing])
-import tensorflow as tf
-if not tf.config.list_physical_devices('GPU'):
-    raise RuntimeError('No TensorFlow GPU detected. Check Kaggle accelerator and GPU quota.')
-data_dir = Path('/kaggle/input/cmi-detect-behavior-with-sensor-data')
-if not (data_dir / 'train.csv').exists():
-    matches = list(Path('/kaggle/input').rglob('train.csv'))
-    matches = [p for p in matches if (p.parent / 'train_demographics.csv').exists()]
-    if len(matches) != 1:
-        raise FileNotFoundError('Attach CMI competition data and accept its rules on Kaggle.')
-    data_dir = matches[0].parent
-# Existing data_utils.find_data_root() discovers this exact directory first.
-(workspace_root / 'data').symlink_to(data_dir, target_is_directory=True) if not (workspace_root / 'data').exists() else None
-print('GPU:', tf.config.list_physical_devices('GPU'))
-print('Data:', data_dir)
-'''
-    source = 'MODULE_SNAPSHOT = ' + repr(encoded) + '\n' + bootstrap
-    cell = {'cell_type': 'code', 'id': 'kaggle-local-bootstrap', 'execution_count': None, 'metadata': {}, 'outputs': [],
-            'source': source.splitlines(keepends=True)}
-    notebook['cells'].insert(0, cell)
-    for original in notebook['cells'][1:]:
+    for original in notebook['cells']:
         if original['cell_type'] == 'code':
             original['outputs'] = []
             original['execution_count'] = None
             compile(''.join(original['source']), str(notebook_path), 'exec')
-    compile(source, '<kaggle bootstrap>', 'exec')
     BUILD.mkdir(parents=True, exist_ok=True)
     (BUILD / metadata['code_file']).write_text(json.dumps(notebook, indent=1), encoding='utf-8')
     (BUILD / 'kernel-metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
@@ -199,13 +163,14 @@ def main():
     parser.add_argument('action', choices=['auth', 'prepare', 'push', 'status', 'logs', 'wait', 'download', 'pull'])
     parser.add_argument('--interval', type=int, default=60, help='Polling interval in seconds for wait (minimum 15).')
     parser.add_argument('--iterations', type=int, help='Override only the packaged Bayesian iteration count; local notebook stays unchanged.')
+    parser.add_argument('--notebook', type=str, default=None, help='Notebook filename in notebooks/ (e.g. multibranch_v1.ipynb).')
     args = parser.parse_args()
     metadata = json.loads(METADATA.read_text(encoding='utf-8'))
     try:
         if args.action == 'auth':
             subprocess.run([sys.executable, '-m', 'kaggle', 'auth', 'login'], check=True)
         elif args.action in ('prepare', 'push'):
-            prepare(args.iterations)
+            prepare(args.iterations, notebook_name=args.notebook)
             if args.action == 'push':
                 record_submission(cli('kernels', 'push', '-p', str(BUILD)))
         elif args.action == 'status':

@@ -29,7 +29,16 @@ SRC = ROOT / "src"
 sys.path.insert(0, str(SRC))
 
 import multibranch_attention_sol as mba  # noqa: E402
-from base_utils_sol import InvalidExtractorParams, SensorAugmentor, SequenceExtractor  # noqa: E402
+from base_utils_sol import (  # noqa: E402
+    ECat,
+    EFloat,
+    EInt,
+    GASearchCV,
+    InvalidExtractorParams,
+    SensorAugmentor,
+    SequenceExtractor,
+    build_quick_results_df,
+)
 
 
 NOTEBOOK = ROOT / "notebooks" / "multibranch_v1.ipynb"
@@ -52,10 +61,31 @@ def notebook_grid_param_space():
     )
     # The notebook uses named candidate lists (for example ``STFT_CONFIGS``),
     # so evaluate only the declarations leading up to the grid definition.
-    namespace = {"problematic_sequence_bool": True}
+    namespace = {"problematic_sequence_bool": True, "ECat": ECat, "EInt": EInt, "EFloat": EFloat}
     prefix = ast.Module(body=tree.body[: assignment_index + 1], type_ignores=[])
     exec(compile(prefix, str(NOTEBOOK), "exec"), namespace)
     return namespace["GRID_PARAM_SPACE"]
+
+
+def notebook_evolutionary_param_space():
+    """Read the literal ``EVOLUTIONARY_PARAM_SPACE`` without executing the notebook."""
+    notebook = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
+    source = next(
+        "".join(cell.get("source", []))
+        for cell in notebook["cells"]
+        if "EVOLUTIONARY_PARAM_SPACE = {" in "".join(cell.get("source", []))
+    )
+    tree = ast.parse(source)
+    assignment_index = next(
+        index
+        for index, node in enumerate(tree.body)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "EVOLUTIONARY_PARAM_SPACE" for target in node.targets)
+    )
+    namespace = {"problematic_sequence_bool": True, "ECat": ECat, "EInt": EInt, "EFloat": EFloat}
+    prefix = ast.Module(body=tree.body[: assignment_index + 1], type_ignores=[])
+    exec(compile(prefix, str(NOTEBOOK), "exec"), namespace)
+    return namespace["EVOLUTIONARY_PARAM_SPACE"]
 
 
 def make_pipeline():
@@ -82,10 +112,90 @@ class NotebookParameterContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.grid_space = notebook_grid_param_space()
+        cls.evo_space = notebook_evolutionary_param_space()
 
     def test_every_grid_key_is_reachable_from_the_pipeline(self):
         available = set(make_pipeline().get_params(deep=True))
         self.assertFalse(set(self.grid_space) - available)
+
+    def test_every_evolutionary_key_is_reachable_and_separate(self):
+        available = set(make_pipeline().get_params(deep=True))
+        self.assertFalse(set(self.evo_space) - available)
+        self.assertIsNot(self.evo_space, self.grid_space)
+        prepared = mba.prepare_multibranch_evolutionary_space(self.evo_space)
+        self.assertFalse(set(prepared) - available)
+        pipeline = make_pipeline()
+        rng = np.random.default_rng(42)
+        for key, descriptor in prepared.items():
+            sampled = descriptor.sample(rng=rng)
+            with self.subTest(parameter=key, sampled=repr(sampled)):
+                clone(pipeline).set_params(**{key: sampled})
+
+    def test_quick_results_df_appends_best_score_and_holdout_score(self):
+        fake_search = SimpleNamespace(
+            cv_results_={
+                "mean_fit_time": [1.2, 1.5],
+                "std_fit_time": [0.1, 0.2],
+                "mean_score_time": [0.3, 0.4],
+                "param_estimator__learning_rate": [1e-4, 5e-5],
+                "mean_train_score": [0.81, 0.89],
+                "mean_test_score": [0.72, 0.78],
+                "rank_test_score": [2, 1],
+            },
+            best_index_=1,
+            best_score_=0.78,
+        )
+        df = build_quick_results_df(fake_search, holdout_score=0.765)
+        self.assertEqual(len(df), 4)
+        best_row = df.iloc[-2]
+        self.assertEqual(best_row.iloc[0], "best_score")
+        self.assertAlmostEqual(float(best_row.iloc[1]), 0.89)
+        self.assertAlmostEqual(float(best_row.iloc[2]), 0.78)
+        self.assertTrue(pd.isna(best_row.iloc[3]))
+
+        holdout_row = df.iloc[-1]
+        self.assertEqual(holdout_row.iloc[0], "holdout_score")
+        self.assertAlmostEqual(float(holdout_row.iloc[1]), 0.765)
+        self.assertTrue(pd.isna(holdout_row.iloc[2]))
+
+    def test_ga_search_cv_runs_with_groups_and_produces_cv_results(self):
+        from sklearn.base import BaseEstimator, ClassifierMixin
+        from sklearn.model_selection import GroupShuffleSplit
+
+        class ToyEstimator(BaseEstimator, ClassifierMixin):
+            def __init__(self, alpha=1.0, k=2):
+                self.alpha = alpha
+                self.k = k
+
+            def fit(self, X, y=None):
+                self.fitted_ = True
+                return self
+
+            def score(self, X, y=None):
+                return float(self.alpha) + 0.01 * float(self.k)
+
+        X_toy = pd.DataFrame({"sequence_id": ["s1", "s1", "s2", "s2", "s3", "s3", "s4", "s4"], "x": range(8)})
+        y_toy = pd.DataFrame({"sequence_id": ["s1", "s1", "s2", "s2", "s3", "s3", "s4", "s4"], "bfrb": ["a"] * 4 + ["b"] * 4})
+        groups = X_toy["sequence_id"]
+
+        ga = GASearchCV(
+            estimator=ToyEstimator(),
+            param_grid={"alpha": EFloat(0.1, 0.9), "k": EInt(1, 5)},
+            cv=GroupShuffleSplit(n_splits=1, test_size=0.5, random_state=42),
+            population_size=3,
+            generations=1,
+            tournament_size=2,
+            elitism=True,
+            verbose=0,
+            random_state=42,
+        )
+        ga.fit(X_toy, y_toy, groups=groups)
+        self.assertTrue(hasattr(ga, "best_estimator_"))
+        self.assertIn("mean_train_score", ga.cv_results_)
+        self.assertIn("mean_test_score", ga.cv_results_)
+        quick_df = build_quick_results_df(ga, holdout_score=0.55)
+        self.assertEqual(quick_df.iloc[-2, 0], "best_score")
+        self.assertEqual(quick_df.iloc[-1, 0], "holdout_score")
 
     def test_every_grid_candidate_can_be_set_independently(self):
         """Catch bad names and incompatible candidate values before GridSearchCV."""

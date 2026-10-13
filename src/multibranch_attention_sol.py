@@ -27,6 +27,7 @@ from base_utils_sol import (
     SequenceExtractor,
     competition_score,
     prepare_bayesian_space,
+    prepare_evolutionary_space,
     prepare_multitask_param_space,
     validate_sequence_extractor_params,
 )
@@ -247,6 +248,10 @@ def _json_maybe(value: Any) -> Any:
 
 def prepare_multibranch_bayesian_space(param_space: Dict[str, Any]) -> Dict[str, Any]:
     return prepare_bayesian_space(prepare_multitask_param_space(param_space, "bayesian"))
+
+
+def prepare_multibranch_evolutionary_space(param_space: Dict[str, Any]) -> Dict[str, Any]:
+    return prepare_evolutionary_space(prepare_multitask_param_space(param_space, "evolutionary"))
 
 
 def group_feature_names(
