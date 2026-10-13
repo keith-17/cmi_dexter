@@ -83,6 +83,29 @@ def find_data_root(local_dir: str = 'data', kaggle_root: str = '/kaggle/input') 
     )
 
 
+def _largest_remainder(quotas: np.ndarray, caps: np.ndarray, target: int, rng) -> np.ndarray:
+    """Round per-cell quotas to integers that sum to ``target`` without exceeding ``caps``."""
+    counts = np.minimum(np.floor(quotas).astype(int), caps)
+    remaining = int(target - counts.sum())
+    if remaining <= 0:
+        return counts
+    fractions = quotas - np.floor(quotas)
+    shuffled = rng.permutation(len(quotas))
+    order = shuffled[np.argsort(-fractions[shuffled], kind='stable')]
+    while remaining > 0:
+        added = False
+        for idx in order:
+            if remaining == 0:
+                break
+            if counts[idx] < caps[idx]:
+                counts[idx] += 1
+                remaining -= 1
+                added = True
+        if not added:
+            break
+    return counts
+
+
 def sample_balanced_split(
     df: pd.DataFrame,
     train_pct: float = 0.20,
@@ -90,43 +113,46 @@ def sample_balanced_split(
     random_state: int = 42
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Split sequences into train and test sets balanced by subject and gesture.
+    Split sequences into disjoint train and test sets, stratified by subject and gesture.
+
+    Each (subject, gesture) cell contributes to both sets in proportion to its size, and the
+    totals match ``train_pct`` / ``test_pct`` of all sequences. When the two fractions sum
+    to 1 every sequence is assigned to exactly one set.
     """
+    if train_pct <= 0 or test_pct <= 0 or train_pct + test_pct > 1 + 1e-9:
+        raise ValueError('train_pct and test_pct must be positive and sum to at most 1.')
+
+    rng = np.random.default_rng(random_state)
     total_sequences = df['sequence_id'].nunique()
-    n_gestures = df['gesture'].nunique()
-    n_subjects = df['subject'].nunique()
+    cells = [
+        group['sequence_id'].drop_duplicates().sample(frac=1, random_state=random_state).tolist()
+        for _, group in df.groupby(['subject', 'gesture'])
+    ]
+    sizes = np.array([len(cell) for cell in cells])
 
-    train_target = int(total_sequences * train_pct)
-    test_target = int(total_sequences * test_pct)
+    train_target = int(round(total_sequences * train_pct))
+    n_train = _largest_remainder(sizes * train_pct, sizes, train_target, rng)
 
-    train_seqs_per_cell = train_target // (n_subjects * n_gestures)
-    test_seqs_per_cell = test_target // (n_subjects * n_gestures)
+    if train_pct + test_pct >= 1 - 1e-9:
+        test_target = total_sequences - int(n_train.sum())
+    else:
+        test_target = min(int(round(total_sequences * test_pct)), total_sequences - int(n_train.sum()))
+    n_test = _largest_remainder(sizes * test_pct, sizes - n_train, test_target, rng)
 
-    min_pct = n_subjects * n_gestures / total_sequences
+    train_ids, test_ids = [], []
+    for cell, k_train, k_test in zip(cells, n_train, n_test):
+        train_ids.extend(cell[:k_train])
+        test_ids.extend(cell[k_train:k_train + k_test])
 
-    if train_seqs_per_cell == 0 or test_seqs_per_cell == 0:
-        raise ValueError(
-            f"Percentage too small. Min viable pct for this data: {min_pct:.1%}"
-        )
-
-    train_ids = []
-    test_ids = []
-
-    for _, group in df.groupby(['subject', 'gesture']):
-        unique_seqs = group['sequence_id'].drop_duplicates().sample(frac=1, random_state=random_state)
-        
-        n_train = min(train_seqs_per_cell, len(unique_seqs))
-        n_test = min(test_seqs_per_cell, len(unique_seqs) - n_train)
-        
-        train_ids.extend(unique_seqs.iloc[:n_train].tolist())
-        test_ids.extend(unique_seqs.iloc[n_train:n_train + n_test].tolist())
+    assert len(set(train_ids) & set(test_ids)) == 0, "Overlap detected!"
 
     train_df = df[df['sequence_id'].isin(train_ids)]
     test_df = df[df['sequence_id'].isin(test_ids)]
 
-    assert len(set(train_ids) & set(test_ids)) == 0, "Overlap detected!"
-
-    print(f"Train: {train_df['sequence_id'].nunique()} seqs | {100 * train_df['sequence_id'].nunique() / total_sequences:.1f}%")
-    print(f"Test:  {test_df['sequence_id'].nunique()} seqs  | {100 * test_df['sequence_id'].nunique() / total_sequences:.1f}%")
+    print(f"Train: {len(train_ids)} seqs | {100 * len(train_ids) / total_sequences:.1f}%")
+    print(f"Test:  {len(test_ids)} seqs  | {100 * len(test_ids) / total_sequences:.1f}%")
+    unused = total_sequences - len(train_ids) - len(test_ids)
+    if unused:
+        print(f"Unused: {unused} seqs | {100 * unused / total_sequences:.1f}%")
 
     return train_df, test_df

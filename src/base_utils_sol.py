@@ -2993,6 +2993,25 @@ def _detect_sensor_groups(columns):
     return groups
 
 
+def _coerce_augmentation_names(value):
+    """Accept names as a sequence or as the JSON string produced for Bayesian search."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError:
+            value = [p.strip().strip("'\"") for p in text.strip("()[]").split(",") if p.strip()]
+    if isinstance(value, str):
+        value = [value]
+    names = list(value)
+    unknown = [n for n in names if n not in _AUGMENTATION_REGISTRY]
+    if unknown:
+        raise ValueError(f"Unknown augmentation(s) {unknown}; expected a subset of {sorted(_AUGMENTATION_REGISTRY)}")
+    return names
+
+
 class SensorAugmentor(BaseEstimator, TransformerMixin):
     def __init__(
         self,
@@ -3034,9 +3053,8 @@ class SensorAugmentor(BaseEstimator, TransformerMixin):
 
     def fit(self, X, y=None):
         self._rng = np.random.default_rng(self.seed)
-        self.aug_names_ = list(
-            self.augmentations if self.augmentations is not None else ALL_AUGMENTATION_NAMES
-        )
+        names = _coerce_augmentation_names(self.augmentations)
+        self.aug_names_ = list(ALL_AUGMENTATION_NAMES if names is None else names)
         skip = {self.sequence_col, self.counter_col}
         self.sensor_cols_ = [
             c for c in X.columns
