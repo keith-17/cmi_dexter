@@ -44,7 +44,7 @@ from base_utils_sol import (  # noqa: E402
 NOTEBOOK = ROOT / "notebooks" / "multibranch_v1.ipynb"
 
 
-def notebook_grid_param_space():
+def notebook_grid_param_space(custom_aux_heads=None):
     """Read the literal ``GRID_PARAM_SPACE`` without executing the notebook."""
     notebook = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
     source = next(
@@ -61,13 +61,15 @@ def notebook_grid_param_space():
     )
     # The notebook uses named candidate lists (for example ``STFT_CONFIGS``),
     # so evaluate only the declarations leading up to the grid definition.
-    namespace = {"problematic_sequence_bool": True, "ECat": ECat, "EInt": EInt, "EFloat": EFloat}
+    namespace = {"problematic_sequence_bool": True, "ECat": ECat, "EInt": EInt, "EFloat": EFloat,
+                 "USE_ORIENTATION_AUX_HEAD": False, "USE_PHASE_AUX_HEAD": False,
+                 "CUSTOM_AUX_HEADS": custom_aux_heads or [], "ORIENTATION_LOSS_WEIGHT": 0.2, "PHASE_LOSS_WEIGHT": 0.2}
     prefix = ast.Module(body=tree.body[: assignment_index + 1], type_ignores=[])
     exec(compile(prefix, str(NOTEBOOK), "exec"), namespace)
     return namespace["GRID_PARAM_SPACE"]
 
 
-def notebook_evolutionary_param_space():
+def notebook_evolutionary_param_space(custom_aux_heads=None):
     """Read the literal ``EVOLUTIONARY_PARAM_SPACE`` without executing the notebook."""
     notebook = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
     source = next(
@@ -82,7 +84,9 @@ def notebook_evolutionary_param_space():
         if isinstance(node, ast.Assign)
         and any(isinstance(target, ast.Name) and target.id == "EVOLUTIONARY_PARAM_SPACE" for target in node.targets)
     )
-    namespace = {"problematic_sequence_bool": True, "ECat": ECat, "EInt": EInt, "EFloat": EFloat}
+    namespace = {"problematic_sequence_bool": True, "ECat": ECat, "EInt": EInt, "EFloat": EFloat,
+                 "USE_ORIENTATION_AUX_HEAD": False, "USE_PHASE_AUX_HEAD": False,
+                 "CUSTOM_AUX_HEADS": custom_aux_heads or [], "ORIENTATION_LOSS_WEIGHT": 0.2, "PHASE_LOSS_WEIGHT": 0.2}
     prefix = ast.Module(body=tree.body[: assignment_index + 1], type_ignores=[])
     exec(compile(prefix, str(NOTEBOOK), "exec"), namespace)
     return namespace["EVOLUTIONARY_PARAM_SPACE"]
@@ -117,6 +121,37 @@ class NotebookParameterContractTests(unittest.TestCase):
     def test_every_grid_key_is_reachable_from_the_pipeline(self):
         available = set(make_pipeline().get_params(deep=True))
         self.assertFalse(set(self.grid_space) - available)
+
+    def test_auxiliary_heads_are_optional_search_choices_in_both_spaces(self):
+        for name in ('use_orientation_aux_head', 'use_phase_aux_head'):
+            key = f'estimator__{name}'
+            self.assertEqual(self.grid_space[key], [False, True])
+            self.assertEqual(list(self.evo_space[key].choices), [False, True])
+        # No custom specifications: one disabled variant, not two identical variants.
+        self.assertEqual(self.grid_space['estimator__custom_aux_heads'], [[]])
+        self.assertEqual(list(self.evo_space['estimator__custom_aux_heads'].choices), [[]])
+
+    def test_evolutionary_space_exposes_all_temporal_backbones(self):
+        self.assertEqual(set(self.evo_space['estimator__temporal_architecture'].choices),
+                         {'bigru_attention', 'phase_attention', 'cnn_attention_pool', 'bert'})
+        self.assertEqual(list(self.evo_space['estimator__use_bigru'].choices), [False, True])
+        for name in ('cnn_depth', 'phase_attention_units', 'n_phases',
+                     'bert_d_model', 'bert_num_heads', 'bert_use_cls_token',
+                     'tof_spatial_filters', 'tof_gru_units'):
+            self.assertIn(f'estimator__{name}', self.evo_space)
+
+    def test_custom_specs_are_independently_optional_in_both_search_spaces(self):
+        heads = [{'name': 'short_window', 'target': 'bfrb', 'window_size': 50},
+                 {'name': 'long_window', 'target': 'bfrb', 'window_size': 150}]
+        key = 'estimator__custom_aux_heads'
+        grid = notebook_grid_param_space(heads)
+        evolution = notebook_evolutionary_param_space(heads)
+        expected = [[], [heads[0]], [heads[1]], heads]
+        self.assertEqual(grid[key], expected)
+        self.assertEqual(list(evolution[key].choices), expected)
+        prepared = mba.prepare_multibranch_evolutionary_space(evolution)
+        self.assertEqual([mba._normalise_aux_heads(value) for value in prepared[key].choices],
+                         [mba._normalise_aux_heads(value) for value in expected])
 
     def test_every_evolutionary_key_is_reachable_and_separate(self):
         available = set(make_pipeline().get_params(deep=True))
@@ -834,6 +869,6 @@ class KerasParameterConstructionTests(unittest.TestCase):
                     warmup_epochs=1,
                     cosine_t_max=2,
                 )
-                callbacks = classifier._build_callbacks()
+                callbacks = classifier._build_callbacks(has_validation_data=True)
                 self.assertGreaterEqual(len(callbacks), 2)
                 self.assertTrue(all(isinstance(callback, mba.callbacks.Callback) for callback in callbacks))

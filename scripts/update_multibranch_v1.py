@@ -23,7 +23,6 @@ def process_cell(cell):
         return
     source = ''.join(cell.get('source', []))
     if 'population_size =' in source and 'experiment_name =' in source:
-        source = re.sub(r"^search_mode = 'bayesian'", "search_mode = 'evolutionary'", source, flags=re.M)
         source = re.sub(r'# (?:Separate evolutionary search parameters[^\n]*|Evolutionary pilot:[^\n]*)\n.*?(?=orientation_filter_list =)', CONTROLS, source, flags=re.S)
     if 'EVOLUTIONARY_PARAM_SPACE = {' in source:
         before, evolution = source.split('EVOLUTIONARY_PARAM_SPACE = {', 1)

@@ -3183,6 +3183,8 @@ class GASearchCV(BaseEstimator):
             if key not in cache:
                 cache[key] = self._evaluate_individual(ind, X, y, splits, fit_params)
                 history_records.append(cache[key])
+            elif hasattr(self, "_on_candidate_cache_hit"):
+                self._on_candidate_cache_hit()
             return cache[key]
 
         population = [self._sample_individual(space, rng) for _ in range(pop_size)]

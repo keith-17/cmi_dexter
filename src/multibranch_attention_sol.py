@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import warnings
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -50,6 +52,48 @@ STATIC_BRANCHES = {"stft", "cwt"}
 DEFAULT_BRANCH_FILTERS = {"acc": 64, "rotation": 64, "tof": 32, "thermo": 32, "stft": 32, "cwt": 32}
 DEFAULT_BRANCH_KERNEL_SIZES = {"acc": 5, "rotation": 5, "tof": 3, "thermo": 3, "stft": 3, "cwt": 3}
 DEFAULT_BRANCH_POOL_SIZES = {"acc": 2, "rotation": 2, "tof": 2, "thermo": 2, "stft": 2, "cwt": 2}
+
+
+def _normalise_aux_heads(specs):
+    """Validate serialisable sequence/window head declarations without mutating parameters."""
+    specs = _json_maybe(specs)
+    if specs is None:
+        return []
+    if not isinstance(specs, (list, tuple)):
+        raise ValueError("custom_aux_heads must be a list of head dictionaries (or JSON).")
+    result, names = [], {"predictions", "orientation_aux", "phase_aux"}
+    allowed = {"name", "target", "task", "hidden_units", "activation", "dropout", "loss_weight", "window_size", "num_classes"}
+    for raw in specs:
+        if not isinstance(raw, dict) or set(raw) - allowed:
+            raise ValueError("Unknown custom auxiliary head settings.")
+        spec = dict(raw)
+        name = spec.get("name", "")
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name) or name in names:
+            raise ValueError("Auxiliary head names must be unique identifiers and not reserved.")
+        names.add(name)
+        if not isinstance(spec.get("target"), str) or not spec["target"]:
+            raise ValueError(f"Auxiliary head {name} requires a target column.")
+        spec.setdefault("task", "classification")
+        if spec["task"] not in {"classification", "regression"}:
+            raise ValueError("Auxiliary task must be classification or regression.")
+        spec.setdefault("hidden_units", [32])
+        if not isinstance(spec["hidden_units"], (list, tuple)) or any(
+            isinstance(v, bool) or not isinstance(v, (int, np.integer)) or v < 1
+            for v in spec["hidden_units"]
+        ):
+            raise ValueError("hidden_units must contain positive integers.")
+        spec.setdefault("activation", "relu")
+        spec.setdefault("dropout", 0.0)
+        spec.setdefault("loss_weight", 1.0)
+        if not np.isfinite(spec["dropout"]) or not 0 <= spec["dropout"] < 1:
+            raise ValueError("Auxiliary dropout must be in [0, 1).")
+        if not np.isfinite(spec["loss_weight"]) or spec["loss_weight"] < 0:
+            raise ValueError("Auxiliary loss_weight must be finite and nonnegative.")
+        window = spec.get("window_size")
+        if window is not None and (isinstance(window, bool) or not isinstance(window, (int, np.integer)) or window < 1):
+            raise ValueError("Auxiliary window_size must be a positive integer.")
+        result.append(spec)
+    return result
 
 
 def _attention_pool_over_time(name: str, x):
@@ -332,13 +376,7 @@ def _build_optimizer(
 ):
     name = str(optimizer_name).lower()
     if gradient_clip_norm is not None and gradient_clip_value is not None:
-        warnings.warn(
-            "Both gradient_clip_norm and gradient_clip_value were set; keeping only "
-            "gradient_clip_norm and ignoring gradient_clip_value.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        gradient_clip_value = None
+        raise ValueError("Set at most one of gradient_clip_norm and gradient_clip_value.")
     clip_kwargs = {}
     if gradient_clip_norm is not None:
         clip_kwargs["clipnorm"] = float(gradient_clip_norm)
@@ -469,20 +507,18 @@ def _build_temporal_fusion_model(
     use_orientation_aux_head,
     use_phase_aux_head,
     orientation_num_classes,
+    custom_aux_heads=None,
 ):
     """Build alternate temporal models while keeping the original builder path intact."""
     bert_positional_encoding = str(bert_positional_encoding).lower()
     bert_pooling = str(bert_pooling).lower()
     tof_encoder_type = str(tof_encoder_type).lower()
-    if (
-        (architecture == "phase_attention" or use_phase_aux_head)
-        and (
-            n_phases < 2
-            or not np.isfinite(phase_attention_temperature)
-            or phase_attention_temperature <= 0
-        )
+    if (architecture == "phase_attention" or use_phase_aux_head) and n_phases < 2:
+        raise ValueError("n_phases must be >= 2.")
+    if architecture == "phase_attention" and (
+        not np.isfinite(phase_attention_temperature) or phase_attention_temperature <= 0
     ):
-        raise ValueError("n_phases must be >= 2 and phase_attention_temperature must be positive.")
+        raise ValueError("phase_attention_temperature must be positive.")
     if architecture == "bert" and (
         bert_d_model < 1 or bert_num_heads < 1 or bert_d_model % bert_num_heads
     ):
@@ -499,17 +535,6 @@ def _build_temporal_fusion_model(
         raise ValueError("fusion_type must be 'concat', 'sum', or 'attention'.")
     if use_se and int(se_ratio) < 1:
         raise ValueError("se_ratio must be a positive integer.")
-
-    branch_filters = _json_maybe(branch_filters) or DEFAULT_BRANCH_FILTERS
-    branch_kernel_sizes = _json_maybe(branch_kernel_sizes) or DEFAULT_BRANCH_KERNEL_SIZES
-    layer_counts = _json_maybe(branch_num_conv_layers)
-    if isinstance(layer_counts, dict):
-        layer_counts = {str(key): max(1, int(value)) for key, value in layer_counts.items()}
-    else:
-        layer_counts = max(1, int(layer_counts))
-    branch_filter_mode = str(branch_filter_mode).lower()
-    if branch_filter_mode not in {"custom", "double", "constant"}:
-        raise ValueError("branch_filter_mode must be 'custom', 'double', or 'constant'.")
 
     ts_names = list(time_series_shapes)
     static_names = list(static_shapes)
@@ -528,6 +553,7 @@ def _build_temporal_fusion_model(
         or use_bigru
         or use_orientation_aux_head
         or use_phase_aux_head
+        or custom_aux_heads
     ):
         inferred_length = int(inferred_length)
         mask_input = layers.Input(shape=(inferred_length,), name="valid_timestep_mask")
@@ -538,6 +564,9 @@ def _build_temporal_fusion_model(
         inputs.append(branch_input)
         input_by_name[name] = branch_input
         x = branch_input
+        if mask_input is not None:
+            branch_mask = layers.Reshape((-1, 1), name=f"{name}_input_mask_expand")(mask_input)
+            x = layers.Multiply(name=f"{name}_masked_input")([x, branch_mask])
         if name == "tof" and tof_encoder_type in {"spatial_cnn", "spatial_cnn_gru"}:
             if shape[-1] % 64:
                 raise ValueError(
@@ -846,6 +875,10 @@ def _build_temporal_fusion_model(
     head = layers.Dense(dense_units, activation="relu", name="head_dense")(pooled)
     head = layers.Dropout(dropout, name="head_dropout")(head)
     outputs = {"predictions": layers.Dense(n_classes, activation="softmax", name="predictions")(head)}
+    auxiliary_x, auxiliary_mask = x, sequence_mask
+    if architecture == "bert" and bert_use_cls_token:
+        auxiliary_x = layers.Lambda(lambda value: value[:, 1:, :], name="aux_remove_cls")(x)
+        auxiliary_mask = mask_input
     if use_orientation_aux_head:
         outputs["orientation_aux"] = layers.Dense(
             int(orientation_num_classes), activation="softmax", name="orientation_aux"
@@ -855,10 +888,36 @@ def _build_temporal_fusion_model(
             if sequence_mask is None:
                 raise ValueError("use_phase_aux_head requires time-series features.")
             phase_probabilities = layers.Softmax(axis=-1, name="phase_aux_probabilities")(
-                layers.Dense(int(n_phases), name="phase_aux_logits")(x)
+                layers.Dense(int(n_phases), name="phase_aux_logits")(auxiliary_x)
             )
         outputs["phase_aux"] = phase_probabilities
-    if not use_orientation_aux_head and not use_phase_aux_head:
+    for spec in custom_aux_heads or []:
+        name = spec["name"]
+        aux = pooled
+        if spec.get("window_size") is not None:
+            if sequence_mask is None or not time_series_shapes:
+                raise ValueError("Window auxiliary heads require time-series inputs.")
+            # Each window head sees its own final valid span of the shared temporal representation.
+            # Positions are measured in extracted timesteps, not seconds.
+            window = int(spec["window_size"])
+            if window > int(inferred_length):
+                raise ValueError(f"Auxiliary window {window} exceeds chunk length {inferred_length}.")
+            def window_pool(values, window=window):
+                values_x, mask = values
+                positions = tf.cumsum(mask, axis=1)
+                end = tf.reduce_sum(mask, axis=1, keepdims=True)
+                selected = mask * tf.cast(positions > end - window, mask.dtype)
+                return tf.reduce_sum(values_x * selected[:, :, None], axis=1) / tf.maximum(
+                    tf.reduce_sum(selected, axis=1, keepdims=True), 1.0)
+            aux = layers.Lambda(window_pool, name=f"{name}_window_pool")([auxiliary_x, auxiliary_mask])
+        for idx, units in enumerate(spec["hidden_units"]):
+            aux = layers.Dense(units, activation=spec["activation"], name=f"{name}_dense{idx}")(aux)
+            aux = layers.Dropout(spec["dropout"], name=f"{name}_dropout{idx}")(aux)
+        outputs[name] = layers.Dense(
+            1 if spec["task"] == "regression" else spec["num_classes"],
+            activation="linear" if spec["task"] == "regression" else "softmax", name=name,
+        )(aux)
+    if not use_orientation_aux_head and not use_phase_aux_head and not custom_aux_heads:
         outputs = outputs["predictions"]
     model_inputs = inputs + ([model_mask_input] if model_mask_input is not None else [])
     model = models.Model(
@@ -947,6 +1006,9 @@ def build_multibranch_model(
     use_orientation_aux_head: bool = False,
     use_phase_aux_head: bool = False,
     orientation_num_classes: int = 4,
+    custom_aux_heads=None,
+    orientation_loss_weight: float = 1.0,
+    phase_loss_weight: float = 1.0,
     sequence_length: Optional[int] = None,
 ):
     if not TENSORFLOW_AVAILABLE:
@@ -960,7 +1022,12 @@ def build_multibranch_model(
             "temporal_architecture must be 'bigru_attention', 'phase_attention', "
             "'bert', or 'cnn_attention_pool'."
         )
-    if architecture != "bigru_attention" or use_bigru or use_orientation_aux_head or use_phase_aux_head:
+    custom_aux_heads = _normalise_aux_heads(custom_aux_heads)
+    for enabled, weight in ((use_orientation_aux_head, orientation_loss_weight),
+                            (use_phase_aux_head, phase_loss_weight)):
+        if enabled and (not np.isfinite(weight) or weight < 0):
+            raise ValueError("Auxiliary loss weights must be finite and nonnegative.")
+    if architecture != "bigru_attention" or use_bigru or use_orientation_aux_head or use_phase_aux_head or custom_aux_heads:
         model = _build_temporal_fusion_model(
             time_series_shapes=time_series_shapes,
             static_shapes=static_shapes,
@@ -1027,14 +1094,16 @@ def build_multibranch_model(
             use_orientation_aux_head=use_orientation_aux_head,
             use_phase_aux_head=use_phase_aux_head,
             orientation_num_classes=orientation_num_classes,
+            custom_aux_heads=custom_aux_heads,
         )
         main_loss = _build_loss(loss_name=loss_name, label_smoothing=label_smoothing)
-        has_auxiliary_outputs = use_orientation_aux_head or use_phase_aux_head
+        has_auxiliary_outputs = use_orientation_aux_head or use_phase_aux_head or bool(custom_aux_heads)
         model_loss = (
             {
                 "predictions": main_loss,
                 **({"orientation_aux": "sparse_categorical_crossentropy"} if use_orientation_aux_head else {}),
                 **({"phase_aux": "sparse_categorical_crossentropy"} if use_phase_aux_head else {}),
+                **{h["name"]: ("mse" if h["task"] == "regression" else "sparse_categorical_crossentropy") for h in custom_aux_heads},
             }
             if has_auxiliary_outputs
             else main_loss
@@ -1049,6 +1118,12 @@ def build_multibranch_model(
                 gradient_clip_value=gradient_clip_value,
             ),
             loss=model_loss,
+            loss_weights=({
+                "predictions": 1.0,
+                **({"orientation_aux": orientation_loss_weight} if use_orientation_aux_head else {}),
+                **({"phase_aux": phase_loss_weight} if use_phase_aux_head else {}),
+                **{h["name"]: h["loss_weight"] for h in custom_aux_heads},
+            } if has_auxiliary_outputs else None),
             metrics={"predictions": ["accuracy"]} if has_auxiliary_outputs else ["accuracy"],
         )
         return model
@@ -1260,6 +1335,13 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         use_orientation_aux_head: bool = False,
         use_phase_aux_head: bool = False,
         orientation_num_classes: int = 4,
+        custom_aux_heads=None,
+        orientation_loss_weight: float = 1.0,
+        phase_loss_weight: float = 1.0,
+        phase_label_provider=None,
+        invalid_candidate_policy: str = "raise",
+        invalid_candidate_score: float = -1.0,
+        candidate_failure_log=None,
     ):
         self.primary_target = primary_target
         self.extractor = extractor
@@ -1355,6 +1437,13 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         self.use_orientation_aux_head = use_orientation_aux_head
         self.use_phase_aux_head = use_phase_aux_head
         self.orientation_num_classes = orientation_num_classes
+        self.custom_aux_heads = custom_aux_heads
+        self.orientation_loss_weight = orientation_loss_weight
+        self.phase_loss_weight = phase_loss_weight
+        self.phase_label_provider = phase_label_provider
+        self.invalid_candidate_policy = invalid_candidate_policy
+        self.invalid_candidate_score = invalid_candidate_score
+        self.candidate_failure_log = candidate_failure_log
 
     def _default_extractor(self) -> SequenceExtractor:
         return SequenceExtractor(
@@ -1500,8 +1589,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
     def _prepare_training_targets(self, labels, sequence_ids, y, phase_labels=None):
         targets = {"predictions": labels}
         weights = {}
-        if self.sample_weight_ is not None:
-            weights["predictions"] = self.sample_weight_
+        weights["predictions"] = (self.sample_weight_ if self.sample_weight_ is not None else np.ones(len(labels), dtype=np.float32))
         if self.use_orientation_aux_head:
             raw_orientation = self._orientation_labels(sequence_ids, y)
             if not hasattr(self, "orientation_le_"):
@@ -1517,17 +1605,32 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
                     "use_phase_aux_head=True requires fit parameter 'phase_labels' "
                     "aligned to extracted chunks and timesteps."
                 )
-            phase_labels = np.asarray(phase_labels, dtype=np.int32)
+            phase_labels = np.asarray(phase_labels)
             if (
                 phase_labels.ndim != 2
                 or phase_labels.shape[0] != len(labels)
                 or phase_labels.shape[1] != self._current_chunk_mask.shape[1]
             ):
                 raise ValueError("phase_labels must have shape (number_of_chunks, timesteps).")
-            if np.any(phase_labels < 0) or np.any(phase_labels >= self.n_phases):
+            valid = np.asarray(self._current_chunk_mask, dtype=bool)
+            valid_labels = phase_labels[valid]
+            if (not np.isfinite(valid_labels).all() or
+                    np.any(valid_labels != np.floor(valid_labels)) or
+                    np.any(valid_labels < 0) or np.any(valid_labels >= self.n_phases)):
                 raise ValueError(f"phase_labels must be in [0, {self.n_phases}).")
+            phase_labels = np.where(valid, phase_labels, 0).astype(np.int32)
             targets["phase_aux"] = phase_labels
             weights["phase_aux"] = np.asarray(self._current_chunk_mask, dtype=np.float32)
+        for spec in getattr(self, "custom_aux_heads_", []):
+            raw = self._aux_column_labels(sequence_ids, y, spec["target"])
+            if spec["task"] == "classification":
+                raw = self.custom_aux_encoders_[spec["name"]].transform(raw)
+            else:
+                raw = np.asarray(raw, dtype=np.float32).reshape(-1, 1)
+                if not np.isfinite(raw).all():
+                    raise ValueError(f"Non-finite numeric labels for {spec['name']}.")
+            targets[spec["name"]] = raw
+            weights[spec["name"]] = np.ones(len(labels), dtype=np.float32)
         if len(targets) == 1:
             return labels, self.sample_weight_
         return targets, weights
@@ -1576,13 +1679,78 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         return cb
 
     def fit(self, X, y=None, **fit_params):
+        if self.invalid_candidate_policy not in {"raise", "penalize"}:
+            raise ValueError("invalid_candidate_policy must be 'raise' or 'penalize'.")
+        if not np.isfinite(self.invalid_candidate_score) or self.invalid_candidate_score >= 0:
+            raise ValueError("invalid_candidate_score must be finite and negative.")
+        self.fit_failed_ = False
+        self.fit_error_ = None
+        try:
+            return self._fit_impl(X, y, **fit_params)
+        except Exception as exc:
+            if self.invalid_candidate_policy == "raise":
+                raise
+            self.fit_failed_ = True
+            self.fit_error_ = f"{type(exc).__name__}: {exc}"
+            self.history_ = {}
+            if hasattr(self, "model_"):
+                del self.model_
+            warnings.warn(f"Candidate skipped: {self.fit_error_}", RuntimeWarning)
+            self._record_candidate_failure("fit", self.fit_error_)
+            return self
+
+    def _record_candidate_failure(self, stage, error):
+        if self.candidate_failure_log is not None:
+            path = Path(self.candidate_failure_log)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({"stage": stage, "error": error,
+                                         "params": self.get_params(deep=False)}, default=str) + "\n")
+        if self.verbose:
+            print(f"Candidate skipped ({stage}): {error}")
+
+    def _aux_column_labels(self, sequence_ids, y, column):
+        seq_col = getattr(self.extractor_, "sequence_col", "sequence_id")
+        if isinstance(y, pd.DataFrame) and seq_col not in y and y.index.name == seq_col:
+            y = y.reset_index()
+        if not isinstance(y, pd.DataFrame) or seq_col not in y or column not in y:
+            raise ValueError(f"Auxiliary target {column!r} requires that column in y.")
+        grouped = y.groupby(seq_col)[column]
+        if (grouped.nunique(dropna=False) > 1).any():
+            raise ValueError(f"Auxiliary target {column!r} must be constant within each sequence.")
+        aligned = y.drop_duplicates(seq_col).set_index(seq_col)[column].reindex(sequence_ids)
+        if aligned.isna().any():
+            raise ValueError(f"Missing auxiliary labels for {column!r}.")
+        return aligned.to_numpy()
+
+    def _fit_impl(self, X, y=None, **fit_params):
         if y is None:
             raise ValueError("MultiBranchSequenceClassifier requires y.")
+        # Validate the effective architecture before expensive feature extraction.
+        # Inactive search dimensions remain sklearn parameters but cannot reject
+        # an otherwise valid model (e.g. shared CNN depth under a BERT backbone).
+        from multibranch_candidate_rules import candidate_error
+        error = candidate_error(
+            {}, self.get_params(deep=True), y=y,
+            phase_labels_available=fit_params.get("phase_labels") is not None,
+        )
+        if error is not None:
+            raise ValueError(error)
+        if (
+            self.use_phase_aux_head and self.phase_label_provider is None
+            and self.validation_split is not None and self.validation_split > 0
+            and fit_params.get("validation_phase_labels") is None
+        ):
+            raise ValueError("Internal validation with phase supervision requires validation_phase_labels or phase_label_provider.")
         if not TENSORFLOW_AVAILABLE:
             raise ImportError("TensorFlow/Keras is required to fit MultiBranchSequenceClassifier.")
+        if tf is not None:
+            # Serial population trials must release Keras graph/name state.
+            tf.keras.backend.clear_session()
 
         self.extractor_ = clone(self.extractor) if self.extractor is not None else self._default_extractor()
         self._validate_extractor()
+        self.custom_aux_heads_ = _normalise_aux_heads(self.custom_aux_heads)
 
         X_train, X_validation = self._split_validation_sequences(X, y)
         validation_data = None
@@ -1616,6 +1784,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
                 or self.use_bigru
                 or self.use_orientation_aux_head
                 or self.use_phase_aux_head
+                or bool(self.custom_aux_heads_)
             ),
         )
         if not self.branch_groups_:
@@ -1634,6 +1803,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
             or self.use_bigru
             or self.use_orientation_aux_head
             or self.use_phase_aux_head
+            or bool(self.custom_aux_heads_)
         )
         model_inputs = self._model_inputs(branch_arrays, train_chunks["mask"])
 
@@ -1676,8 +1846,19 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         if self.use_orientation_aux_head:
             orientation_training = self._orientation_labels(train_chunks["sequence_ids"], y)
             self.orientation_le_ = LabelEncoder().fit(orientation_training)
+        self.custom_aux_encoders_ = {}
+        for spec in self.custom_aux_heads_:
+            raw = self._aux_column_labels(train_chunks["sequence_ids"], y, spec["target"])
+            if spec["task"] == "classification":
+                encoder = LabelEncoder().fit(raw)
+                self.custom_aux_encoders_[spec["name"]] = encoder
+                spec["num_classes"] = len(encoder.classes_)
         phase_training = fit_params.pop("phase_labels", None)
         phase_validation = fit_params.pop("validation_phase_labels", None)
+        if self.use_phase_aux_head and self.phase_label_provider is not None:
+            phase_training = self.phase_label_provider(X_train, train_chunks)
+            if validation_chunks is not None:
+                phase_validation = self.phase_label_provider(X_validation, validation_chunks)
         self._current_chunk_mask = train_chunks["mask"]
         train_targets, model_sample_weight = self._prepare_training_targets(
             y_enc,
@@ -1686,16 +1867,19 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
             phase_training,
         )
         if validation_chunks is not None and (
-            self.use_orientation_aux_head or self.use_phase_aux_head
+            self.use_orientation_aux_head or self.use_phase_aux_head or bool(self.custom_aux_heads_)
         ):
             self._current_chunk_mask = validation_chunks["mask"]
-            validation_targets, _ = self._prepare_training_targets(
+            training_weights = self.sample_weight_
+            self.sample_weight_ = None
+            validation_targets, validation_weights = self._prepare_training_targets(
                 validation_labels,
                 validation_chunks["sequence_ids"],
                 y,
                 phase_validation,
             )
-            validation_data = (validation_inputs, validation_targets)
+            self.sample_weight_ = training_weights
+            validation_data = (validation_inputs, validation_targets, validation_weights)
 
         self.model_ = build_multibranch_model(
             time_series_shapes=time_series_shapes,
@@ -1772,7 +1956,10 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
             fusion_dropout=self.fusion_dropout,
             use_orientation_aux_head=self.use_orientation_aux_head,
             use_phase_aux_head=self.use_phase_aux_head,
-            orientation_num_classes=self.orientation_num_classes,
+            orientation_num_classes=(len(self.orientation_le_.classes_) if self.use_orientation_aux_head else self.orientation_num_classes),
+            custom_aux_heads=self.custom_aux_heads_,
+            orientation_loss_weight=self.orientation_loss_weight,
+            phase_loss_weight=self.phase_loss_weight,
             sequence_length=train_chunks["mask"].shape[1],
         )
 
@@ -1817,6 +2004,8 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         return pd.Series(preds, index=proba.index, name=self.primary_target).sort_index()
 
     def score(self, X, y, sample_weight=None):
+        if getattr(self, "fit_failed_", False):
+            return float(self.invalid_candidate_score)
         preds = self.predict(X)
         seq_col = getattr(self.extractor_, "sequence_col", "sequence_id")
         if isinstance(y, pd.DataFrame):

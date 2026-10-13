@@ -10,6 +10,7 @@ from sklearn.base import clone
 from sklearn.model_selection import GridSearchCV, ParameterGrid
 
 from test_multibranch_attention_sol_params import NOTEBOOK, GASearchCV, make_pipeline
+from multibranch_experiment_utils import candidate_score
 
 
 class SearchModeTests(unittest.TestCase):
@@ -18,50 +19,40 @@ class SearchModeTests(unittest.TestCase):
         notebook = json.loads(NOTEBOOK.read_text(encoding='utf-8'))
         cls.sources = [''.join(c.get('source', [])) for c in notebook['cells'] if c['cell_type'] == 'code']
         namespace = {}
-        exec(next(s for s in cls.sources if 'BEST_PARAM_PRESETS = ' in s), namespace)
-        cls.presets = namespace['BEST_PARAM_PRESETS']
+        exec(next(s for s in cls.sources if 'BEST_PARAMS = ' in s), namespace)
+        cls.best_params = namespace['BEST_PARAMS']
 
-    def test_saved_presets_are_accepted_by_current_pipeline(self):
-        for preset in self.presets.values():
-            with self.subTest(source=preset['source_file']):
-                configured = clone(make_pipeline()).set_params(**preset['params'])
-                self.assertEqual(configured.get_params()['estimator__activation'], preset['params']['estimator__activation'])
-                self.assertTrue(np.isfinite(preset['cv_score']))
+    def test_best_params_are_accepted_by_current_pipeline(self):
+        configured = clone(make_pipeline()).set_params(**self.best_params)
+        self.assertEqual(configured.get_params()['estimator__activation'], self.best_params['estimator__activation'])
+        self.assertFalse(any('best_params_source' in s or 'BEST_PARAM_PRESETS' in s for s in self.sources))
 
     def test_best_mode_selects_one_exact_candidate_and_keeps_cv_settings(self):
-        source = next(s for s in self.sources if 'search = GASearchCV(' in s)
+        source = next(s for s in self.sources if 'search = HierarchicalGASearchCV(' in s)
         tree = ast.parse(source)
         construction = ast.Module(body=[tree.body[0]], type_ignores=[])
-        for requested, expected in [('auto', '81'), ('80', '80'), ('81', '81')]:
-            namespace = dict(search_mode='best_params', best_params_source=requested,
-                             BEST_PARAM_PRESETS=self.presets, pipeline=make_pipeline(),
-                             GridSearchCV=GridSearchCV, cv_object=3, n_jobs=1,
-                             verbose=0, error_score='raise')
-            with redirect_stdout(StringIO()):
-                exec(compile(construction, str(NOTEBOOK), 'exec'), namespace)
-            self.assertEqual(namespace['selected_source'], expected)
-            search = namespace['search']
-            self.assertEqual(list(ParameterGrid(search.param_grid)), [self.presets[expected]['params']])
-            self.assertEqual(search.cv, 3)
-            self.assertEqual(search.n_jobs, 1)
-            self.assertTrue(search.refit)
+        namespace = dict(search_mode='best params', BEST_PARAMS=self.best_params,
+                         pipeline=make_pipeline(), GridSearchCV=GridSearchCV,
+                         cv_object=3, n_jobs=1, verbose=0, error_score='raise', candidate_score=candidate_score)
+        with redirect_stdout(StringIO()):
+            exec(compile(construction, str(NOTEBOOK), 'exec'), namespace)
+        search = namespace['search']
+        self.assertEqual(list(ParameterGrid(search.param_grid)), [self.best_params])
+        self.assertEqual(search.cv, 3)
+        self.assertEqual(search.n_jobs, 1)
+        self.assertFalse(search.refit)
 
-    def test_invalid_preset_source_has_clear_error(self):
-        source = next(s for s in self.sources if 'search = GASearchCV(' in s)
-        construction = ast.Module(body=[ast.parse(source).body[0]], type_ignores=[])
-        with self.assertRaisesRegex(ValueError, 'best_params_source'):
-            exec(compile(construction, str(NOTEBOOK), 'exec'), dict(
-                search_mode='best_params', best_params_source='missing', BEST_PARAM_PRESETS=self.presets))
-
-    def test_best_params_alias_is_normalized(self):
+    def test_exactly_four_search_modes_are_supported(self):
         source = next(s for s in self.sources if 'experiment_name =' in s)
         tree = ast.parse(source)
         normalization = next(node for node in tree.body if isinstance(node, ast.If)
-                             and "'bayes'" in ast.unparse(node.test))
-        for alias in ('best params', 'best_params', 'best'):
-            namespace = {'search_mode': alias}
+                             and 'search_mode' in ast.unparse(node.test))
+        for mode in ('best params', 'evo', 'bayes', 'grid'):
+            namespace = {'search_mode': mode}
             exec(compile(ast.Module(body=[normalization], type_ignores=[]), str(NOTEBOOK), 'exec'), namespace)
-            self.assertEqual(namespace['search_mode'], 'best_params')
+            self.assertEqual(namespace['search_mode'], mode)
+        with self.assertRaisesRegex(ValueError, 'search_mode must be'):
+            exec(compile(ast.Module(body=[normalization], type_ignores=[]), str(NOTEBOOK), 'exec'), {'search_mode': 'invalid'})
 
     def test_ga_rejects_list_controls_before_training(self):
         for controls in ({'population_size': [5, 10, 15]}, {'generations': -1},
