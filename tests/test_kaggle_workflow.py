@@ -1,5 +1,8 @@
 """Offline integration checks; no GPU or Kaggle credentials required."""
 import importlib.util
+import base64
+import io
+import ast
 import json
 from pathlib import Path
 import tempfile
@@ -14,6 +17,46 @@ spec.loader.exec_module(workflow)
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_quick_save_collects_the_configured_single_cv_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / 'output'
+            output.mkdir()
+            (output / 'multibranch_v1_cv.csv').write_text('mean_test_score\n0.7\n')
+            workflow.collect(output, root / 'results', expected_names={'multibranch_v1_cv.csv'})
+            self.assertTrue((root / 'results' / 'multibranch_v1_cv.csv').exists())
+
+    def test_attached_source_uses_dataset_without_injecting_local_modules(self):
+        original = json.loads((ROOT / 'notebooks/multibranch_v1.ipynb').read_text(encoding='utf-8'))
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(workflow, 'BUILD', Path(temporary)):
+                metadata = workflow.prepare(notebook_name='multibranch_v1.ipynb', use_attached_source=True)
+                packaged = json.loads((Path(temporary) / metadata['code_file']).read_text())
+                manifest = json.loads((Path(temporary) / 'submission.json').read_text())
+            self.assertEqual([c['source'] for c in packaged['cells']], [c['source'] for c in original['cells']])
+            self.assertEqual(manifest['source_mode'], 'attached_dataset')
+            self.assertIn('keithmarange/eliaslongagain', metadata['dataset_sources'])
+
+    def test_v1_packages_exact_local_modules_without_editing_local_notebook(self):
+        path = ROOT / 'notebooks/multibranch_v1.ipynb'
+        original_bytes = path.read_bytes()
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(workflow, 'BUILD', Path(temporary)):
+                metadata = workflow.prepare(notebook_name='multibranch_v1.ipynb')
+                packaged = json.loads((Path(temporary) / metadata['code_file']).read_text())
+            original = json.loads(original_bytes)
+            self.assertEqual(packaged['cells'][0]['id'], 'kaggle-source-bootstrap')
+            self.assertEqual([c['source'] for c in packaged['cells'][1:]],
+                             [c['source'] for c in original['cells']])
+            bootstrap = ast.parse(''.join(packaged['cells'][0]['source']))
+            payload = next(node.args[0].value for node in ast.walk(bootstrap)
+                           if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                           and node.func.attr == 'b64decode')
+            with zipfile.ZipFile(io.BytesIO(base64.b64decode(payload))) as archive:
+                for module in (ROOT / 'src').glob('*.py'):
+                    self.assertEqual(archive.read(module.name), module.read_bytes())
+        self.assertEqual(path.read_bytes(), original_bytes)
+
     def test_two_iteration_test_changes_only_packaged_iteration_count(self):
         original_bytes = (ROOT / 'notebooks/multibranch_alpha.ipynb').read_bytes()
         with tempfile.TemporaryDirectory() as temporary:

@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 from datetime import datetime, timezone
 import hashlib
+import io
 import json
 from pathlib import Path
 import re
@@ -32,7 +34,7 @@ def cli(*args):
     return result.stdout
 
 
-def prepare(iterations=None, notebook_name=None):
+def prepare(iterations=None, notebook_name=None, use_attached_source=False):
     if iterations is not None and iterations < 1:
         raise RuntimeError('Iteration override must be a positive integer.')
     branch = subprocess.run(['git', 'branch', '--show-current'], cwd=ROOT,
@@ -48,6 +50,13 @@ def prepare(iterations=None, notebook_name=None):
         raise RuntimeError('Expected exactly one literal n_iter configuration assignment.')
     configuration = iteration_cells[0]
     config_source = ''.join(configuration['source'])
+    config_values = {}
+    for node in ast.parse(config_source).body:
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+            try:
+                config_values[node.targets[0].id] = ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                pass
     original_iterations = int(re.search(r'^n_iter\s*=\s*(\d+)\b', config_source, re.MULTILINE).group(1))
     if iterations is not None:
         config_source, count = re.subn(r'^(n_iter\s*=\s*)\d+\b',
@@ -64,16 +73,49 @@ def prepare(iterations=None, notebook_name=None):
             original['outputs'] = []
             original['execution_count'] = None
             compile(''.join(original['source']), str(notebook_path), 'exec')
+    if use_attached_source and not metadata.get('dataset_sources'):
+        raise RuntimeError('Attached source requested but no dataset is configured.')
+    if not use_attached_source and any('import multibranch_attention_sol' in ''.join(cell.get('source', []))
+           for cell in notebook['cells']):
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED) as zipped:
+            for module in modules:
+                zipped.writestr(module.name, module.read_bytes())
+        payload = base64.b64encode(archive.getvalue()).decode('ascii')
+        bootstrap = (
+            '# Install the exact local source snapshot for this Kaggle run.\n'
+            'import base64, io, sys, zipfile\n'
+            'from pathlib import Path\n'
+            "_source_dir = Path.cwd() / 'src'\n"
+            '_source_dir.mkdir(exist_ok=True)\n'
+            f'with zipfile.ZipFile(io.BytesIO(base64.b64decode({payload!r}))) as _archive:\n'
+            '    _archive.extractall(_source_dir)\n'
+            'sys.path.insert(0, str(_source_dir))\n'
+            "print('Current local source snapshot installed.')\n"
+        )
+        notebook['cells'].insert(0, {
+            'cell_type': 'code', 'id': 'kaggle-source-bootstrap', 'metadata': {},
+            'execution_count': None, 'outputs': [],
+            'source': bootstrap.splitlines(keepends=True),
+        })
     BUILD.mkdir(parents=True, exist_ok=True)
     (BUILD / metadata['code_file']).write_text(json.dumps(notebook, indent=1), encoding='utf-8')
     (BUILD / 'kernel-metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
     manifest = {'branch': branch, 'kernel': metadata['id'],
+                'source_mode': 'attached_dataset' if use_attached_source else 'local_snapshot',
+                'dataset_sources': metadata.get('dataset_sources', []),
+                'configuration': {key: config_values[key] for key in (
+                    'experiment_name', 'search_mode', 'population_size', 'generations',
+                    'quick_save', 'n_splits', 'train_size') if key in config_values},
                 'search_iterations': iterations if iterations is not None else original_iterations,
                 'iteration_override': iterations,
                 'created_utc': datetime.now(timezone.utc).isoformat(),
                 'submitted_source_sha256': source_hash(notebook),
                 'sha256': {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
                            for p in [notebook_path, *modules]}}
+    experiment_name = config_values.get('experiment_name', 'multibranch_attention')
+    suffixes = ('cv',) if config_values.get('quick_save', False) else ('cv', 'best', 'holdout')
+    manifest['csv_names'] = [f'{experiment_name}_{suffix}.csv' for suffix in suffixes]
     (BUILD / 'submission.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
     print(f'Prepared {metadata["id"]} from branch {branch}: {BUILD}')
     return metadata
@@ -110,10 +152,12 @@ def download(metadata):
     notebook = json.loads((remote / remote_metadata['code_file']).read_text(encoding='utf-8'))
     if source_hash(notebook) != manifest['submitted_source_sha256']:
         raise RuntimeError('Latest completed remote source differs from the submitted source; outputs not collected.')
+    expected_names = set(manifest.get('csv_names', CSV_NAMES))
+    pattern = '(?:' + '|'.join(re.escape(name) for name in sorted(expected_names)) + ')$'
     cli('kernels', 'output', metadata['id'], '-p', str(downloaded),
-        '--file-pattern', r'multibranch_attention_(cv|best|holdout)\.csv$')
+        '--file-pattern', pattern)
     destination = ROOT / 'results' / 'kaggle' / stamp
-    collect(downloaded, destination)
+    collect(downloaded, destination, expected_names=expected_names)
     shutil.copy2(submitted, destination / 'local_submission.json')
     for log in downloaded.glob('*.log'):
         shutil.copy2(log, destination / log.name)
@@ -135,7 +179,8 @@ def wait_for_results(metadata, interval):
         time.sleep(interval)
 
 
-def collect(download_dir, destination):
+def collect(download_dir, destination, expected_names=None):
+    expected_names = CSV_NAMES if expected_names is None else set(expected_names)
     # Some API versions package output as a zip; unpack with traversal protection.
     for archive in download_dir.rglob('*.zip'):
         with zipfile.ZipFile(archive) as zipped:
@@ -145,15 +190,15 @@ def collect(download_dir, destination):
             zipped.extractall(archive.parent)
     groups = {}
     for path in download_dir.rglob('*.csv'):
-        if path.name in CSV_NAMES:
+        if path.name in expected_names:
             groups.setdefault(path.parent, set()).add(path.name)
-    complete = [parent for parent, names in groups.items() if names == CSV_NAMES]
+    complete = [parent for parent, names in groups.items() if names == expected_names]
     if not complete:
-        raise RuntimeError('No complete CV/best/holdout CSV set found. Check status and downloaded logs.')
+        raise RuntimeError(f'No complete result set found: {sorted(expected_names)}. Check status and downloaded logs.')
     for parent in complete:
         target = destination / parent.relative_to(download_dir)
         target.mkdir(parents=True, exist_ok=True)
-        for name in CSV_NAMES:
+        for name in expected_names:
             shutil.copy2(parent / name, target / name)
         print(f'Results downloaded to {target}')
 
@@ -164,13 +209,14 @@ def main():
     parser.add_argument('--interval', type=int, default=60, help='Polling interval in seconds for wait (minimum 15).')
     parser.add_argument('--iterations', type=int, help='Override only the packaged Bayesian iteration count; local notebook stays unchanged.')
     parser.add_argument('--notebook', type=str, default=None, help='Notebook filename in notebooks/ (e.g. multibranch_v1.ipynb).')
+    parser.add_argument('--attached-source', action='store_true', help='Import modules from the configured Kaggle dataset instead of embedding local sources.')
     args = parser.parse_args()
     metadata = json.loads(METADATA.read_text(encoding='utf-8'))
     try:
         if args.action == 'auth':
             subprocess.run([sys.executable, '-m', 'kaggle', 'auth', 'login'], check=True)
         elif args.action in ('prepare', 'push'):
-            prepare(args.iterations, notebook_name=args.notebook)
+            prepare(args.iterations, notebook_name=args.notebook, use_attached_source=args.attached_source)
             if args.action == 'push':
                 record_submission(cli('kernels', 'push', '-p', str(BUILD)))
         elif args.action == 'status':
