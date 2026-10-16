@@ -2437,7 +2437,9 @@ class SequenceExtractor(HoneycombBase):
             arr = group[self.feature_names_in_].to_numpy(dtype=float)
             arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
             full_length = len(arr)
-            arr = self._crop_sequence(arr)
+            # Chunk values are returned as float32. Convert before retaining
+            # window views so stacking does not allocate a full float64 tensor.
+            arr = self._crop_sequence(arr).astype(np.float32)
             length = len(arr)
             if length == 0:
                 continue
@@ -2475,7 +2477,7 @@ class SequenceExtractor(HoneycombBase):
                 real_length = len(chunk)
                 if real_length < window:
                     pad_length = window - real_length
-                    padding = np.full((pad_length, arr.shape[1]), self.padding_value, dtype=float)
+                    padding = np.full((pad_length, arr.shape[1]), self.padding_value, dtype=np.float32)
                     chunk = np.vstack([chunk, padding])
                     mask = np.concatenate([
                         np.ones(real_length, dtype=bool),
@@ -2502,7 +2504,7 @@ class SequenceExtractor(HoneycombBase):
             )
 
         return {
-            "X": np.stack(sequences, axis=0).astype(np.float32),
+            "X": np.stack(sequences, axis=0),
             "mask": np.stack(masks, axis=0).astype(bool),
             "sequence_ids": np.array(seq_ids),
             "feature_names": list(self.feature_names_in_),

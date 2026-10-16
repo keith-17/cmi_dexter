@@ -1791,8 +1791,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
             raise InvalidExtractorParams("No modality branches could be built from the extracted features.")
 
         branch_arrays = self._split_branches(train_chunks["X"], train_chunks["mask"], self.branch_groups_)
-        flat_check = np.concatenate([arr.reshape(len(arr), -1) for arr in branch_arrays.values()], axis=1)
-        if not np.isfinite(flat_check).all():
+        if not all(np.isfinite(arr).all() for arr in branch_arrays.values()):
             raise InvalidExtractorParams("Feature extraction produced non-finite branch values.")
 
         time_series_shapes = {name: arr.shape[1:] for name, arr in branch_arrays.items() if name in TIME_SERIES_BRANCHES}
@@ -1880,6 +1879,13 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
             )
             self.sample_weight_ = training_weights
             validation_data = (validation_inputs, validation_targets, validation_weights)
+
+        # Branch indexing creates independent arrays. Providers have now read
+        # the original chunk dictionaries; release their duplicate feature
+        # tensors before TensorFlow copies the model inputs to its runtime.
+        del train_chunks["X"]
+        if validation_chunks is not None:
+            del validation_chunks["X"]
 
         self.model_ = build_multibranch_model(
             time_series_shapes=time_series_shapes,
