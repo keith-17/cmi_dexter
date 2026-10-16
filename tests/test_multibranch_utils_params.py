@@ -28,11 +28,41 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 sys.path.insert(0, str(SRC))
 
-import multibranch_attention as mba  # noqa: E402
-from base_utils_qwen import InvalidExtractorParams, SensorAugmentor, SequenceExtractor  # noqa: E402
+import multibranch_utils as mba  # noqa: E402
+from base_utils import (  # noqa: E402
+    ECat,
+    EFloat,
+    EInt,
+    GASearchCV,
+    InvalidExtractorParams,
+    SensorAugmentor,
+    SequenceExtractor,
+    build_quick_results_df,
+)
 
 
-NOTEBOOK = ROOT / "notebooks" / "multibranch_alpha.ipynb"
+NOTEBOOK = ROOT / "notebooks" / "multibranch_v1.ipynb"
+
+
+def notebook_aux_namespace():
+    """Evaluate only auxiliary-head declarations, without notebook IO or training."""
+    notebook = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
+    names = {
+        "TARGET_COL", "USE_ORIENTATION_AUX_HEAD", "USE_PHASE_AUX_HEAD",
+        "ORIENTATION_LOSS_WEIGHT", "PHASE_LOSS_WEIGHT", "NO_CUSTOM_AUX_HEADS",
+        "generic_aux_heads", "competition_custom_aux_heads",
+        "multi_scale_custom_aux_heads", "qwen_custom_aux_heads",
+    }
+    namespace = {"problematic_sequence_bool": True, "ECat": ECat, "EInt": EInt, "EFloat": EFloat}
+    for cell in notebook["cells"]:
+        if cell["cell_type"] != "code":
+            continue
+        for node in ast.parse("".join(cell.get("source", []))).body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id in names for target in node.targets
+            ):
+                exec(compile(ast.Module(body=[node], type_ignores=[]), str(NOTEBOOK), "exec"), namespace)
+    return namespace
 
 
 def notebook_grid_param_space():
@@ -52,10 +82,31 @@ def notebook_grid_param_space():
     )
     # The notebook uses named candidate lists (for example ``STFT_CONFIGS``),
     # so evaluate only the declarations leading up to the grid definition.
-    namespace = {"problematic_sequence_bool": True}
+    namespace = notebook_aux_namespace()
     prefix = ast.Module(body=tree.body[: assignment_index + 1], type_ignores=[])
     exec(compile(prefix, str(NOTEBOOK), "exec"), namespace)
     return namespace["GRID_PARAM_SPACE"]
+
+
+def notebook_evolutionary_param_space():
+    """Read the literal ``EVOLUTIONARY_PARAM_SPACE`` without executing the notebook."""
+    notebook = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
+    source = next(
+        "".join(cell.get("source", []))
+        for cell in notebook["cells"]
+        if "EVOLUTIONARY_PARAM_SPACE = {" in "".join(cell.get("source", []))
+    )
+    tree = ast.parse(source)
+    assignment_index = next(
+        index
+        for index, node in enumerate(tree.body)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "EVOLUTIONARY_PARAM_SPACE" for target in node.targets)
+    )
+    namespace = notebook_aux_namespace()
+    prefix = ast.Module(body=tree.body[: assignment_index + 1], type_ignores=[])
+    exec(compile(prefix, str(NOTEBOOK), "exec"), namespace)
+    return namespace["EVOLUTIONARY_PARAM_SPACE"]
 
 
 def make_pipeline():
@@ -82,10 +133,127 @@ class NotebookParameterContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.grid_space = notebook_grid_param_space()
+        cls.evo_space = notebook_evolutionary_param_space()
 
     def test_every_grid_key_is_reachable_from_the_pipeline(self):
         available = set(make_pipeline().get_params(deep=True))
         self.assertFalse(set(self.grid_space) - available)
+
+    def test_auxiliary_search_choices_match_the_notebook_configuration(self):
+        namespace = notebook_aux_namespace()
+        for name in ('use_orientation_aux_head', 'use_phase_aux_head'):
+            key = f'estimator__{name}'
+            expected = [namespace[name.upper()]]
+            self.assertEqual(self.grid_space[key], expected)
+            self.assertEqual(list(self.evo_space[key].choices), expected)
+        self.assertEqual(self.grid_space['estimator__custom_aux_heads'], [[]])
+        choices = list(self.evo_space['estimator__custom_aux_heads'].choices)
+        self.assertEqual(choices[0], [])
+        self.assertEqual(len(choices), 5)
+
+    def test_evolutionary_space_uses_supported_temporal_backbones(self):
+        choices = set(self.evo_space['estimator__temporal_architecture'].choices)
+        supported = {'bigru_attention', 'phase_attention', 'cnn_attention_pool', 'bert'}
+        self.assertTrue(choices)
+        self.assertTrue(choices <= supported)
+        for backbone in supported:
+            clone(make_pipeline()).set_params(estimator__temporal_architecture=backbone)
+        self.assertTrue(set(self.evo_space['estimator__use_bigru'].choices) <= {False, True})
+        for name in ('cnn_depth', 'phase_attention_units', 'n_phases',
+                     'bert_d_model', 'bert_num_heads', 'bert_use_cls_token',
+                     'tof_spatial_filters', 'tof_gru_units'):
+            self.assertIn(f'estimator__{name}', make_pipeline().get_params(deep=True))
+
+    def test_configured_custom_head_variants_survive_search_serialisation(self):
+        key = 'estimator__custom_aux_heads'
+        namespace = notebook_aux_namespace()
+        expected = [namespace[name] for name in (
+            'NO_CUSTOM_AUX_HEADS', 'generic_aux_heads', 'competition_custom_aux_heads',
+            'multi_scale_custom_aux_heads', 'qwen_custom_aux_heads',
+        )]
+        self.assertEqual(list(self.evo_space[key].choices), expected)
+        prepared = mba.prepare_multibranch_evolutionary_space(self.evo_space)
+        self.assertEqual([mba._normalise_aux_heads(value) for value in prepared[key].choices],
+                         [mba._normalise_aux_heads(value) for value in expected])
+
+    def test_every_evolutionary_key_is_reachable_and_separate(self):
+        available = set(make_pipeline().get_params(deep=True))
+        self.assertFalse(set(self.evo_space) - available)
+        self.assertIsNot(self.evo_space, self.grid_space)
+        prepared = mba.prepare_multibranch_evolutionary_space(self.evo_space)
+        self.assertFalse(set(prepared) - available)
+        pipeline = make_pipeline()
+        rng = np.random.default_rng(42)
+        for key, descriptor in prepared.items():
+            sampled = descriptor.sample(rng=rng)
+            with self.subTest(parameter=key, sampled=repr(sampled)):
+                clone(pipeline).set_params(**{key: sampled})
+
+    def test_quick_results_df_appends_best_score_and_holdout_score(self):
+        fake_search = SimpleNamespace(
+            cv_results_={
+                "mean_fit_time": [1.2, 1.5],
+                "std_fit_time": [0.1, 0.2],
+                "mean_score_time": [0.3, 0.4],
+                "param_estimator__learning_rate": [1e-4, 5e-5],
+                "mean_train_score": [0.81, 0.89],
+                "mean_test_score": [0.72, 0.78],
+                "rank_test_score": [2, 1],
+            },
+            best_index_=1,
+            best_score_=0.78,
+        )
+        df = build_quick_results_df(fake_search, holdout_score=0.765)
+        self.assertEqual(len(df), 4)
+        best_row = df.iloc[-2]
+        self.assertEqual(best_row.iloc[0], "best_score")
+        self.assertAlmostEqual(float(best_row.iloc[1]), 0.89)
+        self.assertAlmostEqual(float(best_row.iloc[2]), 0.78)
+        self.assertTrue(pd.isna(best_row.iloc[3]))
+
+        holdout_row = df.iloc[-1]
+        self.assertEqual(holdout_row.iloc[0], "holdout_score")
+        self.assertAlmostEqual(float(holdout_row.iloc[1]), 0.765)
+        self.assertTrue(pd.isna(holdout_row.iloc[2]))
+
+    def test_ga_search_cv_runs_with_groups_and_produces_cv_results(self):
+        from sklearn.base import BaseEstimator, ClassifierMixin
+        from sklearn.model_selection import GroupShuffleSplit
+
+        class ToyEstimator(BaseEstimator, ClassifierMixin):
+            def __init__(self, alpha=1.0, k=2):
+                self.alpha = alpha
+                self.k = k
+
+            def fit(self, X, y=None):
+                self.fitted_ = True
+                return self
+
+            def score(self, X, y=None):
+                return float(self.alpha) + 0.01 * float(self.k)
+
+        X_toy = pd.DataFrame({"sequence_id": ["s1", "s1", "s2", "s2", "s3", "s3", "s4", "s4"], "x": range(8)})
+        y_toy = pd.DataFrame({"sequence_id": ["s1", "s1", "s2", "s2", "s3", "s3", "s4", "s4"], "bfrb": ["a"] * 4 + ["b"] * 4})
+        groups = X_toy["sequence_id"]
+
+        ga = GASearchCV(
+            estimator=ToyEstimator(),
+            param_grid={"alpha": EFloat(0.1, 0.9), "k": EInt(1, 5)},
+            cv=GroupShuffleSplit(n_splits=1, test_size=0.5, random_state=42),
+            population_size=3,
+            generations=1,
+            tournament_size=2,
+            elitism=True,
+            verbose=0,
+            random_state=42,
+        )
+        ga.fit(X_toy, y_toy, groups=groups)
+        self.assertTrue(hasattr(ga, "best_estimator_"))
+        self.assertIn("mean_train_score", ga.cv_results_)
+        self.assertIn("mean_test_score", ga.cv_results_)
+        quick_df = build_quick_results_df(ga, holdout_score=0.55)
+        self.assertEqual(quick_df.iloc[-2, 0], "best_score")
+        self.assertEqual(quick_df.iloc[-1, 0], "holdout_score")
 
     def test_every_grid_candidate_can_be_set_independently(self):
         """Catch bad names and incompatible candidate values before GridSearchCV."""
@@ -94,6 +262,28 @@ class NotebookParameterContractTests(unittest.TestCase):
             for candidate in candidates:
                 with self.subTest(parameter=key, candidate=repr(candidate)):
                     clone(pipeline).set_params(**{key: candidate})
+
+    def test_new_architecture_parameters_are_cloneable_and_searchable(self):
+        pipeline = make_pipeline()
+        params = pipeline.get_params(deep=True)
+        self.assertTrue(set(self.grid_space["estimator__temporal_architecture"]) <=
+                        {"bigru_attention", "phase_attention", "cnn_attention_pool", "bert"})
+        for name, value in (
+            ("temporal_architecture", "bert"),
+            ("bert_num_layers", 2),
+            ("bert_d_model", 64),
+            ("phase_attention_units", 32),
+            ("tof_encoder_type", "spatial_cnn"),
+        ):
+            key = f"estimator__{name}"
+            self.assertIn(key, params)
+            clone(pipeline).set_params(**{key: value})
+
+        self.assertTrue(any(
+            width % heads == 0
+            for width in self.grid_space["estimator__bert_d_model"]
+            for heads in self.grid_space["estimator__bert_num_heads"]
+        ))
 
     def test_grid_never_combines_incompatible_gradient_clipping_modes(self):
         """Keras accepts norm clipping or value clipping, but never both."""
@@ -272,6 +462,37 @@ class NotebookParameterContractTests(unittest.TestCase):
         self.assertEqual(extractor.stft_extractors, [])
         self.assertEqual(extractor.cwt_extractors, [])
         self.assertEqual(set(classifier._branch_groups(["acc_x"])), {"acc"})
+
+    def test_derived_imu_branch_is_separate_only_for_new_temporal_paths(self):
+        classifier = mba.MultiBranchSequenceClassifier()
+        classifier.extractor_ = SequenceExtractor(stft_configs=None, cwt_configs=None)
+        feature_names = [
+            "acc_x_raw",
+            "acc_x_raw_integrated_velocity",
+            "lin_acc_x",
+            "rot_x",
+            "tof_sensor0_v0",
+        ]
+
+        legacy_groups = classifier._branch_groups(feature_names)
+        self.assertEqual(
+            legacy_groups,
+            {"acc": [0, 1, 2], "rotation": [3], "tof": [4]},
+        )
+
+        temporal_groups = classifier._branch_groups(
+            feature_names,
+            separate_derived_imu=True,
+        )
+        self.assertEqual(
+            temporal_groups,
+            {
+                "acc": [0],
+                "derived_imu": [1, 2],
+                "rotation": [3],
+                "tof": [4],
+            },
+        )
 
     def test_callbacks_monitor_validation_loss_only_when_validation_exists(self):
         class Callback:
@@ -506,6 +727,119 @@ class KerasParameterConstructionTests(unittest.TestCase):
                     (None, 3),
                 )
 
+    def test_all_temporal_architectures_construct_and_predict(self):
+        cases = (
+            ("bigru_attention", {"use_bigru": True}),
+            ("phase_attention", {"phase_fusion_mode": "concat"}),
+            ("phase_attention", {"phase_fusion_mode": "sum"}),
+            ("phase_attention", {"phase_fusion_mode": "learned"}),
+            ("cnn_attention_pool", {"fusion_type": "sum"}),
+            ("cnn_attention_pool", {"fusion_type": "attention"}),
+            ("cnn_attention_pool", {"post_fusion_pooling": "attention"}),
+            ("cnn_attention_pool", {"post_fusion_pooling": "avg"}),
+            ("cnn_attention_pool", {"post_fusion_pooling": "max"}),
+            ("cnn_attention_pool", {"post_fusion_pooling": "avg_max"}),
+            ("cnn_attention_pool", {"post_fusion_pooling": "attention_avg_max"}),
+            ("bert", {"bert_positional_encoding": "learned"}),
+            ("bert", {"bert_positional_encoding": "sinusoidal"}),
+            ("bert", {"bert_pooling": "cls", "bert_use_cls_token": True}),
+            ("bert", {"bert_pooling": "avg"}),
+            ("bert", {"bert_pooling": "avg_max"}),
+        )
+        for architecture, overrides in cases:
+            with self.subTest(architecture=architecture, options=overrides):
+                model = self.build(temporal_architecture=architecture, **overrides)
+                inputs = [
+                    np.zeros((2, 8, 3), dtype=np.float32),
+                    np.zeros((2, 8, 4), dtype=np.float32),
+                    np.zeros((2, 5), dtype=np.float32),
+                    np.zeros((2, 6), dtype=np.float32),
+                    np.ones((2, 8), dtype=np.float32),
+                ]
+                output = model(inputs, training=False)
+                if isinstance(output, dict):
+                    output = output["predictions"]
+                self.assertEqual(tuple(output.shape), (2, 3))
+
+    def test_temporal_model_masks_padding_and_handles_spatial_tof(self):
+        model = self.build(
+            temporal_architecture="cnn_attention_pool",
+            time_series_shapes={"acc": (8, 3), "tof": (8, 64)},
+            static_shapes={},
+            tof_encoder_type="spatial_cnn_gru",
+        )
+        output = model(
+            [
+                np.zeros((2, 8, 3), dtype=np.float32),
+                np.zeros((2, 8, 64), dtype=np.float32),
+                np.array([[1] * 8, [1, 1, 1, 0, 0, 0, 0, 0]], dtype=np.float32),
+            ],
+            training=False,
+        )
+        self.assertEqual(tuple(output.shape), (2, 3))
+
+        with self.assertRaisesRegex(ValueError, "multiple of 64"):
+            self.build(
+                temporal_architecture="bert",
+                time_series_shapes={"tof": (8, 63)},
+                static_shapes={},
+                tof_encoder_type="spatial_cnn",
+            )
+
+    def test_optional_auxiliary_heads_accept_explicit_labels(self):
+        model = self.build(
+            temporal_architecture="phase_attention",
+            use_orientation_aux_head=True,
+            use_phase_aux_head=True,
+            orientation_num_classes=4,
+        )
+        inputs = [
+            np.zeros((2, 8, 3), dtype=np.float32),
+            np.zeros((2, 8, 4), dtype=np.float32),
+            np.zeros((2, 5), dtype=np.float32),
+            np.zeros((2, 6), dtype=np.float32),
+            np.array([[1] * 8, [1, 1, 1, 0, 0, 0, 0, 0]], dtype=np.float32),
+        ]
+        labels = {
+            "predictions": np.array([0, 1], dtype=np.int32),
+            "orientation_aux": np.array([1, 2], dtype=np.int32),
+            "phase_aux": np.zeros((2, 8), dtype=np.int32),
+        }
+        sample_weights = {
+            "predictions": np.ones(2, dtype=np.float32),
+            "orientation_aux": np.ones(2, dtype=np.float32),
+            "phase_aux": inputs[-1],
+        }
+        history = model.train_on_batch(
+            inputs,
+            labels,
+            sample_weight=sample_weights,
+            return_dict=True,
+        )
+        self.assertIn("loss", history)
+
+    def test_invalid_bert_configuration_is_rejected_before_fit(self):
+        with self.assertRaisesRegex(ValueError, "divisible"):
+            self.build(temporal_architecture="bert", bert_d_model=30, bert_num_heads=4)
+        with self.assertRaisesRegex(ValueError, "requires bert_use_cls_token"):
+            self.build(temporal_architecture="bert", bert_pooling="cls")
+        self.assertEqual(
+            self.build(
+                temporal_architecture="phase_attention",
+                bert_d_model=0,
+                bert_num_heads=0,
+            ).output_shape,
+            (None, 3),
+        )
+        self.assertEqual(
+            self.build(
+                temporal_architecture="bert",
+                n_phases=0,
+                phase_attention_temperature=0.0,
+            ).output_shape,
+            (None, 3),
+        )
+
     def test_gradient_clipping_modes_construct_and_conflict_is_clear(self):
         for options in (
             {"gradient_clip_norm": 1.0},
@@ -558,6 +892,6 @@ class KerasParameterConstructionTests(unittest.TestCase):
                     warmup_epochs=1,
                     cosine_t_max=2,
                 )
-                callbacks = classifier._build_callbacks()
+                callbacks = classifier._build_callbacks(has_validation_data=True)
                 self.assertGreaterEqual(len(callbacks), 2)
                 self.assertTrue(all(isinstance(callback, mba.callbacks.Callback) for callback in callbacks))

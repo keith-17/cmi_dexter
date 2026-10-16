@@ -1,5 +1,5 @@
 """
-multibranch_attention.py
+multibranch_utils.py
 
 Multi-branch (modality-specific) Keras classifier with every architecture,
 optimizer, loss, and scheduler knob exposed for search.
@@ -10,7 +10,10 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
 import warnings
+from collections import Counter
+from numbers import Integral, Real
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -24,15 +27,36 @@ from sklearn.utils.validation import check_is_fitted
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import f1_score
 
-from base_utils_sol import (
-    InvalidExtractorParams,
-    SequenceExtractor,
-    competition_score,
-    prepare_bayesian_space,
-    prepare_evolutionary_space,
-    prepare_multitask_param_space,
-    validate_sequence_extractor_params,
-)
+if __package__:
+    from .base_utils import (
+        GASearchCV,
+        InvalidExtractorParams,
+        SequenceExtractor,
+        SensorAugmentor,
+        inactive_sequence_parameters,
+        sequence_feature_families,
+        _coerce_augmentation_names,
+        competition_score,
+        prepare_bayesian_space,
+        prepare_evolutionary_space,
+        prepare_multitask_param_space,
+        validate_sequence_extractor_params,
+    )
+else:
+    from base_utils import (
+        GASearchCV,
+        InvalidExtractorParams,
+        SequenceExtractor,
+        SensorAugmentor,
+        inactive_sequence_parameters,
+        sequence_feature_families,
+        _coerce_augmentation_names,
+        competition_score,
+        prepare_bayesian_space,
+        prepare_evolutionary_space,
+        prepare_multitask_param_space,
+        validate_sequence_extractor_params,
+    )
 
 try:
     import tensorflow as tf
@@ -1470,15 +1494,14 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         sequence_ids = pd.Index(sequence_ids)
         fill_value = "non_bfrb" if self.primary_target == "bfrb" else "Unknown"
         if isinstance(y, pd.DataFrame):
-            yy = y.copy()
-            if seq_col not in yy.columns:
-                if yy.index.name == seq_col:
-                    yy = yy.reset_index()
-                else:
-                    raise ValueError("y DataFrame does not contain sequence_id.")
-            if self.primary_target not in yy.columns:
+            if self.primary_target not in y.columns:
                 raise ValueError(f"y DataFrame does not contain target column: {self.primary_target}")
-            y_seq = yy.drop_duplicates(seq_col).set_index(seq_col)[self.primary_target]
+            if seq_col in y.columns:
+                y_seq = y[[seq_col, self.primary_target]].drop_duplicates(seq_col).set_index(seq_col)[self.primary_target]
+            elif y.index.name == seq_col:
+                y_seq = y[self.primary_target].loc[~y.index.duplicated()]
+            else:
+                raise ValueError("y DataFrame does not contain sequence_id.")
             aligned = y_seq.reindex(sequence_ids).fillna(fill_value)
             return aligned.to_numpy()
         if isinstance(y, pd.Series):
@@ -1502,7 +1525,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         if self.validation_split is None or self.validation_split <= 0:
             self.train_sequence_ids_ = all_sequence_ids
             self.validation_sequence_ids_ = pd.Index([], name=seq_col)
-            return X.copy(), None
+            return X, None
         if not 0 < self.validation_split < 1:
             raise ValueError("validation_split must be in [0, 1).")
         if len(all_sequence_ids) < 2:
@@ -1536,12 +1559,12 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
 
         train_mask = X[seq_col].isin(self.train_sequence_ids_)
         validation_mask = X[seq_col].isin(self.validation_sequence_ids_)
-        return X.loc[train_mask].copy(), X.loc[validation_mask].copy()
+        return X.loc[train_mask], X.loc[validation_mask]
 
     def _augment_training_sequences(self, X):
         if self.augmentor is None:
             self.augmentor_ = None
-            return X.copy()
+            return X
         self.augmentor_ = clone(self.augmentor)
         return self.augmentor_.fit_transform(X)
 
@@ -1557,12 +1580,21 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
 
     def _split_branches(self, x_arr, mask_arr, groups):
         branch_arrays = {}
+        static_mask = None
+        static_counts = None
         for name, idxs in groups.items():
             block = x_arr[:, :, idxs]
             if name in STATIC_BRANCHES:
-                m = mask_arr[:, :, None].astype(np.float32)
-                denom = np.clip(m.sum(axis=1), 1.0, None)
-                branch_arrays[name] = (block * m).sum(axis=1) / denom
+                if static_mask is None:
+                    static_mask = np.asarray(mask_arr, dtype=bool)[:, :, None]
+                    static_counts = np.maximum(
+                        np.sum(mask_arr, axis=1, dtype=np.float32), 1.0,
+                    )[:, None]
+                # Feature indexing already created a private block. Mask it
+                # in place so the original sum order and float32 values stay
+                # unchanged without allocating another feature tensor.
+                np.multiply(block, static_mask, out=block)
+                branch_arrays[name] = block.sum(axis=1) / static_counts
             else:
                 branch_arrays[name] = block
         return branch_arrays
@@ -1575,13 +1607,17 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
 
     def _orientation_labels(self, sequence_ids, y):
         seq_col = getattr(self.extractor_, "sequence_col", "sequence_id")
-        if isinstance(y, pd.DataFrame) and seq_col not in y.columns and y.index.name == seq_col:
-            y = y.reset_index()
-        if not isinstance(y, pd.DataFrame) or seq_col not in y.columns or "orientation" not in y.columns:
+        if not isinstance(y, pd.DataFrame) or "orientation" not in y.columns:
             raise ValueError(
                 "use_orientation_aux_head=True requires an 'orientation' column in y."
             )
-        labels = y.drop_duplicates(seq_col).set_index(seq_col)["orientation"].reindex(sequence_ids)
+        if seq_col in y.columns:
+            labels = y[[seq_col, "orientation"]].drop_duplicates(seq_col).set_index(seq_col)["orientation"]
+        elif y.index.name == seq_col:
+            labels = y["orientation"].loc[~y.index.duplicated()]
+        else:
+            raise ValueError(f"Orientation auxiliary labels require sequence column {seq_col!r}.")
+        labels = labels.reindex(sequence_ids)
         if labels.isna().any():
             raise ValueError("Orientation auxiliary labels are missing for one or more sequences.")
         return labels.to_numpy()
@@ -1711,14 +1747,21 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
 
     def _aux_column_labels(self, sequence_ids, y, column):
         seq_col = getattr(self.extractor_, "sequence_col", "sequence_id")
-        if isinstance(y, pd.DataFrame) and seq_col not in y and y.index.name == seq_col:
-            y = y.reset_index()
-        if not isinstance(y, pd.DataFrame) or seq_col not in y or column not in y:
+        if not isinstance(y, pd.DataFrame) or column not in y:
             raise ValueError(f"Auxiliary target {column!r} requires that column in y.")
-        grouped = y.groupby(seq_col)[column]
+        if seq_col in y.columns:
+            labels = y[[seq_col, column]]
+            grouped = labels.groupby(seq_col, sort=False)[column]
+            unique_labels = labels.drop_duplicates(seq_col).set_index(seq_col)[column]
+        elif y.index.name == seq_col:
+            labels = y[column]
+            grouped = labels.groupby(level=seq_col, sort=False)
+            unique_labels = labels.loc[~labels.index.duplicated()]
+        else:
+            raise ValueError(f"Auxiliary labels require sequence column {seq_col!r}.")
         if (grouped.nunique(dropna=False) > 1).any():
             raise ValueError(f"Auxiliary target {column!r} must be constant within each sequence.")
-        aligned = y.drop_duplicates(seq_col).set_index(seq_col)[column].reindex(sequence_ids)
+        aligned = unique_labels.reindex(sequence_ids)
         if aligned.isna().any():
             raise ValueError(f"Missing auxiliary labels for {column!r}.")
         return aligned.to_numpy()
@@ -1729,7 +1772,6 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         # Validate the effective architecture before expensive feature extraction.
         # Inactive search dimensions remain sklearn parameters but cannot reject
         # an otherwise valid model (e.g. shared CNN depth under a BERT backbone).
-        from multibranch_candidate_rules import candidate_error
         error = candidate_error(
             {}, self.get_params(deep=True), y=y,
             phase_labels_available=fit_params.get("phase_labels") is not None,
@@ -1762,8 +1804,23 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         try:
             # STFT/CWT features summarize each whole sequence; split sequences
             # first, then fit/transform train and validation partitions separately.
-            self.extractor_.fit(X_train)
-            train_chunks = self.extractor_.transform_chunks(X_train)
+            if (
+                isinstance(self.extractor_, SequenceExtractor)
+                and (
+                    type(self.extractor_) is SequenceExtractor
+                    or type(self.extractor_).fit_transform is not SequenceExtractor.fit_transform
+                )
+                and "fit" not in vars(self.extractor_)
+                and "transform_chunks" not in vars(self.extractor_)
+                and "transform" not in vars(self.extractor_)
+            ):
+                # The native extractor reuses fitted training features. A
+                # subclass must explicitly opt in through fit_transform so
+                # customized fit/transform methods retain their usual effect.
+                train_chunks = self.extractor_.fit_transform(X_train)
+            else:
+                self.extractor_.fit(X_train)
+                train_chunks = self.extractor_.transform_chunks(X_train)
             validation_chunks = (
                 self.extractor_.transform_chunks(X_validation)
                 if X_validation is not None
@@ -1858,6 +1915,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
             phase_training = self.phase_label_provider(X_train, train_chunks)
             if validation_chunks is not None:
                 phase_validation = self.phase_label_provider(X_validation, validation_chunks)
+        del X_train, X_validation
         self._current_chunk_mask = train_chunks["mask"]
         train_targets, model_sample_weight = self._prepare_training_targets(
             y_enc,
@@ -1992,6 +2050,9 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         )
         sequence_ids = chunks["sequence_ids"]
         model_inputs = self._model_inputs(branch_arrays, chunks["mask"])
+        # Advanced feature indexing gives each branch its own array; the
+        # combined tensor need not overlap TensorFlow's prediction allocations.
+        del chunks["X"]
         probs = self.model_.predict(model_inputs, verbose=0)
         if isinstance(probs, dict):
             probs = probs["predictions"]
@@ -2015,7 +2076,12 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         preds = self.predict(X)
         seq_col = getattr(self.extractor_, "sequence_col", "sequence_id")
         if isinstance(y, pd.DataFrame):
-            yy = y.copy()
+            columns = [self.primary_target]
+            if "is_target" in y.columns and self.primary_target != "is_target":
+                columns.append("is_target")
+            if seq_col in y.columns:
+                columns.insert(0, seq_col)
+            yy = y[columns]
             if seq_col not in yy.columns:
                 if yy.index.name == seq_col:
                     yy = yy.reset_index()
@@ -2043,3 +2109,1105 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
     def branch_summary(self):
         check_is_fitted(self, ["feature_names_", "branch_groups_"])
         return describe_branches(self.feature_names_, self.branch_groups_)
+
+
+"""Conditional architecture rules shared by search and estimator preflight.
+
+Canonicalisation removes *inactive* dimensions, not valid architecture choices.
+In particular a BERT backbone still has modality-specific CNN encoders. The
+functions do not construct a model, fit an extractor, or mutate caller settings.
+"""
+
+ARCHITECTURES = {"bigru_attention", "phase_attention", "cnn_attention_pool", "bert"}
+_BERT = {
+    "bert_num_layers", "bert_d_model", "bert_num_heads", "bert_ff_dim",
+    "bert_dropout", "bert_attention_dropout", "bert_activation", "bert_pooling",
+    "bert_use_cls_token", "bert_positional_encoding",
+}
+_GRU = {"gru_units", "gru_layers", "gru_dropout", "gru_recurrent_dropout", "bidirectional_gru"}
+_SHARED_CNN = {"cnn_depth", "cnn_filters", "cnn_kernel_size", "cnn_dropout"}
+_PHASE = {"phase_attention_units", "phase_attention_temperature", "phase_fusion_mode"}
+_POST_FUSION = {"post_fusion_attention_type", "post_fusion_attention_units", "post_fusion_pooling"}
+_BRANCH_CNN = {"branch_encoder_type", "branch_cnn_filters", "branch_cnn_kernel_size", "branch_cnn_depth", "branch_dropout"}
+_LEGACY_BRANCH = {
+    "branch_filters", "branch_kernel_sizes", "branch_pool_sizes", "branch_num_conv_layers",
+    "branch_filter_mode", "branch_dense_units", "conv_dropout", "pooling_mode",
+}
+_TEMPORAL = _BRANCH_CNN | {"fusion_type", "fusion_units", "fusion_dropout", "use_residual", "use_se", "se_ratio"}
+_TOF_SPATIAL = {"tof_spatial_filters", "tof_spatial_kernel_size", "tof_spatial_depth", "tof_gru_units"}
+_DEFAULTS = {
+    "temporal_architecture": "bigru_attention", "use_bigru": False,
+    "use_orientation_aux_head": False, "use_phase_aux_head": False,
+    "custom_aux_heads": None, "branch_encoder_type": "conv1d", "tof_encoder_type": "flatten_1d",
+    "bert_d_model": 64, "bert_num_heads": 4, "bert_num_layers": 2, "bert_ff_dim": 128,
+    "bert_pooling": "attention", "bert_use_cls_token": False, "bert_positional_encoding": "learned",
+    "n_phases": 3, "phase_attention_temperature": 1.0, "phase_fusion_mode": "concat",
+    "phase_label_provider": None, "fusion_type": "concat", "attention_type": "additive",
+    "post_fusion_pooling": "attention", "post_fusion_attention_type": "additive",
+    "use_se": False, "pooling_mode": "attention", "branch_filter_mode": "custom",
+    "optimizer_name": "adam", "loss_name": "sparse_cce", "use_lr_scheduler": False,
+    "lr_scheduler_type": "plateau", "validation_split": 0.15,
+}
+
+_EXTRA_CONTROLLERS = (
+    "optimizer_name", "loss_name", "use_lr_scheduler", "validation_split", "lr_scheduler_type",
+    "augmentor", "augmentor__prob", "augmentor__per_aug_prob", "augmentor__augmentations",
+    "extractor__output_format", "extractor__filter_problematic_sequences",
+    "extractor__resample_modalities", "extractor__motion_filter_mode",
+    "extractor__stft_configs", "extractor__cwt_configs", "extractor__stft_window_seconds",
+    "extractor__linear_acc_mode", "extractor__use_highpass_fallback",
+    "extractor__acc_modes", "extractor__smooth_alpha", "extractor__rotation_modes",
+    "extractor__use_acc_magnitude", "extractor__linear_acc_modes", "extractor__use_linear_acc_magnitude",
+    "extractor__use_dead_reckoning", "extractor__max_windows_per_sequence",
+    "extractor__sequence_crop_mode", "extractor__maxlen", "extractor__use_chunk_stride_ratio",
+)
+
+
+def _unused_training_parameters(settings):
+    unused = set()
+    if str(settings["optimizer_name"]).lower() != "sgd":
+        unused.add("momentum")
+    if str(settings["optimizer_name"]).lower() != "adamw":
+        unused.add("weight_decay")
+    if str(settings["loss_name"]).lower() == "focal":
+        unused.add("label_smoothing")
+    scheduler = str(settings["lr_scheduler_type"]).lower()
+    if not settings["use_lr_scheduler"]:
+        unused |= {"lr_scheduler_type", "lr_factor", "lr_patience", "min_lr", "cosine_t_max", "warmup_epochs"}
+    elif scheduler == "cosine":
+        unused |= {"lr_factor", "lr_patience"}
+    else:
+        unused |= {"cosine_t_max", "warmup_epochs"}
+        if scheduler == "plateau" and not settings["validation_split"]:
+            unused |= {"lr_factor", "lr_patience", "min_lr"}
+
+    augmentor = settings.get("augmentor")
+    if type(augmentor) is SensorAugmentor:
+        aug = augmentor.get_params(deep=False)
+        aug.update({key[len("augmentor__"):]: value for key, value in settings.items()
+                    if key.startswith("augmentor__")})
+        disabled = any(isinstance(aug.get(key), Real) and aug[key] <= 0 for key in ("prob", "per_aug_prob"))
+        try:
+            names = _coerce_augmentation_names(aug["augmentations"])
+        except (TypeError, ValueError):
+            return unused  # Preserve malformed declarations for the real validator.
+        if names == []:
+            disabled = True
+        if disabled:
+            unused.add("__augmentation_disabled__")
+            controls = {"prob", "per_aug_prob"} | ({"augmentations"} if names == [] else set())
+            unused |= {f"augmentor__{key}" for key in aug if key not in controls}
+        elif names is not None:
+            fields = {
+                "jitter": {"jitter_sigma"}, "gaussian_noise": {"noise_std"}, "scaling": {"scaling_sigma"},
+                "time_shift": {"time_shift_frac"}, "crop_resize": {"crop_frac_range"},
+                "temporal_mask": {"temporal_mask_frac", "temporal_num_masks"},
+                "channel_dropout": {"channel_drop_prob"}, "sensor_dropout": {"sensor_drop_prob"},
+                "magnitude_warp": {"warp_sigma", "warp_num_knots"},
+            }
+            selected = set(names)
+            unused |= {f"augmentor__{field}" for name, group in fields.items() if name not in selected for field in group}
+    return unused
+
+
+def _name(key):
+    return key[len("estimator__"):] if key.startswith("estimator__") else key
+
+
+def _merged(params, base_params):
+    merged = dict(_DEFAULTS)
+    for settings in (base_params or {}, params or {}):
+        for key, value in settings.items():
+            merged[_name(key)] = value
+    return merged
+
+
+def _extractor_settings(settings):
+    extractor = settings.get("extractor")
+    if extractor is None:
+        result = {"chunk_window_size": 160, "maxlen": 160, "sequence_col": "sequence_id"}
+    elif isinstance(extractor, dict):
+        result = dict(extractor)
+    elif hasattr(extractor, "get_params"):
+        result = extractor.get_params(deep=True)
+    else:
+        result = vars(extractor).copy()
+    for key, value in settings.items():
+        if key.startswith("extractor__"):
+            result[key[len("extractor__"):]] = value
+    return result
+
+
+def _modes(value):
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        return {mode.strip().lower() for mode in value.split("|") if mode.strip()}
+    return {str(mode).strip().lower() for mode in value}
+
+
+def _heads(value):
+    return json.loads(value) if isinstance(value, str) else value
+
+
+def _is_temporal(settings):
+    try:
+        custom = bool(_heads(settings.get("custom_aux_heads")))
+    except (TypeError, ValueError):
+        custom = True  # Keep malformed specifications active so preflight rejects them.
+    return (
+        str(settings["temporal_architecture"]).lower() != "bigru_attention"
+        or bool(settings["use_bigru"])
+        or bool(settings["use_orientation_aux_head"])
+        or bool(settings["use_phase_aux_head"])
+        or custom
+    )
+
+
+def canonical_candidate(params, base_params=None):
+    """Return supplied settings with irrelevant dimensions removed.
+
+    ``base_params`` can be estimator or pipeline ``get_params(deep=True)``.
+    Only supplied keys are returned, retaining their ``estimator__`` prefix.
+    Consequently this is suitable both for sklearn ``set_params`` and for a
+    phenotype/cache key. A removed value falls back to the base estimator.
+    """
+    settings = _merged(params, base_params)
+    architecture = str(settings["temporal_architecture"]).lower()
+    temporal = _is_temporal(settings)
+    # The classifier derives its orientation output width from training labels.
+    inactive = {"orientation_num_classes"}
+    if architecture != "bert":
+        inactive |= _BERT
+    if architecture != "bigru_attention" or not settings["use_bigru"]:
+        inactive |= _GRU
+    if architecture not in {"phase_attention", "cnn_attention_pool"}:
+        inactive |= _SHARED_CNN
+    if architecture != "phase_attention":
+        inactive |= _PHASE
+        if not settings["use_phase_aux_head"]:
+            inactive.add("n_phases")
+    if architecture != "cnn_attention_pool":
+        inactive |= _POST_FUSION
+    elif str(settings["post_fusion_pooling"]).lower() not in {"attention", "attention_avg_max"}:
+        inactive |= {"post_fusion_attention_type", "post_fusion_attention_units"}
+    elif str(settings["post_fusion_attention_type"]).lower() == "linear":
+        inactive.add("post_fusion_attention_units")
+    uses_attention = (
+        architecture == "bigru_attention" and temporal
+        or architecture == "bert" and str(settings["bert_pooling"]).lower() == "attention"
+    )
+    if not uses_attention:
+        inactive |= {"attention_type", "attention_units"}
+    elif str(settings["attention_type"]).lower() == "linear":
+        inactive.add("attention_units")
+    if temporal:
+        inactive |= _LEGACY_BRANCH
+    else:
+        inactive |= _TEMPORAL | _TOF_SPATIAL | {"tof_encoder_type"}
+    if not settings["use_se"]:
+        inactive.add("se_ratio")
+    if not settings["use_orientation_aux_head"]:
+        inactive |= {"orientation_num_classes", "orientation_loss_weight"}
+    if not settings["use_phase_aux_head"]:
+        inactive |= {"phase_loss_weight", "phase_label_provider"}
+    extractor = _extractor_settings(settings)
+    inactive |= _unused_training_parameters(settings)
+    native = settings.get("extractor")
+    if native is None or isinstance(native, dict) or type(native) is SequenceExtractor:
+        inactive |= {"extractor__" + key for key in inactive_sequence_parameters(extractor, for_frame_output=False)}
+        families = sequence_feature_families(extractor)
+        time_families = families & {"acc", "rotation", "tof", "thermo"}
+        if not families & {"stft", "cwt"}:
+            inactive |= {"static_branch_units", "static_dropout"}
+        if temporal:
+            generic = time_families - ({"tof"} if str(settings["tof_encoder_type"]).lower() != "flatten_1d" else set())
+            if not generic:
+                inactive |= _BRANCH_CNN | {"use_se", "se_ratio"}
+                if architecture != "phase_attention":
+                    inactive |= {"use_batchnorm", "use_residual"}
+        elif not time_families:
+            inactive |= _LEGACY_BRANCH
+    tof_enabled = bool(_modes(extractor.get("tof_modes", "sensor_stats")))
+    tof_encoder = str(settings["tof_encoder_type"]).lower()
+    if not temporal or not tof_enabled:
+        inactive |= _TOF_SPATIAL | {"tof_encoder_type"}
+    elif tof_encoder == "flatten_1d":
+        inactive |= _TOF_SPATIAL
+    elif tof_encoder != "spatial_cnn_gru":
+        inactive.add("tof_gru_units")
+    result = {}
+    for key, value in (params or {}).items():
+        name = _name(key)
+        if name in inactive:
+            continue
+        if name == "use_bigru" and architecture != "bigru_attention":
+            value = False
+        elif name in {"augmentor__prob", "augmentor__per_aug_prob"} and "__augmentation_disabled__" in inactive:
+            value = 0.0
+        elif name == "branch_encoder_type" and str(value).lower() == "cnn":
+            value = "conv1d"
+        elif name in {"temporal_architecture", "branch_encoder_type", "tof_encoder_type",
+                      "optimizer_name", "loss_name", "lr_scheduler_type"}:
+            value = str(value).lower()
+        elif name == "extractor__motion_filter_mode" and value == "extended_kalman":
+            value = "kalman"
+        elif name == "extractor__stft_scaling" and isinstance(value, str) and value in {"density", "psd"}:
+            value = "psd"
+        elif name == "extractor__stft_scaling" and isinstance(value, str) and value in {"spectrum", "power_spectrum"}:
+            value = "power_spectrum"
+        if (name in {"extractor__stft_configs", "extractor__cwt_configs"}
+                and (native is None or isinstance(native, dict) or type(native) is SequenceExtractor)):
+            configs = _json_maybe(value)
+            if isinstance(configs, (list, tuple)) and all(isinstance(config, dict) for config in configs):
+                normalized = []
+                for config in configs:
+                    config = dict(config)
+                    config.pop("acc_modes", None)  # These extractors select signal_columns, not acc_modes.
+                    if name == "extractor__stft_configs":
+                        if config.get("window_seconds", extractor.get("stft_window_seconds")) is not None:
+                            config.pop("nperseg", None)
+                        if isinstance(config.get("scaling"), str):
+                            config["scaling"] = {"density": "psd", "spectrum": "power_spectrum"}.get(
+                                config["scaling"], config["scaling"])
+                    elif config.get("widths") is not None:
+                        config.pop("n_scales", None)
+                        config.pop("min_scale", None)
+                    normalized.append(config)
+                value = json.dumps(normalized, sort_keys=True) if isinstance(value, str) else normalized
+        if (not temporal and (native is None or isinstance(native, dict) or type(native) is SequenceExtractor)
+                and name in {"branch_filters", "branch_kernel_sizes", "branch_pool_sizes", "branch_num_conv_layers"}):
+            mapping = _json_maybe(value)
+            defaults = {"branch_filters": DEFAULT_BRANCH_FILTERS, "branch_kernel_sizes": DEFAULT_BRANCH_KERNEL_SIZES,
+                        "branch_pool_sizes": DEFAULT_BRANCH_POOL_SIZES}
+            if name in defaults and not mapping:
+                mapping = defaults[name]
+            if isinstance(mapping, dict) and time_families:
+                fallback = {"branch_filters": 32, "branch_kernel_sizes": 3,
+                            "branch_pool_sizes": 2, "branch_num_conv_layers": 1}[name]
+                mapping = {branch: mapping.get(branch, fallback) for branch in sorted(time_families)}
+                if name == "branch_filters" and str(settings["branch_filter_mode"]).lower() == "custom":
+                    depth = _json_maybe(settings.get("branch_num_conv_layers", 2))
+                    for branch, filters in mapping.items():
+                        count = depth.get(branch, 1) if isinstance(depth, dict) else depth
+                        if isinstance(count, Integral) and count > 0:
+                            values = list(filters) if isinstance(filters, (list, tuple, np.ndarray)) else [filters]
+                            if values:
+                                values = values[:count]
+                                while len(values) > 1 and values[-1] == values[-2]:
+                                    values.pop()  # The builder repeats its final width automatically.
+                                mapping[branch] = values
+                value = json.dumps(mapping, sort_keys=True) if isinstance(value, str) else mapping
+        result[key] = value
+    return result
+
+
+def _positive_integer(value):
+    return isinstance(value, Integral) and not isinstance(value, bool) and value > 0
+
+
+def _finite_number(value):
+    return isinstance(value, Real) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _positive_tree(value):
+    if isinstance(value, str):
+        value = json.loads(value)
+    if value is None:
+        return True  # Per-branch None invokes model defaults.
+    if isinstance(value, dict):
+        return bool(value) and all(_positive_tree(item) for item in value.values())
+    if isinstance(value, (tuple, list)):
+        return bool(value) and all(_positive_tree(item) for item in value)
+    return _positive_integer(value)
+
+
+def candidate_error(params, base_params=None, y=None, phase_labels_available=False, label_cache=None):
+    """Return a preflight rejection reason, or ``None`` for a valid candidate.
+
+    ``y=None`` omits data-dependent label checks. Phase supervision still needs
+    a callable provider or ``phase_labels_available=True``. A search may provide
+    a fresh ``label_cache`` dictionary for each fit to reuse column validation
+    for its unchanged label table. Individual estimator fits need no cache.
+    Only active knobs
+    are validated: an unused CNN/GRU value cannot reject a BERT candidate.
+    """
+    try:
+        return _candidate_error(params, base_params, y, phase_labels_available, label_cache)
+    except (TypeError, ValueError, AttributeError, OverflowError) as exc:
+        return f"Invalid candidate settings: {exc}"
+
+
+def _candidate_error(params, base_params, y, phase_labels_available, label_cache):
+    merged = _merged(params, base_params)
+    settings = canonical_candidate(merged)
+    architecture = str(settings["temporal_architecture"]).lower()
+    if architecture not in ARCHITECTURES:
+        return f"Unsupported temporal_architecture: {architecture!r}."
+    for name in ("use_bigru", "use_orientation_aux_head", "use_phase_aux_head", "use_residual", "use_se", "bert_use_cls_token"):
+        if name in settings and not isinstance(settings[name], (bool, Integral)):
+            return f"{name} must be True or False."
+    raw_heads = _heads(settings.get("custom_aux_heads"))
+    if raw_heads is not None and raw_heads != []:
+        heads = _normalise_aux_heads(raw_heads)
+    else:
+        heads = []
+    temporal = _is_temporal(merged)
+    extractor = _extractor_settings(merged)
+    if temporal:
+        if str(settings.get("branch_encoder_type", "conv1d")).lower() not in {"conv1d", "cnn"}:
+            return "branch_encoder_type must be 'conv1d' or 'cnn'."
+        if settings.get("fusion_type", "concat") not in {"concat", "sum", "attention"}:
+            return "fusion_type must be 'concat', 'sum', or 'attention'."
+    elif settings.get("pooling_mode", "attention") not in {"attention", "mean", "max", "last"}:
+        return "pooling_mode must be 'attention', 'mean', 'max', or 'last'."
+    if not temporal and settings.get("branch_filter_mode", "custom") not in {"custom", "double", "constant"}:
+        return "branch_filter_mode must be 'custom', 'double', or 'constant'."
+    positive = {
+        "dense_units", "static_branch_units", "branch_dense_units", "epochs", "batch_size",
+        "branch_cnn_filters", "branch_cnn_kernel_size", "branch_cnn_depth", "fusion_units",
+        "cnn_depth", "cnn_filters", "cnn_kernel_size", "gru_units", "gru_layers", "attention_units",
+        "phase_attention_units", "post_fusion_attention_units", "bert_num_layers", "bert_d_model",
+        "bert_num_heads", "bert_ff_dim", "tof_spatial_filters", "tof_spatial_kernel_size",
+        "tof_spatial_depth", "tof_gru_units", "se_ratio",
+    }
+    for name in positive:
+        if name in settings and not _positive_integer(settings[name]):
+            return f"{name} must be a positive integer."
+    for name in ("branch_filters", "branch_kernel_sizes", "branch_pool_sizes", "branch_num_conv_layers"):
+        if name in settings and not _positive_tree(settings[name]):
+            return f"{name} must contain positive integers."
+    for name in {"dropout", "static_dropout", "conv_dropout", "branch_dropout", "fusion_dropout",
+                 "cnn_dropout", "gru_dropout", "gru_recurrent_dropout", "bert_dropout", "bert_attention_dropout"}:
+        if name in settings and (not _finite_number(settings[name]) or not 0 <= settings[name] < 1):
+            return f"{name} must be in [0, 1)."
+    if "learning_rate" in settings and (not _finite_number(settings["learning_rate"]) or settings["learning_rate"] <= 0):
+        return "learning_rate must be finite and positive."
+    for name in ("orientation_loss_weight", "phase_loss_weight"):
+        if name in settings and (not _finite_number(settings[name]) or settings[name] < 0):
+            return f"{name} must be finite and nonnegative."
+    if architecture == "bert":
+        if settings["bert_d_model"] % settings["bert_num_heads"]:
+            return "bert_d_model must be divisible by bert_num_heads."
+        if str(settings["bert_pooling"]).lower() not in {"cls", "attention", "avg", "avg_max"}:
+            return "bert_pooling must be 'cls', 'attention', 'avg', or 'avg_max'."
+        if str(settings["bert_pooling"]).lower() == "cls" and not settings["bert_use_cls_token"]:
+            return "bert_pooling='cls' requires bert_use_cls_token=True."
+        if str(settings["bert_positional_encoding"]).lower() not in {"learned", "sinusoidal"}:
+            return "bert_positional_encoding must be 'learned' or 'sinusoidal'."
+    if architecture == "phase_attention" or settings["use_phase_aux_head"]:
+        if not _positive_integer(settings["n_phases"]) or settings["n_phases"] < 2:
+            return "n_phases must be an integer >= 2."
+    if architecture == "phase_attention":
+        value = settings["phase_attention_temperature"]
+        if not _finite_number(value) or value <= 0:
+            return "phase_attention_temperature must be finite and positive."
+        if settings["phase_fusion_mode"] not in {"concat", "sum", "learned"}:
+            return "phase_fusion_mode must be 'concat', 'sum', or 'learned'."
+    uses_attention = (architecture == "bigru_attention" and temporal
+                      or architecture == "bert" and str(settings["bert_pooling"]).lower() == "attention")
+    if uses_attention and settings.get("attention_type", "additive") not in {"additive", "linear"}:
+        return "attention_type must be 'additive' or 'linear'."
+    if architecture == "cnn_attention_pool":
+        pooling = settings["post_fusion_pooling"]
+        if pooling not in {"attention", "avg", "max", "avg_max", "attention_avg_max"}:
+            return "Invalid post_fusion_pooling."
+        if pooling in {"attention", "attention_avg_max"} and settings["post_fusion_attention_type"] not in {"additive", "linear"}:
+            return "post_fusion_attention_type must be 'additive' or 'linear'."
+    if "tof_encoder_type" in settings:
+        encoder = str(settings["tof_encoder_type"]).lower()
+        if encoder not in {"flatten_1d", "spatial_cnn", "spatial_cnn_gru"}:
+            return "Unsupported tof_encoder_type."
+        if encoder in {"spatial_cnn", "spatial_cnn_gru"} and _modes(extractor.get("tof_modes", "sensor_stats")) != {"raw"}:
+            return "Spatial ToF encoders require extractor__tof_modes='raw' (without summary modes)."
+    if settings["use_phase_aux_head"]:
+        provider = settings.get("phase_label_provider")
+        if provider is not None and not callable(provider):
+            return "phase_label_provider must be callable."
+        if provider is None and not phase_labels_available:
+            return "Phase supervision requires phase_label_provider or explicit phase_labels."
+    windows = [head for head in heads if head.get("window_size") is not None]
+    if windows:
+        defaults = {"acc_modes": "raw", "linear_acc_modes": "", "rotation_modes": "quaternion", "tof_modes": "sensor_stats", "thm_modes": "centered_diff"}
+        if not any(_modes(extractor.get(name, default)) for name, default in defaults.items()):
+            return "Window auxiliary heads require time-series inputs."
+        chunk_length = extractor.get("chunk_window_size", 128)
+        if not _positive_integer(chunk_length):
+            chunk_length = extractor.get("maxlen") if extractor.get("sequence_crop_mode", "tail") != "none" else None
+        for head in windows:
+            if _positive_integer(chunk_length) and head["window_size"] > chunk_length:
+                return f"Auxiliary window {head['window_size']} exceeds chunk length {chunk_length}."
+    if y is not None and (settings["use_orientation_aux_head"] or heads):
+        columns = getattr(y, "columns", ())
+        seq_col = extractor.get("sequence_col", "sequence_id")
+        if seq_col not in columns and getattr(getattr(y, "index", None), "name", None) != seq_col:
+            return f"Auxiliary labels require y with sequence column {seq_col!r}."
+        targets = [("orientation", "classification")] if settings["use_orientation_aux_head"] else []
+        targets += [(head["target"], head["task"]) for head in heads]
+        for column, task in targets:
+            cache_key = (id(y), seq_col, column, task)
+            if label_cache is not None and cache_key in label_cache:
+                error = label_cache[cache_key]
+            else:
+                error = _label_error(y, seq_col, column, task)
+                if label_cache is not None:
+                    label_cache[cache_key] = error
+            if error is not None:
+                return error
+    return None
+
+
+def _label_error(y, seq_col, column, task):
+    if column not in y.columns:
+        return f"Auxiliary target {column!r} requires that column in y."
+    labels = y[column]
+    if labels.isna().any():
+        return f"Missing auxiliary labels for {column!r}."
+    grouped = (y.groupby(seq_col, sort=False)[column] if seq_col in y.columns
+               else y.groupby(level=seq_col, sort=False)[column])
+    if (grouped.nunique(dropna=False) > 1).any():
+        return f"Auxiliary target {column!r} must be constant within each sequence."
+    if task == "regression":
+        try:
+            values = labels.to_numpy(dtype=float)
+        except (TypeError, ValueError):
+            return f"Auxiliary regression target {column!r} must be numeric."
+        if not np.isfinite(values).all():
+            return f"Auxiliary regression target {column!r} must be finite."
+    return None
+
+
+try:
+    from skopt import BayesSearchCV
+except ImportError:
+    BayesSearchCV = None
+
+
+def conditional_bayesian_spaces(param_space, base_params=None):
+    """Compile architecture spaces containing only potentially active dimensions.
+
+    Architecture and BiGRU switches are fixed before testing dependencies. Other
+    categorical controllers are considered together, so an auxiliary-head or
+    pooling choice cannot accidentally hide parameters used by another choice.
+    Large/non-finite controller products use conservative pruning instead of
+    enumerating a potentially enormous search space. This does not allocate the
+    Bayesian evaluation budget or reject invalid model settings.
+    """
+    from itertools import product
+    from skopt.space import Categorical, Dimension, Integer, check_dimension
+
+    if not isinstance(param_space, dict):
+        raise TypeError("conditional_bayesian_spaces requires one parameter dictionary.")
+
+    def categorical(values):
+        return Categorical([
+            json.dumps(value, sort_keys=True) if isinstance(value, (dict, list, tuple)) else value
+            for value in values
+        ])
+
+    dimensions = {}
+    for key, value in param_space.items():
+        if isinstance(value, Dimension):
+            dimensions[key] = value
+        elif hasattr(value, "categories"):
+            dimensions[key] = categorical(value.categories)
+        elif isinstance(value, list):
+            dimensions[key] = categorical(value)
+        elif isinstance(value, tuple):
+            dimensions[key] = check_dimension(value)
+        else:
+            dimensions[key] = categorical([value])
+
+    def finite_values(dimension):
+        if isinstance(dimension, Categorical):
+            return tuple(dimension.categories)
+        if isinstance(dimension, Integer) and dimension.high - dimension.low < 4096:
+            return range(int(dimension.low), int(dimension.high) + 1)
+        return None
+
+    def representative(dimension):
+        if isinstance(dimension, Categorical):
+            return dimension.categories[0]
+        return dimension.low
+
+    by_name = {_name(key): key for key in dimensions}
+    architecture_key = by_name.get("temporal_architecture")
+    gru_key = by_name.get("use_bigru")
+    base = _merged({}, base_params)
+    prefix = "estimator__" if any(
+        key.startswith("estimator__") for key in (*dimensions, *(base_params or {}))
+    ) else ""
+    architectures = (finite_values(dimensions[architecture_key]) if architecture_key is not None
+                     else [base["temporal_architecture"]])
+    if architectures is None:
+        raise ValueError("temporal_architecture requires finite categorical choices.")
+    # Case aliases describe the same backbone, and need only one optimizer.
+    architectures = list(dict.fromkeys(str(value).lower() for value in architectures))
+    controllers = {
+        "use_orientation_aux_head", "use_phase_aux_head", "custom_aux_heads",
+        "bert_pooling", "attention_type", "post_fusion_pooling",
+        "post_fusion_attention_type", "use_se", "tof_encoder_type",
+        "extractor", "extractor__tof_modes",
+    }
+    controllers.update(_EXTRA_CONTROLLERS)
+    spaces = []
+    for architecture in architectures:
+        if architecture == "bigru_attention" and gru_key is not None:
+            gru_values = finite_values(dimensions[gru_key])
+            if gru_values is None:
+                raise ValueError("use_bigru requires finite categorical choices.")
+        else:
+            gru_values = [False if architecture != "bigru_attention" else base["use_bigru"]]
+        for use_bigru in gru_values:
+            subspace = dict(dimensions)
+            if architecture_key is not None:
+                subspace[architecture_key] = Categorical([architecture])
+            if gru_key is not None:
+                subspace[gru_key] = Categorical([use_bigru])
+            fixed_base = dict(base_params or {})
+            fixed_base[prefix + "temporal_architecture"] = architecture
+            fixed_base[prefix + "use_bigru"] = use_bigru
+            varying = []
+            combinations = 1
+            for key, dimension in subspace.items():
+                if _name(key) not in controllers:
+                    continue
+                values = finite_values(dimension)
+                if values is None or combinations * len(values) > 4096:
+                    combinations = 4097
+                    break
+                combinations *= len(values)
+                varying.append((key, values))
+
+            # These exclusions are independent of every other controller. In
+            # the bounded fallback, retaining extra keys is safer than dropping
+            # a dimension that an unenumerated auxiliary/modality choice needs.
+            inactive = {"orientation_num_classes"}
+            if architecture != "bert":
+                inactive |= _BERT
+            if architecture != "bigru_attention" or not use_bigru:
+                inactive |= _GRU
+            if architecture not in {"phase_attention", "cnn_attention_pool"}:
+                inactive |= _SHARED_CNN
+            if architecture != "phase_attention":
+                inactive |= _PHASE
+            if architecture != "cnn_attention_pool":
+                inactive |= _POST_FUSION
+            keep = {key for key in subspace if _name(key) not in inactive}
+            if combinations <= 4096:
+                supplied = {key: representative(value) for key, value in subspace.items()}
+                active = set()
+                try:
+                    for values in product(*(values for _, values in varying)):
+                        proposal = dict(supplied)
+                        proposal.update(zip((key for key, _ in varying), values))
+                        active.update(canonical_candidate(proposal, fixed_base))
+                except (TypeError, ValueError, AttributeError, OverflowError):
+                    # Malformed settings are the estimator preflight's concern;
+                    # do not silently discard other potentially valid choices.
+                    pass
+                else:
+                    keep = active
+            compiled = {key: dimension for key, dimension in subspace.items() if key in keep}
+            if not compiled:
+                compiled[prefix + "temporal_architecture"] = Categorical([architecture])
+            spaces.append(compiled)
+    return spaces
+
+
+class _CandidateRules:
+    """Shared dependency checking and canonical cache keys, independent of TensorFlow."""
+    _proposal_attempts = 32
+
+    def _initialise_rules(self, y, fit_params):
+        self._base_params_ = self.estimator.get_params(deep=True)
+        self._rules_y_ = y
+        self._phase_labels_available_ = any(
+            (key == 'phase_labels' or key.endswith('__phase_labels')) and value is not None
+            for key, value in fit_params.items()
+        )
+        self._label_validation_cache_ = {}
+        self.rejected_candidate_count_ = 0
+        self.rejected_candidate_reasons_ = Counter()
+        self.reused_candidate_count_ = 0
+        self.duplicate_proposal_count_ = 0
+        self.unique_candidate_count_ = 0
+        self.search_exhausted_ = False
+        self.proposal_limit_reached_ = False
+
+    def _active_params(self, params):
+        base_params = getattr(self, '_base_params_', None)
+        if base_params is None:
+            base_params = self.estimator.get_params(deep=True)
+        return canonical_candidate(params, base_params)
+
+    def _candidate_error(self, params):
+        base_params = getattr(self, '_base_params_', None)
+        if base_params is None:
+            base_params = self.estimator.get_params(deep=True)
+        return candidate_error(params, base_params,
+                               y=getattr(self, '_rules_y_', None),
+                               phase_labels_available=getattr(self, '_phase_labels_available_', False),
+                               label_cache=getattr(self, '_label_validation_cache_', None))
+
+    def _reject(self, reason):
+        self.rejected_candidate_count_ += 1
+        self.rejected_candidate_reasons_[reason] += 1
+
+    def _penalty(self):
+        return float(self._base_params_.get('estimator__invalid_candidate_score',
+                     self._base_params_.get('invalid_candidate_score', -1.0)))
+
+
+class HierarchicalGASearchCV(_CandidateRules, GASearchCV):
+    """Evolve only active genes, with bounded retries for duplicate phenotypes.
+
+    Architecture and feature switches are selected before their dependent genes.
+    A changed switch therefore initialises newly active genes from their search
+    descriptors instead of inheriting unrelated, inactive values.
+    """
+    _controller_order = (
+        'temporal_architecture', 'use_bigru', 'use_orientation_aux_head',
+        'use_phase_aux_head', 'custom_aux_heads', 'extractor',
+    ) + _EXTRA_CONTROLLERS + (
+        'extractor__tof_modes', 'tof_encoder_type', 'bert_pooling', 'attention_type',
+        'post_fusion_pooling', 'post_fusion_attention_type', 'use_se',
+    )
+    _finite_enumeration_limit = 4096
+
+    def fit(self, X, y=None, groups=None, **fit_params):
+        self._initialise_rules(y, fit_params)
+        self._proposal_keys_ = set()
+        self._finite_space_id_ = None
+        self._finite_candidates_ = None
+        self._last_proposal_ = None
+        self.duplicate_proposal_count_ = 0
+        self.unique_candidate_count_ = 0
+        self.search_exhausted_ = False
+        self.proposal_limit_reached_ = False
+        try:
+            return super().fit(X, y, groups=groups, **fit_params)
+        finally:
+            # Rule validation and finite-space enumeration are fit-local; do
+            # not retain the label table or the candidate pool afterwards.
+            self._rules_y_ = None
+            self._label_validation_cache_.clear()
+            self._finite_candidates_ = None
+
+    def _on_candidate_cache_hit(self):
+        self.reused_candidate_count_ += 1
+
+    def _ordered_genes(self, space):
+        by_name = {_name(key): key for key in space}
+        controllers = [by_name[name] for name in self._controller_order if name in by_name]
+        return controllers + [key for key in space if key not in controllers]
+
+    def _gene_is_active(self, key, proposal):
+        # canonical_candidate normalises use_bigru=False outside its backbone;
+        # it remains unnecessary to draw that descriptor in those architectures.
+        if _name(key) in {'extractor__sequence_crop_mode', 'extractor__maxlen'}:
+            # Joint crop controls must be drawn before final canonicalisation:
+            # a currently unlimited base sequence must not prevent enabling a cap.
+            return True
+        if _name(key) == 'use_bigru':
+            base = getattr(self, '_base_params_', None)
+            if base is None:
+                base = self.estimator.get_params(deep=True)
+            if str(_merged(proposal, base)['temporal_architecture']).lower() != 'bigru_attention':
+                return False
+        probe = dict(proposal)
+        probe.setdefault(key, None)
+        return key in self._active_params(probe)
+
+    def _conditional_proposal(self, space, rng, individual=None):
+        proposal = self._active_params(individual or {})
+        for key in tuple(proposal):
+            if not self._gene_is_active(key, proposal):
+                proposal.pop(key)
+        for key in self._ordered_genes(space):
+            if not self._gene_is_active(key, proposal):
+                proposal.pop(key, None)
+                continue
+            if (individual is None or key not in proposal
+                    or rng.random() <= float(self.mutation_probability)):
+                # Keep descriptor sampling in the base helper, including support
+                # for external descriptors with either sample signature.
+                proposal[key] = super()._sample_individual({key: space[key]}, rng)[key]
+        return self._active_params(proposal)
+
+    @staticmethod
+    def _finite_gene_values(descriptor):
+        choices = getattr(descriptor, 'choices', getattr(descriptor, 'categories', None))
+        if choices is not None:
+            return choices
+        lower = getattr(descriptor, 'lower', None)
+        upper = getattr(descriptor, 'upper', None)
+        if isinstance(lower, Integral) and isinstance(upper, Integral):
+            return range(int(lower), int(upper) + 1)
+        if lower is not None and lower == upper:
+            return (lower,)
+        if isinstance(descriptor, (tuple, list)):
+            return descriptor
+        if not hasattr(descriptor, 'sample'):
+            return (descriptor,)
+        return None
+
+    def _finite_candidate_pool(self, space):
+        """Enumerate small conditional spaces without expanding inactive axes.
+
+        Enumeration is capped by tree nodes, so a large or continuous space
+        cannot cause an unbounded product or claim proven exhaustion.
+        """
+        if getattr(self, '_finite_space_id_', None) == id(space):
+            return self._finite_candidates_
+        self._finite_space_id_ = id(space)
+        self._finite_candidates_ = None
+        ordered = self._ordered_genes(space)
+        candidates = {}
+        visited = 0
+
+        class IncompleteSpace(Exception):
+            pass
+
+        def visit(index, proposal):
+            nonlocal visited
+            visited += 1
+            if visited > self._finite_enumeration_limit:
+                raise IncompleteSpace
+            if index == len(ordered):
+                active = self._active_params(proposal)
+                if self._candidate_error(active) is None:
+                    candidates[self._canonical_key(active)] = active
+                return
+            key = ordered[index]
+            if not self._gene_is_active(key, proposal):
+                visit(index + 1, proposal)
+                return
+            values = self._finite_gene_values(space[key])
+            if values is None:
+                raise IncompleteSpace
+            for value in values:
+                proposal[key] = value
+                visit(index + 1, proposal)
+            proposal.pop(key, None)
+
+        try:
+            visit(0, {})
+        except IncompleteSpace:
+            return None
+        self._finite_candidates_ = candidates
+        return candidates
+
+    def _remember_proposal(self, proposal):
+        self._proposal_keys_.add(self._canonical_key(proposal))
+        self._last_proposal_ = dict(proposal)
+        return proposal
+
+    def _propose(self, space, rng, individual=None):
+        if not hasattr(self, '_proposal_keys_'):
+            self._proposal_keys_ = set()
+        # Once a finite space has been proved exhausted, subsequent population
+        # slots use the evaluation cache without repeating a retry loop.
+        if getattr(self, 'search_exhausted_', False):
+            self.duplicate_proposal_count_ = getattr(self, 'duplicate_proposal_count_', 0) + 1
+            return dict(self._last_proposal_)
+        fallback = None
+        for attempt in range(self._proposal_attempts):
+            # A duplicate child should explore another phenotype even when a
+            # zero mutation probability would otherwise recreate it forever.
+            proposal = self._conditional_proposal(space, rng, individual if attempt == 0 else None)
+            reason = self._candidate_error(proposal)
+            if reason is not None:
+                self._reject(reason)
+                continue
+            fallback = proposal
+            if self._canonical_key(proposal) not in self._proposal_keys_:
+                return self._remember_proposal(proposal)
+            self.duplicate_proposal_count_ = getattr(self, 'duplicate_proposal_count_', 0) + 1
+        finite = self._finite_candidate_pool(space)
+        if finite is not None:
+            remaining = [key for key in finite if key not in self._proposal_keys_]
+            if remaining:
+                key = remaining[int(rng.integers(len(remaining)))]
+                return self._remember_proposal(dict(finite[key]))
+            self.search_exhausted_ = True
+            if fallback is None and finite:
+                fallback = dict(next(iter(finite.values())))
+        else:
+            self.proposal_limit_reached_ = True
+        # All-invalid and exhausted spaces terminate with a finite penalty or
+        # a cached valid result, respectively; neither schedules extra fits.
+        return self._remember_proposal(fallback if fallback is not None else proposal)
+
+    def _sample_individual(self, space, rng):
+        return self._propose(space, rng)
+
+    def _mutate(self, individual, space, rng):
+        return self._propose(space, rng, individual)
+
+    def _crossover(self, parent1, parent2, rng):
+        child1, child2 = dict(parent1), dict(parent2)
+        if rng.random() <= float(self.crossover_probability):
+            for key in sorted(parent1.keys() | parent2.keys()):
+                if key not in parent1:
+                    child1[key] = parent2[key]
+                elif key not in parent2:
+                    child2[key] = parent1[key]
+                elif rng.random() < 0.5:
+                    child1[key], child2[key] = parent2[key], parent1[key]
+        return self._active_params(child1), self._active_params(child2)
+
+    def _canonical_key(self, individual):
+        return super()._canonical_key(self._active_params(individual))
+
+    def _evaluate_individual(self, params, X, y, splits, fit_params):
+        # Includes invalid canonical candidates recorded with a finite penalty.
+        self.unique_candidate_count_ = getattr(self, 'unique_candidate_count_', 0) + 1
+        active = self._active_params(params)
+        reason = self._candidate_error(params)
+        if reason is not None:
+            self._reject(reason)
+            penalty = self._penalty()
+            count = len(splits)
+            return dict(params=active, fit_times=[0.0]*count, score_times=[0.0]*count,
+                        test_scores=[penalty]*count, train_scores=[penalty]*count,
+                        mean_test_score=penalty, std_test_score=0.0,
+                        mean_train_score=penalty, std_train_score=0.0, candidate_error=reason)
+        result = super()._evaluate_individual(active, X, y, splits, fit_params)
+        result['candidate_error'] = None
+        return result
+
+    def _build_cv_results(self, records, maximize):
+        results = super()._build_cv_results(records, maximize)
+        # Different backbones have different active genes; include their union in the CSV.
+        for key in sorted({key for record in records for key in record['params']}):
+            results[f'param_{key}'] = [record['params'].get(key) for record in records]
+        results['candidate_error'] = [record.get('candidate_error') for record in records]
+        return results
+
+
+if BayesSearchCV is not None:
+    class HierarchicalBayesSearchCV(_CandidateRules, BayesSearchCV):
+        """Search conditional spaces with a budget of distinct valid CV candidates.
+
+        A dictionary's n_iter is shared across its architecture subspaces. Explicit
+        lists of spaces retain skopt's per-entry budgets. Proposals are sequential
+        to avoid speculative fits and keep model memory bounded; CV parallelism
+        still follows n_jobs. Invalid and cached proposals do not spend the budget.
+        """
+        def fit(self, X, y=None, groups=None, callback=None, **fit_params):
+            self._initialise_rules(y, fit_params)
+            self._effective_score_cache_ = {}
+            self._invalid_fallback_ = None
+            try:
+                return super().fit(X, y, groups=groups, callback=callback, **fit_params)
+            finally:
+                # Preflight needs labels only while searching, never a retained dataset.
+                self._rules_y_ = None
+                self._label_validation_cache_.clear()
+
+        @staticmethod
+        def _finite_grid(optimizer, limit=4096):
+            """A lazy fallback for small discrete spaces, never a large Cartesian table."""
+            from itertools import product
+            from skopt.space import Categorical, Integer
+            choices, size = [], 1
+            for dimension in optimizer.space.dimensions:
+                if isinstance(dimension, Categorical):
+                    values = dimension.categories
+                elif isinstance(dimension, Integer):
+                    values = range(int(dimension.low), int(dimension.high) + 1)
+                else:
+                    return None, None
+                size *= len(values)
+                if size > limit:
+                    return None, None
+                choices.append(values)
+            return iter(product(*choices)), size
+
+        def _next_unique_point(self, state):
+            optimizer = state['optimizer']
+            pending = []
+
+            def inspect_point(raw_point):
+                point = [np.asarray(value).item() for value in raw_point]
+                coordinate = json.dumps(point, default=str)
+                if coordinate in state['seen']:
+                    self.duplicate_proposal_count_ += 1
+                    return None
+                state['seen'].add(coordinate)
+                proposal = dict(zip(sorted(state['space']), point))
+                reason = self._candidate_error(proposal)
+                active = self._active_params(proposal)
+                if reason is not None:
+                    self._reject(reason)
+                    self._invalid_fallback_ = active
+                    if state['synthetic_count'] < 16:
+                        pending.append((point, self._penalty()))
+                        state['synthetic_count'] += 1
+                    return None
+                key = GASearchCV._canonical_key(self, active)
+                if key in self._effective_score_cache_:
+                    self.reused_candidate_count_ += 1
+                    self.duplicate_proposal_count_ += 1
+                    if state['synthetic_count'] < 16:
+                        pending.append((point, self._effective_score_cache_[key]))
+                        state['synthetic_count'] += 1
+                    return None
+                return point, active, key
+
+            if state['size'] is not None and len(state['seen']) >= state['size']:
+                state['exhausted'] = True
+                return None, pending
+            for attempt in range(self._proposal_attempts):
+                # ask(n_points=1) uses constant-liar copies and re-fits the surrogate.
+                raw = optimizer.ask() if attempt == 0 else optimizer.space.rvs(
+                    n_samples=1, random_state=optimizer.rng,
+                )[0]
+                candidate = inspect_point(raw)
+                if candidate is not None:
+                    return candidate, pending
+                if state['size'] is not None and len(state['seen']) >= state['size']:
+                    state['exhausted'] = True
+                    return None, pending
+            if state['grid'] is not None:
+                for raw in state['grid']:
+                    candidate = inspect_point(raw)
+                    if candidate is not None:
+                        return candidate, pending
+                state['exhausted'] = True
+            else:
+                # Bounded random retries cannot prove a continuous space exhausted.
+                self.proposal_limit_reached_ = True
+            return None, pending
+
+        @staticmethod
+        def _search_score(results):
+            names = [name for name in results if name.startswith('mean_test_')]
+            if len(names) != 1:
+                raise ValueError('Hierarchical Bayesian search requires one scoring metric.')
+            return float(results[names[0]][-1])
+
+        def _run_search(self, evaluate_candidates):
+            from sklearn.utils import check_random_state
+            from skopt.utils import eval_callbacks
+
+            rng = check_random_state(self.random_state)
+            self.optimizer_kwargs_['random_state'] = rng
+            # Retaining every fitted GP multiplies memory as the search progresses.
+            self.optimizer_kwargs_.setdefault('model_queue_size', 1)
+            entries = [self.search_spaces] if isinstance(self.search_spaces, dict) else self.search_spaces
+            groups, states = [], []
+            for entry in entries:
+                original, budget = entry if isinstance(entry, tuple) else (entry, self.n_iter)
+                if not isinstance(budget, Integral) or budget <= 0:
+                    raise ValueError('Each Bayesian search budget must be a positive integer.')
+                conditional = conditional_bayesian_spaces(original, self._base_params_)
+                group = []
+                for space in conditional:
+                    optimizer = self._make_optimizer(space)
+                    grid, size = self._finite_grid(optimizer)
+                    state = dict(space=space, optimizer=optimizer, grid=grid,
+                                 size=size, seen=set(), exhausted=False, synthetic_count=0)
+                    group.append(state)
+                    states.append(state)
+                # Fair first visits when the budget is smaller than the architecture count.
+                group = [group[index] for index in rng.permutation(len(group))]
+                groups.append((group, int(budget)))
+            self.optimizers_ = [state['optimizer'] for state in states]
+            self.conditional_search_spaces_ = [state['space'] for state in states]
+            self.requested_candidate_count_ = sum(budget for _, budget in groups)
+            stop = False
+            for group, budget in groups:
+                available, cursor, spent = list(group), 0, 0
+                while spent < budget and available and not stop:
+                    cursor %= len(available)
+                    state = available[cursor]
+                    candidate, pending = self._next_unique_point(state)
+                    if candidate is None:
+                        # This optimizer will not propose again. Avoid a cubic GP
+                        # fit on thousands of synthetic penalties from a finite scan.
+                        if pending and not state['optimizer'].yi:
+                            point, score = pending[0]
+                            state['optimizer'].tell([point], [-score])
+                        available.pop(cursor)
+                        continue
+                    point, active, key = candidate
+                    score = self._search_score(evaluate_candidates([active]))
+                    if not np.isfinite(score):
+                        score = self._penalty()
+                    self._effective_score_cache_[key] = score
+                    self.unique_candidate_count_ += 1
+                    spent += 1
+                    pending.append((point, score))
+                    result = state['optimizer'].tell([p for p, _ in pending], [-s for _, s in pending])
+                    if state['size'] is not None and len(state['seen']) >= state['size']:
+                        state['exhausted'] = True
+                    stop = bool(eval_callbacks(self._callbacks, result))
+                    cursor += 1
+                if stop:
+                    break
+            self.search_exhausted_ = bool(states) and all(state['exhausted'] for state in states)
+            if self.unique_candidate_count_ == 0:
+                if self._invalid_fallback_ is None:
+                    raise ValueError('No candidate could be proposed from the conditional search spaces.')
+                # Retain one finite-penalty CV row for existing all-failed reporting.
+                evaluate_candidates([self._invalid_fallback_])
+            self._optim_results = [state['optimizer'].get_result() for state in states
+                                   if state['optimizer'].yi]
+            if self.proposal_limit_reached_:
+                warnings.warn('Stopped a conditional subspace after bounded retries found no unseen valid candidate.',
+                              RuntimeWarning)
+else:
+    HierarchicalBayesSearchCV = None
+
+
+def candidate_score(estimator, X, y):
+    """Finite penalties keep Bayesian optimisation running even if all fits fail."""
+    model = estimator.named_steps['estimator']
+    if getattr(model, 'fit_failed_', False):
+        return float(model.invalid_candidate_score)
+    try:
+        return float(estimator.score(X, y))
+    except Exception as exc:
+        if model.invalid_candidate_policy == 'raise':
+            raise
+        model.fit_error_ = f'{type(exc).__name__}: {exc}'
+        model._record_candidate_failure('score', model.fit_error_)
+        warnings.warn(f'Candidate scoring skipped: {model.fit_error_}', RuntimeWarning)
+        return float(model.invalid_candidate_score)
+
+
+def refit_valid_candidate(search, X, y, **fit_params):
+    """Try successful CV candidates in score order; never refit a penalty winner."""
+    results = search.cv_results_
+    score_key = 'mean_test_score' if 'mean_test_score' in results else 'mean_test_quality'
+    scores = np.asarray(results[score_key], dtype=float)
+    split_keys = [k for k in results if k.startswith('split') and
+                  (k.endswith('_test_score') or k.endswith('_test_quality'))]
+    valid = np.isfinite(scores) & (scores >= 0)
+    for key in split_keys:
+        valid &= np.isfinite(results[key]) & (np.asarray(results[key]) >= 0)
+    search.refit_errors_ = []
+    search.best_estimator_ = None
+    search.best_index_ = None
+    for idx in np.argsort(-scores, kind='stable'):
+        if not valid[idx]:
+            continue
+        estimator = clone(search.estimator).set_params(**results['params'][idx])
+        estimator.set_params(estimator__invalid_candidate_policy='raise')
+        start = time.perf_counter()
+        try:
+            estimator.fit(X, y, **fit_params)
+        except Exception as exc:
+            search.refit_errors_.append({'candidate': int(idx), 'error': f'{type(exc).__name__}: {exc}'})
+            continue
+        search.best_estimator_ = estimator
+        search.best_index_ = int(idx)
+        search.best_params_ = dict(results['params'][idx])
+        search.best_score_ = float(scores[idx])
+        search.refit_time_ = time.perf_counter() - start
+        return True
+    search.best_score_ = np.nan
+    search.best_params_ = {}
+    return False

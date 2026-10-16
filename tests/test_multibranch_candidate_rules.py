@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from multibranch_candidate_rules import canonical_candidate, candidate_error
+from multibranch_utils import canonical_candidate, candidate_error
 
 
 class CandidateRulesTests(unittest.TestCase):
@@ -123,7 +123,7 @@ class CandidateRulesTests(unittest.TestCase):
         self.assertIsNone(candidate_error(params))
 
     def test_incompatible_candidate_is_penalized_before_extractor_or_tensorflow(self):
-        import multibranch_attention_sol as mba
+        import multibranch_utils as mba
         estimator = mba.MultiBranchSequenceClassifier(temporal_architecture="bert", bert_d_model=10,
             bert_num_heads=4, invalid_candidate_policy="penalize")
         y = pd.DataFrame({"sequence_id": [1], "bfrb": ["a"]})

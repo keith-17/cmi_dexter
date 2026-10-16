@@ -2,7 +2,7 @@
 sequence_explorer_utils.py
 Interactive explorer for the CMI sensor data, built directly on the
 SignalCleaner / MotionFilter / IMUExtractor / RotationExtractor /
-SequenceExtractor pipeline in base_utils_qwen.py.
+SequenceExtractor pipeline in base_utils.py.
 """
 from __future__ import annotations
 
@@ -35,17 +35,20 @@ try:
 except Exception:
     _HDBSCAN_AVAILABLE = False
 
-from base_utils_sol import (
-    SequenceExtractor,
-    SignalCleaner,
-    MotionFilter,
-    IMUExtractor,
-    RotationExtractor,
-    STFTExtractor,
-    CWTExtractor,
-    _one_sided_psd,
-    _stft_frame_coverage,
-)
+if __package__:
+    from . import base_utils as _base
+else:
+    import base_utils as _base
+
+SequenceExtractor = _base.SequenceExtractor
+SignalCleaner = _base.SignalCleaner
+MotionFilter = _base.MotionFilter
+IMUExtractor = _base.IMUExtractor
+RotationExtractor = _base.RotationExtractor
+STFTExtractor = _base.STFTExtractor
+CWTExtractor = _base.CWTExtractor
+_one_sided_psd = _base._one_sided_psd
+_stft_frame_coverage = _base._stft_frame_coverage
 
 
 ACC_MODE_OPTS     = ('raw', 'velocity', 'displacement', 'jerk', 'smoothed')

@@ -66,7 +66,7 @@ def prepare(iterations=None, notebook_name=None, use_attached_source=False):
             raise RuntimeError('Iteration override must change exactly one assignment.')
         configuration['source'] = config_source.splitlines(keepends=True)
     modules = sorted((ROOT / 'src').glob('*.py'))
-    if not {'data_utils.py', 'base_utils_qwen.py', 'multibranch_attention.py'} <= {p.name for p in modules}:
+    if not {'base_utils.py', 'multibranch_utils.py'} <= {p.name for p in modules}:
         raise RuntimeError('Required Python utility modules are missing from src/.')
     for original in notebook['cells']:
         if original['cell_type'] == 'code':
@@ -75,8 +75,7 @@ def prepare(iterations=None, notebook_name=None, use_attached_source=False):
             compile(''.join(original['source']), str(notebook_path), 'exec')
     if use_attached_source and not metadata.get('dataset_sources'):
         raise RuntimeError('Attached source requested but no dataset is configured.')
-    if not use_attached_source and any('import multibranch_attention_sol' in ''.join(cell.get('source', []))
-           for cell in notebook['cells']):
+    if not use_attached_source:
         archive = io.BytesIO()
         with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED) as zipped:
             for module in modules:

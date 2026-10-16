@@ -9,8 +9,8 @@ import numpy as np
 from sklearn.base import clone
 from sklearn.model_selection import GridSearchCV, ParameterGrid
 
-from test_multibranch_attention_sol_params import NOTEBOOK, GASearchCV, make_pipeline
-from multibranch_experiment_utils import candidate_score
+from test_multibranch_utils_params import NOTEBOOK, GASearchCV, make_pipeline
+from multibranch_utils import candidate_score
 
 
 class SearchModeTests(unittest.TestCase):

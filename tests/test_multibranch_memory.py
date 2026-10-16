@@ -10,8 +10,8 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-import base_utils_sol as base
-import multibranch_attention_sol as mba
+import base_utils as base
+import multibranch_utils as mba
 
 
 class ChunkMemoryTests(unittest.TestCase):

@@ -65,7 +65,8 @@ class WorkflowTests(unittest.TestCase):
                 packaged = json.loads((Path(temporary) / metadata['code_file']).read_text())
                 original = json.loads(original_bytes)
                 changed = 0
-                for before, after in zip(original['cells'], packaged['cells']):
+                self.assertEqual(packaged['cells'][0]['id'], 'kaggle-source-bootstrap')
+                for before, after in zip(original['cells'], packaged['cells'][1:]):
                     expected, actual = ''.join(before['source']), ''.join(after['source'])
                     if expected != actual:
                         changed += 1
@@ -128,15 +129,16 @@ class WorkflowTests(unittest.TestCase):
                 sleep.assert_called_once_with(60)
                 download.assert_called_once_with(metadata)
 
-    def test_notebook_packaged_without_module_snapshot_bloat(self):
+    def test_alpha_packages_a_local_snapshot_and_preserves_notebook_sources(self):
         original_bytes = (ROOT / 'notebooks/multibranch_alpha.ipynb').read_bytes()
         with tempfile.TemporaryDirectory() as temporary:
             with patch.object(workflow, 'BUILD', Path(temporary)):
                 metadata = workflow.prepare()
                 notebook = json.loads((Path(temporary) / metadata['code_file']).read_text())
             original = json.loads(original_bytes)
-            self.assertEqual(len(notebook['cells']), len(original['cells']))
-            for expected, actual in zip(original['cells'], notebook['cells']):
+            self.assertEqual(len(notebook['cells']), len(original['cells']) + 1)
+            self.assertEqual(notebook['cells'][0]['id'], 'kaggle-source-bootstrap')
+            for expected, actual in zip(original['cells'], notebook['cells'][1:]):
                 self.assertEqual(expected['source'], actual['source'])
             full_text = '\n'.join(''.join(c.get('source', [])) for c in notebook['cells'])
             self.assertNotIn('MODULE_SNAPSHOT', full_text)

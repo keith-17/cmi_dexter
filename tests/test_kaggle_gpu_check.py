@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+import pandas as pd
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 import kaggle_gpu_check as gpu_check
@@ -33,6 +35,19 @@ class GPUCheckTests(unittest.TestCase):
             self.assertEqual(namespace['generations'], 0)
             self.assertLessEqual(namespace['tournament_size'], namespace['population_size'])
             self.assertEqual(namespace['param_space']['estimator__epochs'], [1])
+            subset = next(''.join(c['source']) for c in notebook['cells'] if c.get('id') == 'gpu-check-data')
+            rows = [
+                {'sequence_id': f'{label}_{index}', 'target': label}
+                for label, count in [('large', 20), ('small', 5)]
+                for index in range(count)
+                for _ in range(2)
+            ]
+            subset_namespace = dict(train_df=pd.DataFrame(rows), TARGET_COL='target', random_state=42)
+            exec(subset, subset_namespace)
+            retained = subset_namespace['train_df']
+            self.assertEqual(retained.groupby('target')['sequence_id'].nunique().to_dict(),
+                             {'large': 16, 'small': 5})
+            self.assertTrue(retained.groupby('sequence_id').size().eq(2).all())
             manifest = json.loads((build / 'submitted.json').read_text())
             self.assertEqual(manifest['run_stage'], 'gpu_validation')
             self.assertEqual(manifest['submitted_source_sha256'], gpu_check.workflow.source_hash(notebook))

@@ -1,5 +1,5 @@
 """
-base_utils_qwen.py
+base_utils.py
 
 Cleaned and runnable Honeycomb / sequence feature extraction utilities.
 """
@@ -7,8 +7,10 @@ Cleaned and runnable Honeycomb / sequence feature extraction utilities.
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 from fractions import Fraction
+from pathlib import Path
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -20,8 +22,6 @@ from sklearn.utils.validation import check_is_fitted
 from sklearn.preprocessing import LabelEncoder
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, f1_score, make_scorer
-
-warnings.filterwarnings("ignore")
 
 try:
     from scipy.signal import argrelextrema, get_window, resample_poly, stft
@@ -388,13 +388,14 @@ class SignalCleaner(HoneycombBase):
         counter = _validate_counter_order(df, self.sequence_col, self.counter_col)
         if num_cols:
             if self.interp_mode == "linear":
-                df[num_cols] = df.groupby(self.sequence_col, sort=False)[num_cols].transform(
-                    lambda g: g.interpolate(method="linear", limit_direction="both").ffill().bfill()
-                )
+                if df[num_cols].isna().to_numpy().any():
+                    df[num_cols] = df.groupby(self.sequence_col, sort=False)[num_cols].transform(
+                        lambda g: g.interpolate(method="linear", limit_direction="both").ffill().bfill()
+                    )
             elif self.interp_mode == "ffill":
-                df[num_cols] = df.groupby(self.sequence_col, sort=False)[num_cols].transform(
-                    lambda g: g.ffill().bfill()
-                )
+                if df[num_cols].isna().to_numpy().any():
+                    filled = df.groupby(self.sequence_col, sort=False)[num_cols].ffill()
+                    df[num_cols] = filled.groupby(df[self.sequence_col], sort=False).bfill()
             else:
                 raise InvalidExtractorParams("interp_mode must be 'linear' or 'ffill'")
 
@@ -553,7 +554,7 @@ class MotionFilter(HoneycombBase):
         return s - np.linspace(s.iloc[0], s.iloc[-1], len(s))
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        df = X.copy()
+        df = X
 
         acc_cols = [
             c
@@ -561,6 +562,12 @@ class MotionFilter(HoneycombBase):
             if c.startswith("acc_")
             and not c.endswith(("_vel", "_disp", "_jerk", "_mag", "_dr_vel", "_dr_pos"))
         ]
+
+        if acc_cols and (
+            self.motion_filter_mode in {"kalman", "extended_kalman"}
+            or (self.use_dead_reckoning and "dt" in df.columns)
+        ):
+            df = X.copy()
 
         if self.motion_filter_mode in {"kalman", "extended_kalman"} and acc_cols:
             if self.motion_filter_mode == "extended_kalman":
@@ -643,11 +650,9 @@ class IMUExtractor(HoneycombBase):
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         check_is_fitted(self, ["acc_modes_", "acc_cols_"])
-        df = X.copy()
+        df = X
         parts = []
-        if "dt" not in df.columns:
-            df["dt"] = 1.0
-        dt = df["dt"].astype(float)
+        dt = df.get("dt", pd.Series(1.0, index=df.index)).astype(float)
         first_sample = df.groupby(self.sequence_col, sort=False).cumcount().eq(0)
         integration_dt = dt.mask(first_sample, 0.0)
 
@@ -771,10 +776,10 @@ class RotationExtractor(HoneycombBase):
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         check_is_fitted(self, ["rot_modes_", "rot_cols_"])
-        df = X.copy()
+        df = X
         parts = []
         dt = df.get("rot_dt", df.get("dt", pd.Series(1.0, index=df.index))).astype(float)
-        if not self.rot_cols_:
+        if not self.rot_modes_ or not self.rot_cols_:
             return pd.DataFrame(index=df.index)
 
         q = df[self.rot_cols_].to_numpy(dtype=float, copy=True)
@@ -908,7 +913,7 @@ class TOFExtractor(HoneycombBase):
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         check_is_fitted(self, ["tof_modes_", "tof_cols_"])
-        if not self.tof_cols_:
+        if not self.tof_modes_ or not self.tof_cols_:
             return pd.DataFrame(index=X.index)
 
         observed = X[self.tof_cols_].astype(float).replace(-1.0, np.nan)
@@ -1079,10 +1084,10 @@ class ThermoExtractor(HoneycombBase):
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         check_is_fitted(self, ["thm_modes_", "thm_cols_"])
-        if not self.thm_cols_:
+        if not self.thm_modes_ or not self.thm_cols_:
             return pd.DataFrame(index=X.index)
 
-        raw = X[self.thm_cols_].astype(float).copy()
+        raw = X[self.thm_cols_].astype(float)
         dt = X.get("dt", pd.Series(1.0, index=X.index)).astype(float)
         parts = []
 
@@ -1122,6 +1127,37 @@ class ThermoExtractor(HoneycombBase):
 # ---------------------------------------------------------------------------
 # STFT / CWT
 # ---------------------------------------------------------------------------
+
+
+def _sequence_summary_features(
+    frame: pd.DataFrame,
+    signal_columns: List[str],
+    sequence_col: str,
+    counter_col: str,
+    feature_prefix: str,
+    compute,
+    validate_counter,
+) -> pd.DataFrame:
+    """Broadcast sequence summaries without copying sensor frames or inserting columns."""
+    if not signal_columns:
+        return pd.DataFrame(index=frame.index)
+    positions_by_sequence = frame.groupby(sequence_col, sort=False).indices
+    if sum(map(len, positions_by_sequence.values())) != len(frame):
+        raise ValueError(f"{sequence_col} must not contain missing sequence IDs")
+    if counter_col in frame.columns:
+        counters = frame[[counter_col]]
+        for positions in positions_by_sequence.values():
+            validate_counter(counters.iloc[positions])
+    features = {}
+    for column in signal_columns:
+        signal = frame[column].to_numpy(dtype=float, copy=False)
+        for positions in positions_by_sequence.values():
+            for name, value in compute(signal[positions]).items():
+                feature_name = f"{column}_{feature_prefix}_{name}"
+                if feature_name not in features:
+                    features[feature_name] = np.empty(len(frame), dtype=float)
+                features[feature_name][positions] = value
+    return pd.DataFrame(features, index=frame.index)
 
 
 class STFTExtractor(HoneycombBase):
@@ -1337,26 +1373,10 @@ class STFTExtractor(HoneycombBase):
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         check_is_fitted(self, ["acc_cols_"])
-        df = X.copy()
-        parts = []
-        for col in self.acc_cols_:
-            feat_dict = {}
-            for seq_id, group in df.groupby(self.sequence_col, sort=False):
-                self._validate_uniform_counter(group)
-                signal = group[col].to_numpy(dtype=float)
-                seq_features = self._compute_stft_features(signal)
-                for feat_name, value in seq_features.items():
-                    feat_dict.setdefault(feat_name, []).append(value)
-            seq_ids = df[self.sequence_col].values
-            unique_seqs = pd.unique(seq_ids)
-            for feat_name, values in feat_dict.items():
-                seq_to_val = dict(zip(unique_seqs, values))
-                df[f"{col}_{self.feature_prefix}_{feat_name}"] = [seq_to_val[sid] for sid in seq_ids]
-            feat_cols = [f"{col}_{self.feature_prefix}_{k}" for k in feat_dict.keys()]
-            parts.append(df[feat_cols])
-        if not parts:
-            return pd.DataFrame(index=df.index)
-        return pd.concat(parts, axis=1)
+        return _sequence_summary_features(
+            X, self.acc_cols_, self.sequence_col, self.counter_col,
+            self.feature_prefix, self._compute_stft_features, self._validate_uniform_counter,
+        )
 
     def _validate_uniform_counter(self, group: pd.DataFrame) -> None:
         if self.counter_col not in group.columns or len(group) < 2:
@@ -1613,26 +1633,10 @@ class CWTExtractor(HoneycombBase):
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         check_is_fitted(self, ["acc_cols_", "widths_"])
-        df = X.copy()
-        parts = []
-        for col in self.acc_cols_:
-            feat_dict = {}
-            for seq_id, group in df.groupby(self.sequence_col, sort=False):
-                self._validate_uniform_counter(group)
-                signal = group[col].to_numpy(dtype=float)
-                seq_features = self._compute_cwt_features(signal)
-                for feat_name, value in seq_features.items():
-                    feat_dict.setdefault(feat_name, []).append(value)
-            seq_ids = df[self.sequence_col].values
-            unique_seqs = pd.unique(seq_ids)
-            for feat_name, values in feat_dict.items():
-                seq_to_val = dict(zip(unique_seqs, values))
-                df[f"{col}_{self.feature_prefix}_{feat_name}"] = [seq_to_val[sid] for sid in seq_ids]
-            feat_cols = [f"{col}_{self.feature_prefix}_{k}" for k in feat_dict.keys()]
-            parts.append(df[feat_cols])
-        if not parts:
-            return pd.DataFrame(index=df.index)
-        return pd.concat(parts, axis=1)
+        return _sequence_summary_features(
+            X, self.acc_cols_, self.sequence_col, self.counter_col,
+            self.feature_prefix, self._compute_cwt_features, self._validate_uniform_counter,
+        )
 
     def _validate_uniform_counter(self, group: pd.DataFrame) -> None:
         if self.counter_col not in group.columns or len(group) < 2:
@@ -1950,7 +1954,10 @@ class SequenceExtractor(HoneycombBase):
             motion_filter_mode=self.motion_filter_mode,
             kalman_process_noise=self.kalman_process_noise,
             kalman_measurement_noise=self.kalman_measurement_noise,
-            use_dead_reckoning=self.use_dead_reckoning,
+            use_dead_reckoning=(self.use_dead_reckoning and (
+                type(self) is not SequenceExtractor
+                or _sequence_dead_reckoning_consumed(self.get_params(deep=False))
+            )),
             dead_reckoning_detrend=self.dead_reckoning_detrend,
             sequence_col=self.sequence_col,
         )
@@ -2032,8 +2039,7 @@ class SequenceExtractor(HoneycombBase):
             if len(g) == 0:
                 continue
             max_len = len(g)
-            new_df = pd.DataFrame(index=range(max_len))
-            new_df[self.sequence_col] = seq_id
+            new_data = {self.sequence_col: [seq_id] * max_len}
             if self.counter_col in g.columns:
                 counter = pd.to_numeric(g[self.counter_col], errors="coerce").to_numpy(dtype=float)
                 if not np.isfinite(counter).all() or (len(counter) > 1 and np.any(np.diff(counter) <= 0)):
@@ -2043,7 +2049,7 @@ class SequenceExtractor(HoneycombBase):
                         "Polyphase resampling requires a uniform input grid; interpolate missing "
                         "counter positions before enabling resample_modalities"
                     )
-                new_df[self.counter_col] = g[self.counter_col].to_numpy()
+                new_data[self.counter_col] = g[self.counter_col].to_numpy()
             else:
                 counter = np.arange(len(g), dtype=float)
             for prefix, (native_rate, target_rate) in rate_map.items():
@@ -2150,17 +2156,17 @@ class SequenceExtractor(HoneycombBase):
                 elif prefix == "tof_":
                     vals[~valid] = -1.0
                 for col_idx, col in enumerate(cols):
-                    new_df[col] = vals[:, col_idx]
+                    new_data[col] = vals[:, col_idx]
             if "dt" in g.columns:
-                new_df["dt"] = g["dt"].to_numpy(dtype=float)
+                new_data["dt"] = g["dt"].to_numpy(dtype=float)
             else:
-                new_df["dt"] = 1.0 / float(self.imu_native_sampling_rate)
+                new_data["dt"] = 1.0 / float(self.imu_native_sampling_rate)
             if "rot_dt" in g.columns:
-                new_df["rot_dt"] = g["rot_dt"].to_numpy(dtype=float)
+                new_data["rot_dt"] = g["rot_dt"].to_numpy(dtype=float)
             else:
-                new_df["rot_dt"] = 1.0 / float(self.rot_native_sampling_rate)
-            new_df["mask"] = 1.0
-            rows.append(new_df)
+                new_data["rot_dt"] = 1.0 / float(self.rot_native_sampling_rate)
+            new_data["mask"] = 1.0
+            rows.append(pd.DataFrame(new_data))
         if not rows:
             return df
         return pd.concat(rows, ignore_index=True)
@@ -2175,8 +2181,9 @@ class SequenceExtractor(HoneycombBase):
             combined = pd.concat(outs, axis=1)
         else:
             combined = pd.DataFrame(index=processed.index)
-        combined = combined.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        combined = combined.loc[:, ~combined.columns.duplicated()]
+        combined = combined.replace([np.inf, -np.inf, np.nan], 0.0)
+        if combined.columns.duplicated().any():
+            combined = combined.loc[:, ~combined.columns.duplicated()]
         if self.sequence_col in processed.columns:
             combined[self.sequence_col] = processed[self.sequence_col].values
         elif self.sequence_col not in combined.columns:
@@ -2187,13 +2194,25 @@ class SequenceExtractor(HoneycombBase):
         return combined
 
     def _append_global_context(self, out: pd.DataFrame, base_cols: List[str]) -> pd.DataFrame:
-        out = out.copy()
-        for col in base_cols:
-            if col not in out.columns:
-                continue
-            out[f"{col}_global_mean"] = out.groupby(self.sequence_col, sort=False)[col].transform("mean")
-            out[f"{col}_global_std"] = out.groupby(self.sequence_col, sort=False)[col].transform("std").fillna(0.0)
-        return out
+        columns = [col for col in base_cols if col in out.columns]
+        if not columns:
+            return out
+        grouped = out.groupby(self.sequence_col, sort=False)
+        # Aggregate once per sequence, then broadcast the small table in row order.
+        # Constructing one context block avoids two groupings and inserts per feature.
+        summary = grouped[columns].agg(["mean", "std"])
+        summary.iloc[:, 1::2] = summary.iloc[:, 1::2].fillna(0.0)
+        codes = grouped.ngroup().to_numpy()
+        present = pd.notna(codes)
+        context_values = np.full((len(out), 2 * len(columns)), np.nan)
+        context_values[present] = summary.to_numpy()[codes[present].astype(int)]
+        context_values[~present, 1::2] = 0.0
+        context = pd.DataFrame(
+            context_values,
+            columns=[f"{column}_global_{stat}" for column in columns for stat in ("mean", "std")],
+            index=out.index,
+        )
+        return pd.concat([out, context], axis=1)
 
     def _preprocess_features(self, X: pd.DataFrame) -> pd.DataFrame:
         if self.filter_problematic_sequences:
@@ -2202,8 +2221,13 @@ class SequenceExtractor(HoneycombBase):
                 raise InvalidExtractorParams("Problematic-sequence filtering removed every input row.")
         cleaned = self.cleaner.transform(X)
         filtered = self.motion_filter.transform(cleaned)
+        del cleaned
         processed = self._maybe_resample(filtered)
-        combined = self._combine_feature_outputs(processed, add_context=self.add_global_context)
+        del filtered
+        combined = self._combine_feature_outputs(
+            processed,
+            add_context=self.add_global_context and str(self.output_format).lower() != "frame",
+        )
         return combined
 
     def _stat_vector(self, arr: np.ndarray, stat: str) -> np.ndarray:
@@ -2260,7 +2284,7 @@ class SequenceExtractor(HoneycombBase):
             if stride > 0 and window is not None:
                 self.chunk_stride = min(stride, window)
 
-    def fit(self, X: pd.DataFrame, y: Optional[pd.DataFrame] = None):
+    def _fit_features(self, X: pd.DataFrame, y: Optional[pd.DataFrame] = None) -> pd.DataFrame:
         self._normalize_chunk_stride()
 
         validate_sequence_extractor_params(
@@ -2276,14 +2300,18 @@ class SequenceExtractor(HoneycombBase):
             problematic_features_threshold=self.problematic_features_threshold,
             feature_cols=_coerce_search_value(self.problematic_feature_cols),
             sequence_col=self.sequence_col,
-        ).fit(X)
+        )
+        if self.filter_problematic_sequences:
+            self.problematic_filter_.fit(X)
         X_fit = self.problematic_filter_.transform(X) if self.filter_problematic_sequences else X
         if X_fit.empty:
             raise InvalidExtractorParams("Problematic-sequence filtering removed every training row.")
 
         cleaned = self.cleaner.fit_transform(X_fit)
         filtered = self.motion_filter.fit_transform(cleaned)
+        del cleaned
         processed = self._maybe_resample(filtered)
+        del filtered
 
         self.imu.fit(processed)
         self.rotation.fit(processed)
@@ -2309,12 +2337,28 @@ class SequenceExtractor(HoneycombBase):
         ]
 
         if self.add_global_context:
-            combined_ctx = self._append_global_context(combined.copy(), self.base_feature_names_)
-            self.feature_names_in_ = [c for c in combined_ctx.columns if c not in self._non_feature_cols()]
+            self.feature_names_in_ = self.base_feature_names_ + [
+                f"{column}_global_{stat}"
+                for column in self.base_feature_names_
+                for stat in ("mean", "std")
+            ]
         else:
             self.feature_names_in_ = list(self.base_feature_names_)
 
+        return combined
+
+    def fit(self, X: pd.DataFrame, y: Optional[pd.DataFrame] = None):
+        self._fit_features(X, y)
         return self
+
+    def fit_transform(self, X: pd.DataFrame, y=None, **fit_params):
+        """Reuse fitted training features without keeping a dataset cache on the estimator."""
+        combined = self._fit_features(X, y, **fit_params)
+        if str(self.output_format).lower() == "frame":
+            return self._frame_from_features(combined)
+        if self.add_global_context:
+            combined = self._append_global_context(combined, self.base_feature_names_)
+        return self._chunks_from_features(combined)
 
     # ---------- transform ----------
 
@@ -2326,7 +2370,9 @@ class SequenceExtractor(HoneycombBase):
 
     def transform_frame(self, X: pd.DataFrame) -> pd.DataFrame:
         check_is_fitted(self, ["base_feature_names_", "frame_feature_names_"])
-        out = self._preprocess_features(X)
+        return self._frame_from_features(self._preprocess_features(X))
+
+    def _frame_from_features(self, out: pd.DataFrame) -> pd.DataFrame:
         records = []
         seq_ids = []
         for seq_id, g in out.groupby(self.sequence_col, sort=True):
@@ -2379,13 +2425,15 @@ class SequenceExtractor(HoneycombBase):
         check_is_fitted(self, ["feature_names_in_"])
         self._normalize_chunk_stride()
         validate_sequence_extractor_params(self.get_params(), for_frame_output=False)
-        out = self._preprocess_features(X)
+        return self._chunks_from_features(self._preprocess_features(X))
+
+    def _chunks_from_features(self, out: pd.DataFrame) -> Dict[str, Any]:
         for col in self.feature_names_in_:
             if col not in out.columns:
                 out[col] = 0.0
 
-        grouped_sequences = list(out.groupby(self.sequence_col, sort=False))
-        if not grouped_sequences:
+        grouped_positions = out.groupby(self.sequence_col, sort=False).indices
+        if not grouped_positions:
             raise ValueError("SequenceExtractor.transform_chunks produced no sequences.")
 
         maxlen = None
@@ -2407,8 +2455,8 @@ class SequenceExtractor(HoneycombBase):
                 ) from exc
         if window is None or window <= 0:
             window = max(
-                min(len(group), maxlen) if maxlen is not None else len(group)
-                for _, group in grouped_sequences
+                min(len(positions), maxlen) if maxlen is not None else len(positions)
+                for positions in grouped_positions.values()
             )
         window = max(1, int(window))
 
@@ -2430,11 +2478,14 @@ class SequenceExtractor(HoneycombBase):
         max_windows_before_cap = 0
         max_windows_after_cap = 0
 
-        for seq_id, group in grouped_sequences:
-            if len(group) == 0:
+        # Store only feature columns; groupby.indices avoids retaining a DataFrame
+        # for every sequence alongside the complete preprocessed feature table.
+        features = out[self.feature_names_in_]
+        for seq_id, positions in grouped_positions.items():
+            if len(positions) == 0:
                 continue
             sequences_total += 1
-            arr = group[self.feature_names_in_].to_numpy(dtype=float)
+            arr = features.iloc[positions].to_numpy(dtype=float)
             arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
             full_length = len(arr)
             # Chunk values are returned as float32. Convert before retaining
@@ -2503,17 +2554,148 @@ class SequenceExtractor(HoneycombBase):
                 f"max_windows_after_cap={max_windows_after_cap}"
             )
 
+        del features, out
         return {
             "X": np.stack(sequences, axis=0),
-            "mask": np.stack(masks, axis=0).astype(bool),
+            "mask": np.stack(masks, axis=0),
             "sequence_ids": np.array(seq_ids),
             "feature_names": list(self.feature_names_in_),
         }
 
 
 # ---------------------------------------------------------------------------
-# Random Forest sequence classifier (unchanged)
+# Search dependencies and Random Forest sequence classifier
 # ---------------------------------------------------------------------------
+
+
+_SEQUENCE_PARAMETER_DEFAULTS = {
+    name: parameter.default
+    for name, parameter in inspect.signature(SequenceExtractor.__init__).parameters.items()
+    if name != "self"
+}
+
+
+def _spectral_configs(settings, kind):
+    raw = settings.get(f"{kind}_configs", _UNSET)
+    if raw is _UNSET:
+        return [{}]
+    raw = _coerce_search_value(raw)
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)) and all(isinstance(config, dict) for config in raw):
+        return raw
+    return None  # Unknown/custom declarations must remain active for preflight.
+
+
+def _sequence_dead_reckoning_consumed(settings):
+    """Built-in feature selectors exclude these derived axes unless explicitly requested."""
+    for kind in ("stft", "cwt"):
+        configs = _spectral_configs(settings, kind)
+        if configs is None:
+            return True
+        for config in configs:
+            columns = config.get("signal_columns")
+            if columns is not None and any("_raw_dead_reckoning_" in str(column) for column in columns):
+                return True
+    return False
+
+
+def inactive_sequence_parameters(params, *, for_frame_output=None):
+    """Return proven unused native-extractor knobs, without inspecting a dataset.
+
+    Controls themselves remain present: removing a disabled switch could restore
+    an enabled value from the base estimator. Data-dependent equivalences such as
+    a window cap that no sequence reaches are deliberately not inferred here.
+    """
+    settings = dict(_SEQUENCE_PARAMETER_DEFAULTS)
+    settings.update(params)
+    inactive = set()
+    if not settings["filter_problematic_sequences"]:
+        inactive |= {"ideal_skew_threshold", "problematic_features_threshold", "problematic_feature_cols"}
+    if settings["motion_filter_mode"] not in {"kalman", "extended_kalman"}:
+        inactive |= {"kalman_process_noise", "kalman_measurement_noise"}
+    if not _sequence_dead_reckoning_consumed(settings):
+        inactive |= {"use_dead_reckoning", "dead_reckoning_detrend"}
+    elif not settings["use_dead_reckoning"]:
+        inactive.add("dead_reckoning_detrend")
+    if not settings["resample_modalities"]:
+        inactive |= {f"{sensor}_target_sampling_rate" for sensor in ("imu", "rot", "tof", "thm")}
+        inactive |= {"tof_native_sampling_rate", "thm_native_sampling_rate"}
+    if not HoneycombBase()._parse_modes(settings["tof_modes"]):
+        inactive.add("tof_n_sensors")
+        if not settings["resample_modalities"]:
+            inactive.add("tof_fill_mode")
+    if not HoneycombBase()._parse_modes(settings["rotation_modes"]):
+        inactive.add("fix_quaternion_sign")
+    if settings["linear_acc_mode"] != "baseline":
+        inactive |= {"use_highpass_fallback", "acceleration_units", "linear_acc_frame", "gravity_magnitude"}
+    smoothed = "smoothed" in HoneycombBase()._parse_modes(settings["acc_modes"])
+    if not smoothed:
+        inactive.add("smooth_alpha")
+    highpass = settings["linear_acc_mode"] == "baseline" and settings["use_highpass_fallback"]
+    if not highpass and (not smoothed or settings["smooth_alpha"] is not None):
+        inactive.add("window_size")
+
+    frame = str(settings["output_format"]).lower() == "frame" if for_frame_output is None else for_frame_output
+    if frame:
+        inactive |= {
+            "maxlen", "sequence_crop_mode", "padding_value", "chunk_window_size", "chunk_stride",
+            "max_windows_per_sequence", "window_cap_policy", "final_window_mode",
+            "use_chunk_stride_ratio", "chunk_stride_ratio", "add_global_context",
+        }
+    else:
+        inactive.add("frame_stats")
+        if settings["use_chunk_stride_ratio"]:
+            inactive.add("chunk_stride")
+        else:
+            inactive.add("chunk_stride_ratio")
+        if settings["max_windows_per_sequence"] is None:
+            inactive.add("window_cap_policy")
+        if settings["sequence_crop_mode"] == "none":
+            inactive.add("maxlen")
+        elif settings["maxlen"] is None:
+            inactive.add("sequence_crop_mode")
+
+    maps = {
+        "stft": {"nperseg": "nperseg", "noverlap": "noverlap", "window_type": "window_type",
+                 "scaling": "scaling", "detrend": "detrend", "use_log_scale": "use_log_scale",
+                 "frequency_bands": "frequency_bands", "window_seconds": "window_seconds"},
+        "cwt": {"wavelet": "wavelet", "max_scale": "max_scale", "n_scales": "n_scales",
+                "use_log_scale": "use_log_scale", "min_scale": "min_scale", "max_frequency": "max_frequency"},
+    }
+    for kind, fields in maps.items():
+        configs = _spectral_configs(settings, kind)
+        if configs is None:
+            continue
+        for suffix, field in fields.items():
+            if not configs or all(field in config for config in configs):
+                inactive.add(f"{kind}_{suffix}")
+        if kind == "stft" and configs and all(
+            config.get("window_seconds", settings["stft_window_seconds"]) is not None for config in configs
+        ):
+            inactive.add("stft_nperseg")
+        if kind == "cwt" and configs and all(config.get("widths") is not None for config in configs):
+            inactive |= {"cwt_n_scales", "cwt_min_scale"}
+    return inactive
+
+
+def sequence_feature_families(params):
+    """Conservative feature families for the native pipeline, before data availability."""
+    settings = dict(_SEQUENCE_PARAMETER_DEFAULTS)
+    settings.update(params)
+    families = set()
+    parse = HoneycombBase()._parse_modes
+    if (parse(settings["acc_modes"]) or parse(settings["linear_acc_modes"])
+            or settings["use_acc_magnitude"] or settings["use_linear_acc_magnitude"]):
+        families.add("acc")
+    for name, key in (("rotation", "rotation_modes"), ("tof", "tof_modes"), ("thermo", "thm_modes")):
+        if parse(settings[key]):
+            families.add(name)
+    for kind in ("stft", "cwt"):
+        configs = _spectral_configs(settings, kind)
+        if configs is None or any(config.get("signal_columns") != [] for config in configs):
+            families.add(kind)
+    return families
 
 
 class RandomForestSequenceClassifier(BaseEstimator, ClassifierMixin):
@@ -2551,7 +2733,7 @@ class RandomForestSequenceClassifier(BaseEstimator, ClassifierMixin):
         sequence_ids = pd.Index(sequence_ids)
         fill_value = "non_bfrb" if self.primary_target == "bfrb" else "Unknown"
         if isinstance(y, pd.DataFrame):
-            yy = y.copy()
+            yy = y.loc[:, [column for column in (seq_col, self.primary_target) if column in y.columns]]
             if seq_col not in yy.columns:
                 if yy.index.name == seq_col:
                     yy = yy.reset_index()
@@ -2586,8 +2768,13 @@ class RandomForestSequenceClassifier(BaseEstimator, ClassifierMixin):
             try: self.extractor_.set_params(output_format="frame")
             except Exception: pass
         validate_sequence_extractor_params(self.extractor_.get_params(), for_frame_output=True)
-        self.extractor_.fit(X)
-        frame = self.extractor_.transform_frame(X) if hasattr(self.extractor_, "transform_frame") else self.extractor_.transform(X)
+        if type(self.extractor_) is SequenceExtractor and not any(
+            method in self.extractor_.__dict__ for method in ("fit", "transform", "transform_frame")
+        ):
+            frame = self.extractor_.fit_transform(X)
+        else:
+            self.extractor_.fit(X)
+            frame = self.extractor_.transform_frame(X) if hasattr(self.extractor_, "transform_frame") else self.extractor_.transform(X)
         if not isinstance(frame, pd.DataFrame):
             raise InvalidExtractorParams("Extractor did not return a DataFrame.")
         if frame.empty:
@@ -2630,7 +2817,8 @@ class RandomForestSequenceClassifier(BaseEstimator, ClassifierMixin):
         preds = self.predict(X)
         seq_col = getattr(self.extractor_, "sequence_col", "sequence_id")
         if isinstance(y, pd.DataFrame):
-            yy = y.copy()
+            columns = dict.fromkeys((seq_col, self.primary_target, "is_target"))
+            yy = y.loc[:, [column for column in columns if column in y.columns]]
             if seq_col not in yy.columns:
                 if yy.index.name == seq_col:
                     yy = yy.reset_index()
@@ -2844,6 +3032,54 @@ def prepare_bayesian_space(param_space: Dict[str, Any]) -> Dict[str, Any]:
         else:
             out[key] = space
     return out
+
+
+def prepare_random_forest_bayesian_spaces(param_space, n_iter):
+    """Collapse redundant integer split/leaf pairs, sharing one Bayesian budget.
+
+    sklearn raises min_samples_split to at least twice min_samples_leaf. Float
+    fractions depend on the fold's row count and are deliberately left alone.
+    """
+    if not isinstance(n_iter, (int, np.integer)) or isinstance(n_iter, bool) or n_iter <= 0:
+        raise ValueError("n_iter must be a positive integer")
+    keys = {key.rsplit("__", 1)[-1]: key for key in param_space}
+    leaf_key, split_key = keys.get("min_samples_leaf"), keys.get("min_samples_split")
+    if leaf_key is None or split_key is None:
+        return [(dict(param_space), int(n_iter))]
+
+    def choices(dimension):
+        values = getattr(dimension, "categories", dimension if isinstance(dimension, list) else None)
+        if values is None or any(not isinstance(value, (int, np.integer)) or isinstance(value, bool) or value < 1 for value in values):
+            return None
+        prior = getattr(dimension, "prior", None)
+        if prior is not None and not np.allclose(prior, np.full(len(values), 1.0 / len(values))):
+            return None  # Do not silently change an explicitly weighted search.
+        return list(values)
+
+    leaves, splits = choices(param_space[leaf_key]), choices(param_space[split_key])
+    if (leaves is None or splits is None or not leaves or not splits
+            or any(split < 2 for split in splits) or n_iter < len(leaves)):
+        return [(dict(param_space), int(n_iter))]
+    grouped = []
+    redundant = False
+    for leaf in leaves:
+        effective = {}
+        for split in splits:
+            effective.setdefault(max(split, 2 * leaf), split)
+        redundant |= len(effective) < len(splits)
+        grouped.append((leaf, list(effective.values())))
+    if not redundant:
+        return [(dict(param_space), int(n_iter))]
+    from skopt.space import Categorical
+    budgets = [n_iter // len(grouped) + (index < n_iter % len(grouped)) for index in range(len(grouped))]
+    compiled = []
+    for (leaf, distinct_splits), budget in zip(grouped, budgets):
+        if budget:
+            space = dict(param_space)
+            space[leaf_key] = Categorical([leaf])
+            space[split_key] = Categorical(distinct_splits)
+            compiled.append((space, int(budget)))
+    return compiled
 
 
 class ECat:
@@ -3194,6 +3430,8 @@ class GASearchCV(BaseEstimator):
         pop_scores = [rec["mean_test_score"] for rec in pop_records]
 
         for gen in range(1, n_generations + 1):
+            if getattr(self, "search_exhausted_", False):
+                break
             if self.verbose:
                 best_gen = np.nanmax(pop_scores) if maximize else np.nanmin(pop_scores)
                 print(f"Generation {gen}/{n_generations} - current best CV score: {best_gen:.4f}")
@@ -3582,13 +3820,17 @@ class SensorAugmentor(BaseEstimator, TransformerMixin):
         skip = {self.sequence_col, self.counter_col}
         self.sensor_cols_ = [
             c for c in X.columns
-            if c not in skip and np.issubdtype(X[c].dtype, np.number)
+            if c not in skip
+            and c.startswith(("acc_", "lin_acc_", "rot_", "tof_", "thm_"))
+            and pd.api.types.is_numeric_dtype(X[c].dtype)
         ]
         self.sensor_groups_ = _detect_sensor_groups(self.sensor_cols_)
         return self
 
     def transform(self, X, y=None):
         check_is_fitted(self, "sensor_cols_")
+        if self.prob <= 0 or self.per_aug_prob <= 0 or not self.aug_names_ or not self.sensor_cols_:
+            return X
         out = X.copy()
         for seq_id, grp in out.groupby(self.sequence_col, sort=False):
             if self._rng.random() > self.prob:
@@ -3625,3 +3867,166 @@ class SensorAugmentor(BaseEstimator, TransformerMixin):
 
     def get_feature_names_out(self, input_features=None):
         return np.array(self.sensor_cols_)
+
+
+# ---------------------------------------------------------------------------
+# Dataset discovery and sequence-balanced sampling
+# ---------------------------------------------------------------------------
+
+
+def find_data_root(local_dir: str = 'data', kaggle_root: str = '/kaggle/input') -> Path:
+    """
+    Robustly find the data root directory by searching upwards from the 
+    current working directory and the calling script's directory.
+    """
+    # We only strictly require train.csv to verify the folder. 
+    # (test.csv might not be downloaded yet, or demographics might be missing in some setups)
+    required_files = ['train.csv'] 
+    
+    def check_dir(d: Path):
+        target = d / local_dir
+        if target.exists() and target.is_dir():
+            if all((target / f).exists() for f in required_files):
+                return target
+        return None
+
+    # 1. Check exact path provided (e.g., if user passes an absolute path)
+    exact_path = Path(local_dir)
+    if exact_path.exists() and exact_path.is_dir():
+        if all((exact_path / f).exists() for f in required_files):
+            print(f'Using exact path: {exact_path.resolve()}')
+            return exact_path
+
+    # Gather starting points for upward search
+    search_starts = []
+    
+    # Current working directory (handles Jupyter/VSCode running from notebooks/)
+    search_starts.append(Path.cwd())
+    
+    # Directory of this file (src/data_utils.py)
+    try:
+        search_starts.append(Path(__file__).resolve().parent)
+    except Exception:
+        pass
+        
+    # Directory of the script/notebook calling this function
+    try:
+        frame = inspect.currentframe()
+        while frame:
+            fname = frame.f_globals.get('__file__')
+            if fname:
+                search_starts.append(Path(fname).resolve().parent)
+            frame = frame.f_back
+    except Exception:
+        pass
+
+    # Remove duplicates while preserving order
+    unique_starts = []
+    for p in search_starts:
+        if p not in unique_starts:
+            unique_starts.append(p)
+
+    # 2. Search upwards from all starting points to the root of the filesystem
+    for start_path in unique_starts:
+        current = start_path.resolve()
+        for parent in [current] + list(current.parents):
+            res = check_dir(parent)
+            if res:
+                print(f'Found data folder: {res}')
+                return res
+
+    # 3. Check Kaggle environment
+    kaggle_path = Path(kaggle_root)
+    if kaggle_path.exists():
+        for candidate in kaggle_path.rglob('train.csv'):
+            target_dir = candidate.parent
+            print(f'Using Kaggle data folder: {target_dir}')
+            return target_dir
+
+    # 4. Fallback / Error
+    raise FileNotFoundError(
+        f'Could not find the dataset.\n'
+        f'Searched upwards from: {[str(p) for p in unique_starts]}\n'
+        f'Looked for a folder named "{local_dir}" containing {required_files}.\n'
+        f'Current directory: {Path.cwd()}\n'
+        f'Please ensure your CSV files are in a "data/" folder at your project root.'
+    )
+
+
+def _largest_remainder(quotas: np.ndarray, caps: np.ndarray, target: int, rng) -> np.ndarray:
+    """Round per-cell quotas to integers that sum to ``target`` without exceeding ``caps``."""
+    counts = np.minimum(np.floor(quotas).astype(int), caps)
+    remaining = int(target - counts.sum())
+    if remaining <= 0:
+        return counts
+    fractions = quotas - np.floor(quotas)
+    shuffled = rng.permutation(len(quotas))
+    order = shuffled[np.argsort(-fractions[shuffled], kind='stable')]
+    while remaining > 0:
+        added = False
+        for idx in order:
+            if remaining == 0:
+                break
+            if counts[idx] < caps[idx]:
+                counts[idx] += 1
+                remaining -= 1
+                added = True
+        if not added:
+            break
+    return counts
+
+
+def sample_balanced_split(
+    df: pd.DataFrame,
+    train_pct: float = 0.20,
+    test_pct: float = 0.05,
+    random_state: int = 42
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Split sequences into disjoint train and test sets, stratified by subject and gesture.
+
+    Each (subject, gesture) cell contributes to both sets in proportion to its size, and the
+    totals match ``train_pct`` / ``test_pct`` of all sequences. When the two fractions sum
+    to 1 every sequence is assigned to exactly one set.
+    """
+    if train_pct <= 0 or test_pct <= 0 or train_pct + test_pct > 1 + 1e-9:
+        raise ValueError('train_pct and test_pct must be positive and sum to at most 1.')
+
+    rng = np.random.default_rng(random_state)
+    # Split on the compact sequence table instead of grouping all sensor rows.
+    metadata = df[['sequence_id', 'subject', 'gesture']].drop_duplicates()
+    if metadata['sequence_id'].duplicated().any():
+        raise ValueError('Each sequence_id must have one subject and gesture.')
+    total_sequences = metadata['sequence_id'].nunique()
+    cells = [
+        group['sequence_id'].sample(frac=1, random_state=random_state).tolist()
+        for _, group in metadata.groupby(['subject', 'gesture'], observed=True)
+    ]
+    sizes = np.array([len(cell) for cell in cells])
+
+    train_target = int(round(total_sequences * train_pct))
+    n_train = _largest_remainder(sizes * train_pct, sizes, train_target, rng)
+
+    if train_pct + test_pct >= 1 - 1e-9:
+        test_target = total_sequences - int(n_train.sum())
+    else:
+        test_target = min(int(round(total_sequences * test_pct)), total_sequences - int(n_train.sum()))
+    n_test = _largest_remainder(sizes * test_pct, sizes - n_train, test_target, rng)
+
+    train_ids, test_ids = [], []
+    for cell, k_train, k_test in zip(cells, n_train, n_test):
+        train_ids.extend(cell[:k_train])
+        test_ids.extend(cell[k_train:k_train + k_test])
+
+    assert len(set(train_ids) & set(test_ids)) == 0, "Overlap detected!"
+
+    train_df = df[df['sequence_id'].isin(train_ids)]
+    test_df = df[df['sequence_id'].isin(test_ids)]
+
+    print(f"Train: {len(train_ids)} seqs | {100 * len(train_ids) / total_sequences:.1f}%")
+    print(f"Test:  {len(test_ids)} seqs  | {100 * len(test_ids) / total_sequences:.1f}%")
+    unused = total_sequences - len(train_ids) - len(test_ids)
+    if unused:
+        print(f"Unused: {unused} seqs | {100 * unused / total_sequences:.1f}%")
+
+    return train_df, test_df

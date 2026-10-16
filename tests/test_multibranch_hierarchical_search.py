@@ -7,9 +7,9 @@ import pandas as pd
 from sklearn.base import clone
 from sklearn.pipeline import Pipeline
 
-from test_multibranch_attention_sol_params import mba, ECat, EInt, make_pipeline
-from multibranch_candidate_rules import candidate_error, canonical_candidate
-from multibranch_experiment_utils import (
+from test_multibranch_utils_params import mba, ECat, EInt, make_pipeline
+from multibranch_utils import candidate_error, canonical_candidate
+from multibranch_utils import (
     HierarchicalGASearchCV,
     HierarchicalBayesSearchCV,
     candidate_score,
@@ -51,6 +51,11 @@ class CandidateHierarchyTests(unittest.TestCase):
     def setUp(self):
         self.base = make_pipeline().get_params(deep=True)
         self.X, self.y = toy_data()
+
+    def test_penalty_uses_the_direct_estimators_configured_value(self):
+        search = HierarchicalGASearchCV(DryRunMultibranch(invalid_candidate_score=-5.0), param_grid={})
+        search._initialise_rules(self.y, {})
+        self.assertEqual(search._penalty(), -5.0)
 
     def test_bert_retains_branch_cnn_but_discards_other_backbone_knobs(self):
         params = {
@@ -250,9 +255,11 @@ class HierarchicalBayesTests(unittest.TestCase):
         }).fit(self.X, self.y)
         self.assertEqual(len(FIT_LOG), 2)
         self.assertEqual(len(search.cv_results_['params']), 1)
-        self.assertGreater(search.reused_candidate_count_, 0)
+        self.assertTrue(search.search_exhausted_)
+        self.assertEqual(search.unique_candidate_count_, 1)
+        self.assertNotIn('estimator__cnn_filters', search.conditional_search_spaces_[0])
         self.assertTrue(np.isfinite(search.optimizer_results_[0].func_vals).all())
-        self.assertEqual(len(search.optimizer_results_[0].func_vals), 3)
+        self.assertEqual(len(search.optimizer_results_[0].func_vals), 1)
 
     def test_all_invalid_proposals_finish_and_tell_finite_penalties(self):
         search = self.search({
@@ -275,7 +282,7 @@ class HierarchicalBayesTests(unittest.TestCase):
             'estimator__bert_num_heads': self.Categorical([4]),
         }, n_iter=1)
         # Bayesian vector order is sorted parameter-name order.
-        with patch('skopt.Optimizer.ask', return_value=[[30, 4, 'bert']]), \
+        with patch('skopt.Optimizer.ask', return_value=[30, 4, 'bert']), \
                 patch('skopt.space.Space.rvs', return_value=[[32, 4, 'bert']]):
             search.fit(self.X, self.y)
         self.assertEqual(len(FIT_LOG), 2)

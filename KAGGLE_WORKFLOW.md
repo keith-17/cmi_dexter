@@ -1,10 +1,20 @@
 # Local development and Kaggle GPU execution
 
-Use branch `multibranch/v0/develop`, notebook
-`notebooks/multibranch_alpha.ipynb`, and the modules in `src/`.
+Use a `multibranch/*` branch, a saved experiment notebook in `notebooks/`, and
+the modules in `src/`. The default notebook is `multibranch_alpha.ipynb`.
+Shared extraction, augmentation, random forest and data helpers live in
+`src/base_utils.py`. Multibranch models and search helpers live in
+`src/multibranch_utils.py`; the interactive explorer uses
+`src/sequence_explorer_utils.py`.
 The workflow packages the saved notebook and module bytes, adding only a first
-bootstrap cell. It does not change architecture, search candidates, data filters,
-splits, or the 37 Bayesian iterations.
+bootstrap cell for every notebook. It preserves the saved architecture, search
+candidates, data filters, splits and iteration count.
+
+The training notebooks read sensor columns as `float32`, while the signal
+utilities retain their `float64` calculations. This reduces input RAM, with input
+values rounded to float32 precision. They release the unsplit frame before model
+search and keep only metadata in `y`. Random forest searches run one candidate
+at a time and parallelize tree fitting after sequence feature extraction.
 
 ## Windows setup
 
@@ -48,12 +58,17 @@ The account must have accepted the CMI competition rules and have GPU quota.
 
 `push` always rebuilds from the saved local files. Avoid concurrent submissions
 from other machines to the same kernel. `prepare` rejects the wrong Git branch.
+Use `--notebook multibranch_v1.ipynb` to package the V1 configuration. The default
+source mode embeds the exact local canonical modules. `--attached-source` is
+only appropriate when the configured source dataset already contains
+`base_utils.py` and `multibranch_utils.py`.
 
 The generated notebook lives in `kaggle_build/multibranch_attention/`. Its first
-cell reconstructs `src/*.py` in `/kaggle/working/src`, installs only missing
-scikit-optimize/PyWavelets, checks TensorFlow GPU availability, locates competition
-data (including the newer `/kaggle/input/competitions/` layout), and routes outputs
-under `/kaggle/working`. Kaggle's TensorFlow installation remains in place.
+cell reconstructs `src/*.py` in `/kaggle/working/src`; notebook imports prefer this
+snapshot over attached datasets. It uses the libraries already installed in the
+runtime. The data finder searches competition data under `/kaggle/input`,
+including the `/kaggle/input/competitions/` layout. Notebook outputs are routed
+under `/kaggle/working`.
 
 `submission.json` records the most recently prepared snapshot. After a successful
 push, `submitted.json` separately records the acknowledged Kaggle version and

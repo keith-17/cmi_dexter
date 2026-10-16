@@ -12,8 +12,8 @@ from sklearn.base import BaseEstimator, clone
 from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
 
-from test_multibranch_attention_sol_params import mba, ECat
-from multibranch_experiment_utils import candidate_score, refit_valid_candidate
+from test_multibranch_utils_params import mba, ECat
+from multibranch_utils import candidate_score, refit_valid_candidate
 
 
 class DummyCandidate(BaseEstimator):
@@ -85,7 +85,7 @@ class AuxiliaryTests(unittest.TestCase):
                     est.fit(None, None)
 
     def test_fit_routes_all_heads_and_phase_provider_per_partition(self):
-        from base_utils_sol import SequenceExtractor
+        from base_utils import SequenceExtractor
         extractor = SequenceExtractor(output_format='chunks', chunk_window_size=2, chunk_stride=2)
         def fit(extractor_self, frame):
             extractor_self.feature_names_in_ = np.array(['acc_x'])
@@ -139,7 +139,7 @@ class AuxiliaryTests(unittest.TestCase):
 
     def test_evolutionary_all_failed_does_not_refit(self):
         X, y = np.zeros((6, 1)), np.zeros(6)
-        from base_utils_sol import GASearchCV
+        from base_utils import GASearchCV
         search = GASearchCV(Pipeline([('estimator', DummyCandidate())]),
                             param_grid={'estimator__bad': ECat([True])}, cv=2,
                             population_size=2, tournament_size=2, generations=1,

@@ -12,7 +12,7 @@ from scipy.spatial.transform import Rotation
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from base_utils_sol import (  # noqa: E402
+from base_utils import (  # noqa: E402
     CWTExtractor,
     IMUExtractor,
     InvalidExtractorParams,

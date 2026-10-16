@@ -12,20 +12,20 @@ def code_cell(cell_id, source):
 
 
 def main():
-    metadata = workflow.prepare(notebook_name='multibranch_v1.ipynb', use_attached_source=True)
+    metadata = workflow.prepare(notebook_name='multibranch_v1.ipynb')
     path = workflow.BUILD / metadata['code_file']
     notebook = json.loads(path.read_text(encoding='utf-8'))
     # Sample only after validating the complete input and recording exclusions.
     data_index = next(i for i, cell in enumerate(notebook['cells'])
-                      if 'raw_train_df' in ''.join(cell.get('source', [])))
+                      if '# Load and prepare training data' in ''.join(cell.get('source', [])))
     notebook['cells'].insert(data_index + 1, code_cell('gpu-check-data', '''
 print('GPU VALIDATION ONLY: up to 16 sequences per target class, 2 candidates, 1 epoch.')
 _sequence_labels = train_df[['sequence_id', TARGET_COL]].drop_duplicates('sequence_id')
-_selected_ids = _sequence_labels.groupby(TARGET_COL, group_keys=False).apply(
-    lambda group: group.sample(n=min(16, len(group)), random_state=random_state)
-)['sequence_id']
+_shuffled_labels = _sequence_labels.sample(frac=1, random_state=random_state)
+_selected_ids = _shuffled_labels.groupby(TARGET_COL, sort=False).head(16)['sequence_id']
 train_df = train_df[train_df['sequence_id'].isin(_selected_ids)].copy()
 print('Validation subset sequences:', train_df['sequence_id'].nunique())
+del _sequence_labels, _shuffled_labels, _selected_ids
 '''))
     train_index = next(i for i, cell in enumerate(notebook['cells'])
                        if 'search.fit(X_train' in ''.join(cell.get('source', [])))
