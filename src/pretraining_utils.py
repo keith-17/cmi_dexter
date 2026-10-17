@@ -239,11 +239,17 @@ class MaskedSensorSequence(_DataSequence):
         target_frame = frame[[self.sequence_col] + self.columns].copy()
         target_frame.loc[:, self.columns] = np.where(valid, values, 0.0)
         clean = self._raw_chunks(target_frame, self.columns)
-        mask_frame = frame[[self.sequence_col]].copy()
-        mask_frame[self.columns] = masked.astype(np.float32)
+        # Construct the wide ToF/sensor blocks together. Inserting hundreds of
+        # columns separately fragments pandas frames and floods training logs.
+        mask_frame = pd.concat([
+            frame[[self.sequence_col]],
+            pd.DataFrame(masked.astype(np.float32), index=frame.index, columns=self.columns),
+        ], axis=1)
         hidden = self._raw_chunks(mask_frame, self.columns)["X"]
-        valid_frame = frame[[self.sequence_col]].copy()
-        valid_frame[self.columns] = valid.astype(np.float32)
+        valid_frame = pd.concat([
+            frame[[self.sequence_col]],
+            pd.DataFrame(valid.astype(np.float32), index=frame.index, columns=self.columns),
+        ], axis=1)
         originally_valid = self._raw_chunks(valid_frame, self.columns)["X"]
         if extracted["X"].shape[:2] != clean["X"].shape[:2]:
             raise ValueError("Raw reconstruction targets and extracted timesteps do not align.")

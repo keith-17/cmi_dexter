@@ -61,6 +61,163 @@ class PretrainingWorkflowTests(unittest.TestCase):
         (root / 'kaggle/pretraining-kernel-metadata.json').write_text(json.dumps(metadata), encoding='utf-8')
         return metadata
 
+    def large_fixtures(self, root):
+        pilot_metadata = self.fixture(root)
+        profiles = {}
+        for model in (1, 2):
+            profile = f'model{model}-large'
+            filename = f'multibranch_pretraining_model{model}_large.ipynb'
+            notebook = minimal_notebook()
+            notebook['cells'][0]['source'] = [
+                f"MODEL_VARIANT = 'model_{model}'\n", 'FIRST_RUN = False\n',
+                "search_mode = 'bayes'\n", 'n_iter = 37\n',
+                f"experiment_name = 'multibranch_pretraining_model{model}_large'\n",
+                'quick_save = True\n', 'LARGE_RUN = True\n',
+                "PRETRAINING_SOURCE_CHOICES = ['non_target', 'all', 'target', 'baseline']\n",
+                'COVER_PRETRAINING_SOURCES = True\n',
+                "INITIAL_PRETRAINING_SOURCES = ['non_target', 'all', 'target', 'baseline']\n",
+                "LARGE_FIXED_PARAMS = {'estimator__bert_d_model': 128}\n",
+            ]
+            metadata = {**pilot_metadata, 'id': f'owner/{profile}', 'code_file': filename}
+            (root / 'notebooks' / filename).write_text(json.dumps(notebook), encoding='utf-8')
+            (root / 'kaggle' / f'pretraining-model{model}-large-kernel-metadata.json').write_text(
+                json.dumps(metadata), encoding='utf-8')
+            profiles[profile] = metadata
+        return profiles
+
+    def test_profile_defaults_keep_all_three_experiments_isolated(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profiles = self.large_fixtures(root)
+            with patch.object(workflow, 'ROOT', root), patch.object(workflow, 'BUILD', root / 'build'), \
+                    patch.object(workflow, 'METADATA', root / 'kaggle/pretraining-kernel-metadata.json'), \
+                    patch.object(workflow.subprocess, 'run', return_value=SimpleNamespace(stdout='ssl/v0/develop\n')):
+                workflow.prepare(first_run=True)
+                pilot_before = (root / 'build/submission.json').read_bytes()
+                for profile, metadata in profiles.items():
+                    with self.subTest(profile=profile):
+                        self.assertEqual(workflow.prepare(profile=profile), metadata)
+                        build = root / 'build' / profile
+                        manifest = json.loads((build / 'submission.json').read_text())
+                        self.assertEqual(manifest['profile'], profile)
+                        self.assertEqual(manifest['kernel'], metadata['id'])
+                        self.assertEqual(manifest['notebook'], metadata['code_file'])
+                        self.assertEqual(manifest['search_iterations'], 37)
+                        self.assertTrue(manifest['configuration']['LARGE_RUN'])
+                        self.assertTrue(manifest['configuration']['COVER_PRETRAINING_SOURCES'])
+                        self.assertEqual(len(manifest['configuration']['INITIAL_PRETRAINING_SOURCES']), 4)
+                        self.assertEqual(manifest['configuration']['LARGE_FIXED_PARAMS'],
+                                         {'estimator__bert_d_model': 128})
+                        workflow.record_submission('Kernel version 1 successfully pushed.', profile=profile)
+                        submitted = json.loads((build / 'submitted.json').read_text())
+                        self.assertEqual(submitted['kernel'], metadata['id'])
+                self.assertEqual((root / 'build/submission.json').read_bytes(), pilot_before)
+                self.assertFalse((root / 'build/submitted.json').exists())
+
+    def test_large_profile_honours_explicit_notebook_and_packaged_iteration_override(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.large_fixtures(root)
+            original = root / 'notebooks/multibranch_pretraining_model1_large.ipynb'
+            override = root / 'notebooks/custom-model1.ipynb'
+            override.write_bytes(original.read_bytes())
+            with patch.object(workflow, 'ROOT', root), patch.object(workflow, 'BUILD', root / 'build'), \
+                    patch.object(workflow.subprocess, 'run', return_value=SimpleNamespace(stdout='ssl/v0/develop\n')):
+                metadata = workflow.prepare(iterations=39, notebook_name=override.name, profile='model1-large')
+            manifest = json.loads((root / 'build/model1-large/submission.json').read_text())
+            self.assertEqual(manifest['notebook'], override.name)
+            self.assertEqual(manifest['search_iterations'], 39)
+            self.assertEqual(workflow.literal_configuration(json.loads(override.read_text()))['n_iter'], 37)
+            packaged = json.loads((root / 'build/model1-large' / metadata['code_file']).read_text())
+            self.assertEqual(workflow.literal_configuration(packaged)['n_iter'], 39)
+
+    def test_large_profile_refuses_wrong_model_and_pilot_flag(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.large_fixtures(root)
+            with patch.object(workflow, 'ROOT', root), patch.object(workflow, 'BUILD', root / 'build'), \
+                    patch.object(workflow.subprocess, 'run', return_value=SimpleNamespace(stdout='ssl/v0/develop\n')):
+                with self.assertRaisesRegex(RuntimeError, 'requires MODEL_VARIANT'):
+                    workflow.prepare(notebook_name='multibranch_pretraining_model2_large.ipynb', profile='model1-large')
+                with self.assertRaisesRegex(RuntimeError, 'reserved for'):
+                    workflow.prepare(first_run=True, profile='model1-large')
+                with self.assertRaisesRegex(RuntimeError, 'Unknown experiment profile'):
+                    workflow.prepare(profile='unrecognised')
+
+    def test_cli_routes_status_pull_and_default_notebook_to_selected_profile(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profiles = self.large_fixtures(root)
+            with patch.object(workflow, 'ROOT', root), patch.object(workflow, 'BUILD', root / 'build'):
+                for profile, metadata in profiles.items():
+                    for action in ('status', 'pull'):
+                        with self.subTest(profile=profile, action=action), \
+                                patch.object(workflow.sys, 'argv', ['workflow', action, '--profile', profile]), \
+                                patch.object(workflow, 'cli') as cli:
+                            workflow.main()
+                            self.assertEqual(cli.call_args.args[:3], ('kernels', action, metadata['id']))
+                            if action == 'pull':
+                                self.assertEqual(cli.call_args.args[4], str(root / 'build' / profile / 'remote'))
+                with patch.object(workflow.sys, 'argv', ['workflow', 'prepare', '--profile', 'model2-large']), \
+                        patch.object(workflow, 'prepare') as prepare:
+                    workflow.main()
+                    prepare.assert_called_once_with(None, None, False, profile='model2-large')
+                with patch.object(workflow.sys, 'argv', ['workflow', 'push', '--profile', 'model2-large']), \
+                        patch.object(workflow, 'prepare', return_value=profiles['model2-large']), \
+                        patch.object(workflow, 'cli', return_value='Kernel version 2 successfully pushed.') as cli, \
+                        patch.object(workflow, 'record_submission') as record:
+                    workflow.main()
+                    cli.assert_called_once_with('kernels', 'push', '-p', str(root / 'build/model2-large'))
+                    record.assert_called_once_with('Kernel version 2 successfully pushed.', profile='model2-large')
+
+    def test_download_refuses_wrong_profile_even_when_kernel_matches(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            build = root / 'build/model1-large'
+            build.mkdir(parents=True)
+            metadata = {'id': 'owner/model1-large'}
+            (build / 'submitted.json').write_text(json.dumps({
+                'kernel': metadata['id'], 'profile': 'model2-large'}))
+            with patch.object(workflow, 'ROOT', root), patch.object(workflow, 'BUILD', root / 'build'), \
+                    patch.object(workflow, 'cli', return_value='KernelWorkerStatus.COMPLETE'):
+                with self.assertRaisesRegex(RuntimeError, 'Submitted profile differs'):
+                    workflow.download(metadata, profile='model1-large')
+
+    def test_large_download_uses_its_own_submission_and_result_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            notebook = minimal_notebook()
+            metadata = {'id': 'owner/model2-large', 'code_file': 'model2.ipynb'}
+            build = root / 'build/model2-large'
+            build.mkdir(parents=True)
+            manifest = {'kernel': metadata['id'], 'profile': 'model2-large', 'version': 1,
+                        'submitted_source_sha256': workflow.source_hash(notebook),
+                        'csv_names': ['model2_cv.csv']}
+            (build / 'submitted.json').write_text(json.dumps(manifest))
+            (root / 'build/submitted.json').write_text('pilot submission must stay untouched')
+
+            def fake_cli(*args):
+                self.assertEqual(args[2], metadata['id'])
+                if args[1] == 'status':
+                    return 'KernelWorkerStatus.COMPLETE'
+                target = Path(args[args.index('-p') + 1])
+                self.assertTrue(target.is_relative_to(build))
+                target.mkdir(parents=True, exist_ok=True)
+                if args[1] == 'pull':
+                    (target / 'kernel-metadata.json').write_text(json.dumps(metadata))
+                    (target / metadata['code_file']).write_text(json.dumps(notebook))
+                elif args[1] == 'output':
+                    (target / 'model2_cv.csv').write_text('score\n0.6\n')
+                return ''
+
+            with patch.object(workflow, 'ROOT', root), patch.object(workflow, 'BUILD', root / 'build'), \
+                    patch.object(workflow, 'cli', side_effect=fake_cli):
+                destination = workflow.download(metadata, profile='model2-large')
+                self.assertEqual(destination.parent, root / 'results/kaggle_pretraining/model2-large')
+                self.assertTrue((destination / 'model2_cv.csv').exists())
+                self.assertEqual(json.loads((destination / 'local_submission.json').read_text()), manifest)
+                self.assertEqual((root / 'build/submitted.json').read_text(), 'pilot submission must stay untouched')
+
     def test_packages_exact_modules_and_preserves_local_notebook(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -173,6 +330,18 @@ class PretrainingWorkflowTests(unittest.TestCase):
                 self.assertEqual(json.loads((build / 'submitted.json').read_text())['version'], 1)
                 with self.assertRaisesRegex(RuntimeError, 'did not acknowledge'):
                     workflow.record_submission('Unknown push status')
+
+    def test_record_submission_tracks_actual_kaggle_slug(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary)
+            (build / 'submission.json').write_text(json.dumps({'kernel': 'owner/requested-name'}))
+            with patch.object(workflow, 'BUILD', build):
+                workflow.record_submission('Kernel version 1 successfully pushed. '
+                                           'Please check progress at https://www.kaggle.com/code/owner/title-derived-name')
+            manifest = json.loads((build / 'submitted.json').read_text())
+            self.assertEqual(manifest['requested_kernel'], 'owner/requested-name')
+            self.assertEqual(manifest['kernel'], 'owner/title-derived-name')
+            self.assertEqual(manifest['url'], 'https://www.kaggle.com/code/owner/title-derived-name')
 
     def test_download_verifies_source_before_collecting_results(self):
         with tempfile.TemporaryDirectory() as temporary:

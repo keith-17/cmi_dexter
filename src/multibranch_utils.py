@@ -2623,7 +2623,9 @@ def conditional_bayesian_spaces(param_space, base_params=None):
     pooling choice cannot accidentally hide parameters used by another choice.
     Large/non-finite controller products use conservative pruning instead of
     enumerating a potentially enormous search space. This does not allocate the
-    Bayesian evaluation budget or reject invalid model settings.
+    Bayesian evaluation budget or reject invalid model settings. An explicit
+    pretraining-source dimension is stratified into fixed-source optimizers so
+    the shared round-robin budget covers every requested training condition.
     """
     from itertools import product
     from skopt.space import Categorical, Dimension, Integer, check_dimension
@@ -2665,6 +2667,10 @@ def conditional_bayesian_spaces(param_space, base_params=None):
     by_name = {_name(key): key for key in dimensions}
     architecture_key = by_name.get("temporal_architecture")
     gru_key = by_name.get("use_bigru")
+    source_key = by_name.get("extractor__pretraining_source")
+    sources = finite_values(dimensions[source_key]) if source_key is not None else None
+    if source_key is not None and sources is None:
+        raise ValueError("extractor__pretraining_source requires finite categorical choices.")
     base = _merged({}, base_params)
     prefix = "estimator__" if any(
         key.startswith("estimator__") for key in (*dimensions, *(base_params or {}))
@@ -2743,7 +2749,13 @@ def conditional_bayesian_spaces(param_space, base_params=None):
             compiled = {key: dimension for key, dimension in subspace.items() if key in keep}
             if not compiled:
                 compiled[prefix + "temporal_architecture"] = Categorical([architecture])
-            spaces.append(compiled)
+            if source_key is None:
+                spaces.append(compiled)
+            else:
+                for source in sources:
+                    source_space = dict(compiled)
+                    source_space[source_key] = Categorical([source])
+                    spaces.append(source_space)
     return spaces
 
 
@@ -3026,7 +3038,22 @@ if BayesSearchCV is not None:
         lists of spaces retain skopt's per-entry budgets. Proposals are sequential
         to avoid speculative fits and keep model memory bounded; CV parallelism
         still follows n_jobs. Invalid and cached proposals do not spend the budget.
+        Assign ``candidate_checkpoint_path`` after construction to atomically
+        save cumulative CV results after each completed candidate, before the
+        next optimizer update. It is disabled by default.
         """
+        candidate_checkpoint_path = None
+
+        def _checkpoint_candidates(self, results):
+            if self.candidate_checkpoint_path is None:
+                return
+            destination = Path(self.candidate_checkpoint_path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_name(destination.name + '.tmp')
+            pd.DataFrame(results).to_csv(temporary, index=False)
+            temporary.replace(destination)
+            self.candidate_checkpoint_count_ = len(results['params'])
+
         def fit(self, X, y=None, groups=None, callback=None, **fit_params):
             self._initialise_rules(y, fit_params)
             self._effective_score_cache_ = {}
@@ -3165,7 +3192,9 @@ if BayesSearchCV is not None:
                         available.pop(cursor)
                         continue
                     point, active, key = candidate
-                    score = self._search_score(evaluate_candidates([active]))
+                    results = evaluate_candidates([active])
+                    self._checkpoint_candidates(results)
+                    score = self._search_score(results)
                     if not np.isfinite(score):
                         score = self._penalty()
                     self._effective_score_cache_[key] = score
@@ -3184,7 +3213,7 @@ if BayesSearchCV is not None:
                 if self._invalid_fallback_ is None:
                     raise ValueError('No candidate could be proposed from the conditional search spaces.')
                 # Retain one finite-penalty CV row for existing all-failed reporting.
-                evaluate_candidates([self._invalid_fallback_])
+                self._checkpoint_candidates(evaluate_candidates([self._invalid_fallback_]))
             self._optim_results = [state['optimizer'].get_result() for state in states
                                    if state['optimizer'].yi]
             if self.proposal_limit_reached_:

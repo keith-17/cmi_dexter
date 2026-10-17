@@ -26,6 +26,19 @@ BUILD = ROOT / 'kaggle_build' / 'multibranch_pretraining'
 METADATA = ROOT / 'kaggle' / 'pretraining-kernel-metadata.json'
 NOTEBOOK_NAME = 'multibranch_pretraining_v1.ipynb'
 REQUIRED_MODULES = {'base_utils.py', 'multibranch_utils.py', 'pretraining_utils.py'}
+PROFILES = ('pilot', 'model1-large', 'model2-large')
+
+
+def profile_paths(profile='pilot'):
+    """Keep independently submitted experiments and their provenance isolated."""
+    if profile == 'pilot':
+        return BUILD, METADATA, NOTEBOOK_NAME
+    if profile not in PROFILES:
+        raise RuntimeError(f'Unknown experiment profile: {profile!r}.')
+    model = 'model1' if profile == 'model1-large' else 'model2'
+    return (BUILD / profile,
+            ROOT / 'kaggle' / f'pretraining-{model}-large-kernel-metadata.json',
+            f'multibranch_pretraining_{model}_large.ipynb')
 
 
 def source_hash(notebook):
@@ -104,14 +117,16 @@ def validate_first_run(configuration, iterations):
         raise RuntimeError('First-run crop augmentation must preserve the complete sequence.')
 
 
-def prepare(iterations=None, notebook_name=NOTEBOOK_NAME, first_run=False):
+def prepare(iterations=None, notebook_name=None, first_run=False, profile='pilot'):
+    build, metadata_path, default_notebook = profile_paths(profile)
+    notebook_name = notebook_name or default_notebook
     if iterations is not None and iterations < 1:
         raise RuntimeError('Iteration override must be a positive integer.')
     branch = subprocess.run(['git', 'branch', '--show-current'], cwd=ROOT,
                             capture_output=True, text=True, check=True).stdout.strip()
     if not branch.startswith('ssl/'):
         raise RuntimeError('Switch to the ssl/* development branch before preparing this experiment.')
-    metadata = json.loads(METADATA.read_text(encoding='utf-8'))
+    metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
     if metadata.get('enable_gpu') is not False or metadata.get('enable_tpu', False):
         raise RuntimeError('This workflow requires CPU metadata (GPU and TPU disabled).')
     if metadata.get('is_private') is not True:
@@ -149,6 +164,12 @@ def prepare(iterations=None, notebook_name=NOTEBOOK_NAME, first_run=False):
         configuration_cell['source'] = configuration_source.splitlines(keepends=True)
     actual_iterations = iterations if iterations is not None else original_iterations
     configuration = literal_configuration(notebook)
+    if profile != 'pilot':
+        expected_model = 'model_1' if profile == 'model1-large' else 'model_2'
+        if configuration.get('MODEL_VARIANT') != expected_model:
+            raise RuntimeError(f'{profile} requires MODEL_VARIANT = {expected_model!r}.')
+        if first_run:
+            raise RuntimeError('--first-run is reserved for the five-candidate pilot profile.')
     if first_run:
         validate_first_run(configuration, actual_iterations)
     modules = sorted((ROOT / 'src').glob('*.py'))
@@ -174,23 +195,26 @@ def prepare(iterations=None, notebook_name=NOTEBOOK_NAME, first_run=False):
         'cell_type': 'code', 'id': 'kaggle-pretraining-source-bootstrap', 'metadata': {},
         'execution_count': None, 'outputs': [], 'source': bootstrap.splitlines(keepends=True),
     })
-    BUILD.mkdir(parents=True, exist_ok=True)
-    (BUILD / metadata['code_file']).write_text(json.dumps(notebook, indent=1), encoding='utf-8')
-    (BUILD / 'kernel-metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
+    build.mkdir(parents=True, exist_ok=True)
+    (build / metadata['code_file']).write_text(json.dumps(notebook, indent=1), encoding='utf-8')
+    (build / 'kernel-metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
     experiment_name = configuration.get('experiment_name', 'multibranch_pretraining_v1')
     suffixes = ('cv',) if configuration.get('quick_save', False) else ('cv', 'best', 'holdout')
     manifest = {
+        'profile': profile, 'notebook': notebook_name,
         'branch': branch, 'kernel': metadata['id'], 'source_mode': 'local_snapshot',
         'dataset_sources': metadata.get('dataset_sources', []),
         'competition_sources': metadata.get('competition_sources', []),
         'device': 'cpu', 'first_run_validated': first_run,
-        'configuration': {key: configuration[key] for key in (
+        'configuration': {key: configuration[key] for key in configuration if key in (
             'MODEL_VARIANT', 'FIRST_RUN', 'experiment_name', 'search_mode',
             'population_size', 'generations', 'quick_save', 'n_splits', 'train_size',
             'PRETRAINING_EPOCHS', 'FINETUNING_EPOCHS', 'FIRST_RUN_FIXED_PARAMS',
             'FIRST_RUN_PRETRAINING_EPOCHS', 'FIRST_RUN_FINETUNING_EPOCHS',
             'BASE_LEARNING_RATE', 'PRETRAINING_SOURCE_CHOICES',
-        ) if key in configuration},
+            'BAYES_INITIAL_POINTS_PER_SOURCE', 'REFERENCE_HOLDOUT_SCORE',
+        ) or key.startswith(('LARGE_', 'COVER_', 'INITIAL_PRETRAINING_'))
+            or 'SOURCE_COVERAGE' in key},
         'search_iterations': actual_iterations, 'iteration_override': iterations,
         'created_utc': datetime.now(timezone.utc).isoformat(),
         'submitted_source_sha256': source_hash(notebook),
@@ -198,18 +222,26 @@ def prepare(iterations=None, notebook_name=NOTEBOOK_NAME, first_run=False):
                    for path in [notebook_path, *modules]},
         'csv_names': [f'{experiment_name}_{suffix}.csv' for suffix in suffixes],
     }
-    (BUILD / 'submission.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
-    print(f'Prepared {metadata["id"]} from branch {branch}: {BUILD}')
+    (build / 'submission.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+    print(f'Prepared {metadata["id"]} from branch {branch}: {build}')
     return metadata
 
 
-def record_submission(output):
+def record_submission(output, profile='pilot'):
+    build, _, _ = profile_paths(profile)
     match = re.search(r'Kernel version (\d+) successfully pushed', output)
     if not match:
         raise RuntimeError('Kaggle did not acknowledge a submitted version. Check status before retrying.')
-    manifest = json.loads((BUILD / 'submission.json').read_text(encoding='utf-8'))
+    manifest = json.loads((build / 'submission.json').read_text(encoding='utf-8'))
+    # New kernels may receive the slug derived from their title. Track the
+    # acknowledged URL instead of assuming Kaggle retained the requested ID.
+    acknowledged = re.search(r'https://www\.kaggle\.com/code/([A-Za-z0-9_-]+/[A-Za-z0-9_-]+)', output)
+    if acknowledged:
+        manifest['requested_kernel'] = manifest['kernel']
+        manifest['kernel'] = acknowledged.group(1)
+        manifest['url'] = acknowledged.group(0)
     manifest.update(version=int(match.group(1)), acknowledged_utc=datetime.now(timezone.utc).isoformat())
-    (BUILD / 'submitted.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+    (build / 'submitted.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
 
 
 def collect(download_dir, destination, expected_names):
@@ -235,18 +267,21 @@ def collect(download_dir, destination, expected_names):
         print(f'Results downloaded to {target}')
 
 
-def download(metadata):
+def download(metadata, profile='pilot'):
+    build, _, _ = profile_paths(profile)
     status = cli('kernels', 'status', metadata['id'])
     if 'KernelWorkerStatus.COMPLETE' not in status:
         raise RuntimeError('Kernel is not complete; result download postponed.')
-    submitted = BUILD / 'submitted.json'
+    submitted = build / 'submitted.json'
     if not submitted.exists():
         raise RuntimeError('No acknowledged local submission; cannot associate remote outputs with this run.')
     manifest = json.loads(submitted.read_text(encoding='utf-8'))
     if manifest['kernel'] != metadata['id']:
         raise RuntimeError('Submitted kernel differs from configured pretraining kernel.')
+    if manifest.get('profile', 'pilot') != profile:
+        raise RuntimeError('Submitted profile differs from selected experiment profile.')
     stamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')
-    downloaded = BUILD / 'downloads' / stamp
+    downloaded = build / 'downloads' / stamp
     remote = downloaded / 'remote'
     remote.mkdir(parents=True)
     cli('kernels', 'pull', metadata['id'], '-p', str(remote), '-m')
@@ -258,6 +293,8 @@ def download(metadata):
     pattern = '(?:' + '|'.join(re.escape(name) for name in sorted(expected_names)) + ')$'
     cli('kernels', 'output', metadata['id'], '-p', str(downloaded), '--file-pattern', pattern)
     destination = ROOT / 'results' / 'kaggle_pretraining' / stamp
+    if profile != 'pilot':
+        destination = ROOT / 'results' / 'kaggle_pretraining' / profile / stamp
     collect(downloaded, destination, expected_names)
     shutil.copy2(submitted, destination / 'local_submission.json')
     for log in downloaded.glob('*.log'):
@@ -265,33 +302,36 @@ def download(metadata):
     return destination
 
 
-def wait_for_results(metadata, interval=60):
+def wait_for_results(metadata, interval=60, profile='pilot'):
+    build, _, _ = profile_paths(profile)
     while True:
         status = cli('kernels', 'status', metadata['id'])
-        (BUILD / 'last_status.txt').write_text(status, encoding='utf-8')
+        (build / 'last_status.txt').write_text(status, encoding='utf-8')
         if 'KernelWorkerStatus.COMPLETE' in status:
-            return download(metadata)
+            return download(metadata, profile=profile)
         if any(f'KernelWorkerStatus.{state}' in status for state in ('ERROR', 'CANCEL', 'CANCELLED', 'CANCELED')):
-            (BUILD / 'failure.log').write_text(cli('kernels', 'logs', metadata['id']), encoding='utf-8')
-            raise RuntimeError(f'Kaggle execution failed. Inspect {BUILD / "failure.log"}.')
+            (build / 'failure.log').write_text(cli('kernels', 'logs', metadata['id']), encoding='utf-8')
+            raise RuntimeError(f'Kaggle execution failed. Inspect {build / "failure.log"}.')
         time.sleep(min(60, max(15, interval)))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['prepare', 'push', 'status', 'logs', 'wait', 'download', 'pull'])
+    parser.add_argument('--profile', choices=PROFILES, default='pilot', help='Isolated experiment profile (default: pilot).')
     parser.add_argument('--iterations', type=int, help='Override packaged n_iter only; local notebook stays unchanged.')
-    parser.add_argument('--notebook', default=NOTEBOOK_NAME, help='Notebook filename within notebooks/.')
+    parser.add_argument('--notebook', default=None, help='Notebook filename within notebooks/; defaults to the selected profile.')
     parser.add_argument('--first-run', action='store_true', help='Require the explicit model-1 five-candidate Bayesian baseline.')
     parser.add_argument('--interval', type=int, default=60, help='Status polling interval, clamped to 15–60 seconds.')
     parser.add_argument('--follow', action='store_true', help='Continuously follow logs instead of one snapshot.')
     args = parser.parse_args()
     try:
-        metadata = json.loads(METADATA.read_text(encoding='utf-8'))
+        build, metadata_path, _ = profile_paths(args.profile)
+        metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
         if args.action in {'prepare', 'push'}:
-            metadata = prepare(args.iterations, args.notebook, args.first_run)
+            metadata = prepare(args.iterations, args.notebook, args.first_run, profile=args.profile)
             if args.action == 'push':
-                record_submission(cli('kernels', 'push', '-p', str(BUILD)))
+                record_submission(cli('kernels', 'push', '-p', str(build)), profile=args.profile)
         elif args.action == 'status':
             cli('kernels', 'status', metadata['id'])
         elif args.action == 'logs':
@@ -300,11 +340,11 @@ def main():
             else:
                 cli('kernels', 'logs', metadata['id'])
         elif args.action == 'pull':
-            cli('kernels', 'pull', metadata['id'], '-p', str(BUILD / 'remote'), '-m')
+            cli('kernels', 'pull', metadata['id'], '-p', str(build / 'remote'), '-m')
         elif args.action == 'wait':
-            wait_for_results(metadata, args.interval)
+            wait_for_results(metadata, args.interval, profile=args.profile)
         else:
-            download(metadata)
+            download(metadata, profile=args.profile)
     except subprocess.CalledProcessError as error:
         print(error.stdout or '', end='', file=sys.stderr)
         print(error.stderr or '', end='', file=sys.stderr)

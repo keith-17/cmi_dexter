@@ -64,3 +64,41 @@ remote copy inside the build directory without replacing the local notebook.
 To run another model or budget, change notebook configuration and omit
 `--first-run`. `--iterations` changes only the packaged candidate count; it never
 edits the local notebook.
+
+## Large model searches
+
+The large profiles have independent private CPU kernels, notebook files, build
+directories and acknowledged submission manifests. Submitting model 2 cannot
+replace the model-1 run or its local provenance.
+
+```powershell
+.venv-kaggle\Scripts\python.exe scripts/kaggle_pretraining_experiment.py push --profile model1-large --iterations 37
+.venv-kaggle\Scripts\python.exe scripts/kaggle_pretraining_experiment.py push --profile model2-large --iterations 37
+.venv-kaggle\Scripts\python.exe scripts/kaggle_pretraining_experiment.py status --profile model1-large
+.venv-kaggle\Scripts\python.exe scripts/kaggle_pretraining_experiment.py download --profile model2-large
+```
+
+`scripts/create_large_pretraining_notebooks.py` recreates both notebooks from the
+V1 pretraining layout and `kaggle/pretraining-large-reference.json`. That reference
+contains the supplied result (holdout 0.8118239920); its JSON values are treated
+as configuration data. The original downloaded file is never edited.
+
+Both profiles use the reference feature spaces, chunk length 200, 70/30 wearer
+splits, 128-filter four-layer temporal CNN branches, static width 100, AdamW at
+1e-4, cosine scheduling and batch normalization. Fine-tuning allows 150 epochs
+with patience 20; pretraining allows 30 with patience 8. Augmentation, dropout,
+weight decay and label smoothing are zero. BERT width, depth, heads, feed-forward
+width and final dense width vary over explicitly listed large settings.
+
+The reference predates the temporal BERT builder. Its per-branch CNN dictionaries
+do not control BERT; the active `branch_cnn_*` parameters are set explicitly here.
+Thermal processing is therefore larger than in the original, and its 225-unit
+branch embeddings are not reproduced. The original score also used a different
+partition, so it must not be treated as a directly comparable wearer holdout.
+
+Bayesian compilation splits the four pretraining sources into fixed-source
+subspaces under one shared budget and visits them in round-robin order. A
+37-candidate run allocates 9/9/9/10 evaluations, with all four sources visited in
+the first four valid candidates. Each optimizer uses three initial points, then
+adapts to its observations. The search writes an atomic `partial_cv.csv` after
+each completed evaluation; final CSV and holdout evaluation retain the V1 flow.
