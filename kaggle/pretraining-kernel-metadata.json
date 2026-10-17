@@ -1,0 +1,18 @@
+{
+  "id": "keithmarange/multibranch-pretraining-v1-cpu",
+  "title": "Multibranch pretraining v1 CPU",
+  "code_file": "multibranch_pretraining_v1.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "keithmarange/eliaslongagain"
+  ],
+  "competition_sources": [
+    "cmi-detect-behavior-with-sensor-data"
+  ],
+  "kernel_sources": []
+}

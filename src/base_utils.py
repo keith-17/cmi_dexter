@@ -1772,6 +1772,28 @@ class SequenceExtractor(HoneycombBase):
         ideal_skew_threshold: float = 1.35,
         problematic_features_threshold: int = 6,
         problematic_feature_cols: Optional[List[str]] = None,
+        # --- optional training-stage selection (never applied at prediction) ---
+        pretraining_source: str = "non_target",
+        pretraining_label_column: str = "gesture",
+        pretraining_include_classes: Optional[List[Any]] = None,
+        pretraining_exclude_classes: Optional[List[Any]] = None,
+        pretraining_filters: Optional[Dict[str, Any]] = None,
+        pretraining_exclude_filters: Optional[Dict[str, Any]] = None,
+        pretraining_min_length: Optional[int] = None,
+        pretraining_max_length: Optional[int] = None,
+        pretraining_sample_fraction: float = 1.0,
+        pretraining_max_sequences: Optional[int] = None,
+        pretraining_max_sequences_per_class: Optional[int] = None,
+        pretraining_balance_classes: bool = False,
+        pretraining_random_state: Optional[int] = 42,
+        finetuning_source: str = "target",
+        finetuning_label_column: str = "bfrb",
+        finetuning_include_classes: Optional[List[Any]] = None,
+        finetuning_exclude_classes: Optional[List[Any]] = None,
+        finetuning_filters: Optional[Dict[str, Any]] = None,
+        finetuning_exclude_filters: Optional[Dict[str, Any]] = None,
+        stage_target_column: str = "is_target",
+        stage_target_values: Any = (1,),
     ):
         self.acc_modes = acc_modes
         self.linear_acc_modes = linear_acc_modes
@@ -1855,6 +1877,28 @@ class SequenceExtractor(HoneycombBase):
         self.problematic_features_threshold = problematic_features_threshold
         self.problematic_feature_cols = problematic_feature_cols
 
+        self.pretraining_source = pretraining_source
+        self.pretraining_label_column = pretraining_label_column
+        self.pretraining_include_classes = pretraining_include_classes
+        self.pretraining_exclude_classes = pretraining_exclude_classes
+        self.pretraining_filters = pretraining_filters
+        self.pretraining_exclude_filters = pretraining_exclude_filters
+        self.pretraining_min_length = pretraining_min_length
+        self.pretraining_max_length = pretraining_max_length
+        self.pretraining_sample_fraction = pretraining_sample_fraction
+        self.pretraining_max_sequences = pretraining_max_sequences
+        self.pretraining_max_sequences_per_class = pretraining_max_sequences_per_class
+        self.pretraining_balance_classes = pretraining_balance_classes
+        self.pretraining_random_state = pretraining_random_state
+        self.finetuning_source = finetuning_source
+        self.finetuning_label_column = finetuning_label_column
+        self.finetuning_include_classes = finetuning_include_classes
+        self.finetuning_exclude_classes = finetuning_exclude_classes
+        self.finetuning_filters = finetuning_filters
+        self.finetuning_exclude_filters = finetuning_exclude_filters
+        self.stage_target_column = stage_target_column
+        self.stage_target_values = stage_target_values
+
         self._rebuild_components()
 
     def set_params(self, **params):
@@ -1863,6 +1907,142 @@ class SequenceExtractor(HoneycombBase):
         return self
 
     # ---------- helpers ----------
+
+    @staticmethod
+    def _selection_values(value):
+        value = _coerce_search_value(value)
+        if isinstance(value, (list, tuple, set, np.ndarray, pd.Index)):
+            return list(value)
+        return [value]
+
+    def _stage_metadata(self, X, y, columns):
+        """Read sequence-constant metadata without copying the sensor frame."""
+        if not isinstance(X, pd.DataFrame) or self.sequence_col not in X:
+            raise InvalidExtractorParams(
+                f"Training-stage selection requires a DataFrame containing {self.sequence_col!r}."
+            )
+        metadata = X[[self.sequence_col]].drop_duplicates().set_index(self.sequence_col)
+        for column in dict.fromkeys(columns):
+            source = X if column in X else y
+            if not isinstance(source, pd.DataFrame):
+                raise InvalidExtractorParams(f"Training-stage selection requires metadata column {column!r}.")
+            if self.sequence_col not in source and source.index.name == self.sequence_col:
+                source = source.reset_index()
+            if self.sequence_col not in source or column not in source:
+                raise InvalidExtractorParams(f"Training-stage selection requires metadata column {column!r}.")
+            values = source[[self.sequence_col, column]].drop_duplicates()
+            if values[self.sequence_col].duplicated().any():
+                raise InvalidExtractorParams(
+                    f"Selection column {column!r} must be constant within each sequence."
+                )
+            metadata[column] = values.set_index(self.sequence_col)[column].reindex(metadata.index)
+        return metadata
+
+    def _select_stage_sequences(self, X, y, stage):
+        """Select whole original sequences before extraction or augmentation.
+
+        These selectors are opt-in methods for staged estimators. Ordinary
+        ``fit``/``transform`` retain their existing behaviour. Include filters
+        are combined with AND; any exclude-filter match removes a sequence.
+        All sampling operates on original sequences, never individual rows.
+        """
+        source = str(getattr(self, f"{stage}_source")).strip().lower().replace("-", "_")
+        valid_sources = {"all", "target", "non_target"}
+        if stage == "pretraining":
+            valid_sources.add("baseline")
+        if source not in valid_sources:
+            raise InvalidExtractorParams(f"{stage}_source must be one of {sorted(valid_sources)}.")
+        if source == "baseline":
+            metadata = self._stage_metadata(X, y, [])
+            self.pretraining_selection_summary_ = {
+                "source": source, "input_sequences": int(len(metadata)), "selected_sequences": 0,
+            }
+            return X.iloc[:0].copy()
+        label_column = getattr(self, f"{stage}_label_column")
+        include = _coerce_search_value(getattr(self, f"{stage}_include_classes"))
+        exclude = _coerce_search_value(getattr(self, f"{stage}_exclude_classes"))
+        filters = _coerce_search_value(getattr(self, f"{stage}_filters"))
+        exclusions = _coerce_search_value(getattr(self, f"{stage}_exclude_filters"))
+        filters = {} if filters is None else filters
+        exclusions = {} if exclusions is None else exclusions
+        if not isinstance(filters, dict) or not isinstance(exclusions, dict):
+            raise InvalidExtractorParams(f"{stage} filters must be dictionaries of column-to-values.")
+        require_labels = include is not None or exclude is not None
+        if stage == "pretraining":
+            require_labels = require_labels or self.pretraining_balance_classes or self.pretraining_max_sequences_per_class is not None
+        columns = list(filters) + list(exclusions)
+        if source != "all":
+            columns.append(self.stage_target_column)
+        if require_labels:
+            columns.append(label_column)
+        metadata = self._stage_metadata(X, y, columns)
+        keep = pd.Series(True, index=metadata.index)
+        if source != "all":
+            target = metadata[self.stage_target_column].isin(self._selection_values(self.stage_target_values))
+            known = metadata[self.stage_target_column].notna()
+            keep &= known & (target if source == "target" else ~target)
+        if include is not None:
+            keep &= metadata[label_column].isin(self._selection_values(include))
+        if exclude is not None:
+            keep &= ~metadata[label_column].isin(self._selection_values(exclude))
+        for column, values in filters.items():
+            keep &= metadata[column].isin(self._selection_values(values))
+        for column, values in exclusions.items():
+            keep &= ~metadata[column].isin(self._selection_values(values))
+        if stage == "pretraining":
+            lengths = X.groupby(self.sequence_col, sort=False).size().reindex(metadata.index)
+            minimum = self.pretraining_min_length
+            maximum = self.pretraining_max_length
+            for name, value in (("pretraining_min_length", minimum), ("pretraining_max_length", maximum)):
+                if value is not None and (isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 1):
+                    raise InvalidExtractorParams(f"{name} must be a positive integer or None.")
+            if minimum is not None and maximum is not None and minimum > maximum:
+                raise InvalidExtractorParams("pretraining_min_length cannot exceed pretraining_max_length.")
+            if minimum is not None:
+                keep &= lengths >= minimum
+            if maximum is not None:
+                keep &= lengths <= maximum
+        selected = metadata.loc[keep]
+        if stage == "pretraining":
+            fraction = self.pretraining_sample_fraction
+            if isinstance(fraction, bool) or not isinstance(fraction, (int, float, np.number)) or not np.isfinite(fraction) or not 0 < fraction <= 1:
+                raise InvalidExtractorParams("pretraining_sample_fraction must lie in (0, 1].")
+            for name in ("pretraining_max_sequences", "pretraining_max_sequences_per_class"):
+                value = getattr(self, name)
+                if value is not None and (isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 1):
+                    raise InvalidExtractorParams(f"{name} must be a positive integer or None.")
+            if len(selected):
+                rng = np.random.default_rng(self.pretraining_random_state)
+                if self.pretraining_balance_classes or self.pretraining_max_sequences_per_class is not None:
+                    if selected[label_column].isna().any():
+                        raise InvalidExtractorParams("Class-balanced pretraining requires non-missing class labels.")
+                    groups = selected.groupby(label_column, sort=False, observed=True).indices
+                    limit = min(map(len, groups.values())) if self.pretraining_balance_classes else len(selected)
+                    if self.pretraining_max_sequences_per_class is not None:
+                        limit = min(limit, self.pretraining_max_sequences_per_class)
+                    chosen = np.concatenate([rng.choice(indices, size=min(limit, len(indices)), replace=False) for indices in groups.values()])
+                    selected = selected.iloc[np.sort(chosen)]
+                count = max(1, int(np.floor(len(selected) * fraction)))
+                if self.pretraining_max_sequences is not None:
+                    count = min(count, self.pretraining_max_sequences)
+                if count < len(selected):
+                    chosen = np.sort(rng.choice(len(selected), size=count, replace=False))
+                    selected = selected.iloc[chosen]
+        selected_ids = selected.index
+        setattr(self, f"{stage}_selection_summary_", {
+            "source": source,
+            "input_sequences": int(len(metadata)),
+            "selected_sequences": int(len(selected_ids)),
+        })
+        return X.loc[X[self.sequence_col].isin(selected_ids)].copy()
+
+    def select_pretraining_sequences(self, X, y=None):
+        """Apply configurable source/class/metadata/length sampling for pretraining."""
+        return self._select_stage_sequences(X, y, "pretraining")
+
+    def select_finetuning_sequences(self, X, y=None):
+        """Select the supervised target task without changing inference inputs."""
+        return self._select_stage_sequences(X, y, "finetuning")
 
     def _build_stft_defaults(self) -> Dict[str, Any]:
         return dict(

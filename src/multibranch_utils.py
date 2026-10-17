@@ -949,6 +949,10 @@ def _build_temporal_fusion_model(
         outputs=outputs,
         name=f"multibranch_{architecture}",
     )
+    # Non-output tensors let an optional pretraining decoder reuse the exact
+    # temporal backbone without changing the ordinary classifier's graph.
+    model._temporal_representation_tensor = auxiliary_x
+    model._temporal_mask_tensor = auxiliary_mask
     return model
 
 
@@ -1622,8 +1626,13 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
             raise ValueError("Orientation auxiliary labels are missing for one or more sequences.")
         return labels.to_numpy()
 
+    def _classification_targets(self, labels):
+        if str(self.loss_name).lower() == "cce":
+            return tf.keras.utils.to_categorical(labels, len(self.classes_))
+        return labels
+
     def _prepare_training_targets(self, labels, sequence_ids, y, phase_labels=None):
-        targets = {"predictions": labels}
+        targets = {"predictions": self._classification_targets(labels)}
         weights = {}
         weights["predictions"] = (self.sample_weight_ if self.sample_weight_ is not None else np.ones(len(labels), dtype=np.float32))
         if self.use_orientation_aux_head:
@@ -1668,7 +1677,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
             targets[spec["name"]] = raw
             weights[spec["name"]] = np.ones(len(labels), dtype=np.float32)
         if len(targets) == 1:
-            return labels, self.sample_weight_
+            return targets["predictions"], self.sample_weight_
         return targets, weights
 
     def _transform_to_branches(self, X):
@@ -1766,41 +1775,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
             raise ValueError(f"Missing auxiliary labels for {column!r}.")
         return aligned.to_numpy()
 
-    def _fit_impl(self, X, y=None, **fit_params):
-        if y is None:
-            raise ValueError("MultiBranchSequenceClassifier requires y.")
-        # Validate the effective architecture before expensive feature extraction.
-        # Inactive search dimensions remain sklearn parameters but cannot reject
-        # an otherwise valid model (e.g. shared CNN depth under a BERT backbone).
-        error = candidate_error(
-            {}, self.get_params(deep=True), y=y,
-            phase_labels_available=fit_params.get("phase_labels") is not None,
-        )
-        if error is not None:
-            raise ValueError(error)
-        if (
-            self.use_phase_aux_head and self.phase_label_provider is None
-            and self.validation_split is not None and self.validation_split > 0
-            and fit_params.get("validation_phase_labels") is None
-        ):
-            raise ValueError("Internal validation with phase supervision requires validation_phase_labels or phase_label_provider.")
-        if not TENSORFLOW_AVAILABLE:
-            raise ImportError("TensorFlow/Keras is required to fit MultiBranchSequenceClassifier.")
-        if tf is not None:
-            # Serial population trials must release Keras graph/name state.
-            tf.keras.backend.clear_session()
-
-        self.extractor_ = clone(self.extractor) if self.extractor is not None else self._default_extractor()
-        self._validate_extractor()
-        self.custom_aux_heads_ = _normalise_aux_heads(self.custom_aux_heads)
-
-        X_train, X_validation = self._split_validation_sequences(X, y)
-        validation_data = None
-        if X_validation is not None and X_validation.empty:
-            raise ValueError("Internal validation split produced no validation rows.")
-
-        X_train = self._augment_training_sequences(X_train)
-
+    def _extract_training_chunks(self, X_train):
         try:
             # STFT/CWT features summarize each whole sequence; split sequences
             # first, then fit/transform train and validation partitions separately.
@@ -1821,11 +1796,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
             else:
                 self.extractor_.fit(X_train)
                 train_chunks = self.extractor_.transform_chunks(X_train)
-            validation_chunks = (
-                self.extractor_.transform_chunks(X_validation)
-                if X_validation is not None
-                else None
-            )
+            return train_chunks
         except InvalidExtractorParams:
             raise
         except Exception as exc:
@@ -1833,122 +1804,12 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
                 f"MultiBranchSequenceClassifier fit failed during extraction: {exc}"
             ) from exc
 
-        self.feature_names_ = list(train_chunks["feature_names"])
-        self.branch_groups_ = self._branch_groups(
-            self.feature_names_,
-            separate_derived_imu=(
-                str(self.temporal_architecture).lower() != "bigru_attention"
-                or self.use_bigru
-                or self.use_orientation_aux_head
-                or self.use_phase_aux_head
-                or bool(self.custom_aux_heads_)
-            ),
-        )
-        if not self.branch_groups_:
-            raise InvalidExtractorParams("No modality branches could be built from the extracted features.")
-
-        branch_arrays = self._split_branches(train_chunks["X"], train_chunks["mask"], self.branch_groups_)
-        if not all(np.isfinite(arr).all() for arr in branch_arrays.values()):
-            raise InvalidExtractorParams("Feature extraction produced non-finite branch values.")
-
-        time_series_shapes = {name: arr.shape[1:] for name, arr in branch_arrays.items() if name in TIME_SERIES_BRANCHES}
-        static_shapes = {name: arr.shape[1] for name, arr in branch_arrays.items() if name in STATIC_BRANCHES}
-        self.input_order_ = list(time_series_shapes.keys()) + list(static_shapes.keys())
-        self.model_requires_mask_ = (
-            str(self.temporal_architecture).lower() != "bigru_attention"
-            or self.use_bigru
-            or self.use_orientation_aux_head
-            or self.use_phase_aux_head
-            or bool(self.custom_aux_heads_)
-        )
-        model_inputs = self._model_inputs(branch_arrays, train_chunks["mask"])
-
-        y_aligned = self._align_y(train_chunks["sequence_ids"], y)
-        self.le_ = LabelEncoder()
-        self.le_.fit(y_aligned)
-        self.classes_ = self.le_.classes_
-        y_enc = self.le_.transform(y_aligned)
-
-        validation_arrays = None
-        validation_inputs = None
-        validation_labels = None
-        if validation_chunks is not None:
-            train_chunk_ids = pd.Index(train_chunks["sequence_ids"])
-            validation_chunk_ids = pd.Index(validation_chunks["sequence_ids"])
-            overlap = train_chunk_ids.unique().intersection(validation_chunk_ids.unique())
-            if not overlap.empty:
-                raise AssertionError(f"Sequence leakage between train and validation chunks: {overlap.tolist()}")
-            validation_arrays = self._split_branches(
-                validation_chunks["X"], validation_chunks["mask"], self.branch_groups_
-            )
-            validation_inputs = self._model_inputs(validation_arrays, validation_chunks["mask"])
-            validation_y = self._align_y(validation_chunks["sequence_ids"], y)
-            try:
-                validation_labels = self.le_.transform(validation_y)
-            except ValueError as exc:
-                raise ValueError(
-                    "Internal validation contains a target class absent from the training split."
-                ) from exc
-            validation_data = (validation_inputs, validation_labels)
-
-        sample_weight = None
-        if self.class_weight_mode == "balanced":
-            uniq_classes = np.unique(y_enc)
-            weights = compute_class_weight("balanced", classes=uniq_classes, y=y_enc)
-            weight_map = dict(zip(uniq_classes, weights))
-            sample_weight = np.array([weight_map[v] for v in y_enc], dtype=np.float32)
-        self.sample_weight_ = sample_weight
-
-        if self.use_orientation_aux_head:
-            orientation_training = self._orientation_labels(train_chunks["sequence_ids"], y)
-            self.orientation_le_ = LabelEncoder().fit(orientation_training)
-        self.custom_aux_encoders_ = {}
-        for spec in self.custom_aux_heads_:
-            raw = self._aux_column_labels(train_chunks["sequence_ids"], y, spec["target"])
-            if spec["task"] == "classification":
-                encoder = LabelEncoder().fit(raw)
-                self.custom_aux_encoders_[spec["name"]] = encoder
-                spec["num_classes"] = len(encoder.classes_)
-        phase_training = fit_params.pop("phase_labels", None)
-        phase_validation = fit_params.pop("validation_phase_labels", None)
-        if self.use_phase_aux_head and self.phase_label_provider is not None:
-            phase_training = self.phase_label_provider(X_train, train_chunks)
-            if validation_chunks is not None:
-                phase_validation = self.phase_label_provider(X_validation, validation_chunks)
-        del X_train, X_validation
-        self._current_chunk_mask = train_chunks["mask"]
-        train_targets, model_sample_weight = self._prepare_training_targets(
-            y_enc,
-            train_chunks["sequence_ids"],
-            y,
-            phase_training,
-        )
-        if validation_chunks is not None and (
-            self.use_orientation_aux_head or self.use_phase_aux_head or bool(self.custom_aux_heads_)
-        ):
-            self._current_chunk_mask = validation_chunks["mask"]
-            training_weights = self.sample_weight_
-            self.sample_weight_ = None
-            validation_targets, validation_weights = self._prepare_training_targets(
-                validation_labels,
-                validation_chunks["sequence_ids"],
-                y,
-                phase_validation,
-            )
-            self.sample_weight_ = training_weights
-            validation_data = (validation_inputs, validation_targets, validation_weights)
-
-        # Branch indexing creates independent arrays. Providers have now read
-        # the original chunk dictionaries; release their duplicate feature
-        # tensors before TensorFlow copies the model inputs to its runtime.
-        del train_chunks["X"]
-        if validation_chunks is not None:
-            del validation_chunks["X"]
-
-        self.model_ = build_multibranch_model(
+    def _build_model(self, time_series_shapes, static_shapes, n_classes, sequence_length, **overrides):
+        """Build the shared backbone; subclasses may supply stage-specific heads/settings."""
+        settings = dict(
             time_series_shapes=time_series_shapes,
             static_shapes=static_shapes,
-            n_classes=len(self.classes_),
+            n_classes=n_classes,
             branch_filters=self.branch_filters,
             branch_kernel_sizes=self.branch_kernel_sizes,
             branch_pool_sizes=self.branch_pool_sizes,
@@ -2020,11 +1881,182 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
             fusion_dropout=self.fusion_dropout,
             use_orientation_aux_head=self.use_orientation_aux_head,
             use_phase_aux_head=self.use_phase_aux_head,
-            orientation_num_classes=(len(self.orientation_le_.classes_) if self.use_orientation_aux_head else self.orientation_num_classes),
+            orientation_num_classes=(len(self.orientation_le_.classes_) if self.use_orientation_aux_head and hasattr(self, "orientation_le_") else self.orientation_num_classes),
             custom_aux_heads=self.custom_aux_heads_,
             orientation_loss_weight=self.orientation_loss_weight,
             phase_loss_weight=self.phase_loss_weight,
-            sequence_length=train_chunks["mask"].shape[1],
+            sequence_length=sequence_length,
+        )
+
+        settings.update(overrides)
+        return build_multibranch_model(**settings)
+
+    def _before_supervised_fit(self, *, time_series_shapes, static_shapes, sequence_length,
+                               model_inputs, train_targets, sample_weight, validation_data):
+        """Optional pretraining hook; the ordinary classifier has no extra stage."""
+        return None
+
+    def _fit_impl(self, X, y=None, **fit_params):
+        if y is None:
+            raise ValueError("MultiBranchSequenceClassifier requires y.")
+        # Validate the effective architecture before expensive feature extraction.
+        # Inactive search dimensions remain sklearn parameters but cannot reject
+        # an otherwise valid model (e.g. shared CNN depth under a BERT backbone).
+        error = candidate_error(
+            {}, self.get_params(deep=True), y=y,
+            phase_labels_available=fit_params.get("phase_labels") is not None,
+        )
+        if error is not None:
+            raise ValueError(error)
+        if (
+            self.use_phase_aux_head and self.phase_label_provider is None
+            and self.validation_split is not None and self.validation_split > 0
+            and fit_params.get("validation_phase_labels") is None
+        ):
+            raise ValueError("Internal validation with phase supervision requires validation_phase_labels or phase_label_provider.")
+        if not TENSORFLOW_AVAILABLE:
+            raise ImportError("TensorFlow/Keras is required to fit MultiBranchSequenceClassifier.")
+        if tf is not None:
+            # Serial population trials must release Keras graph/name state.
+            tf.keras.backend.clear_session()
+
+        self.extractor_ = clone(self.extractor) if self.extractor is not None else self._default_extractor()
+        self._validate_extractor()
+        self.custom_aux_heads_ = _normalise_aux_heads(self.custom_aux_heads)
+
+        X_train, X_validation = self._split_validation_sequences(X, y)
+        validation_data = None
+        if X_validation is not None and X_validation.empty:
+            raise ValueError("Internal validation split produced no validation rows.")
+
+        X_train = self._augment_training_sequences(X_train)
+
+        train_chunks = self._extract_training_chunks(X_train)
+        validation_chunks = (
+            self.extractor_.transform_chunks(X_validation)
+            if X_validation is not None else None
+        )
+
+        self.feature_names_ = list(train_chunks["feature_names"])
+        self.branch_groups_ = self._branch_groups(
+            self.feature_names_,
+            separate_derived_imu=(
+                str(self.temporal_architecture).lower() != "bigru_attention"
+                or self.use_bigru
+                or self.use_orientation_aux_head
+                or self.use_phase_aux_head
+                or bool(self.custom_aux_heads_)
+            ),
+        )
+        if not self.branch_groups_:
+            raise InvalidExtractorParams("No modality branches could be built from the extracted features.")
+
+        branch_arrays = self._split_branches(train_chunks["X"], train_chunks["mask"], self.branch_groups_)
+        if not all(np.isfinite(arr).all() for arr in branch_arrays.values()):
+            raise InvalidExtractorParams("Feature extraction produced non-finite branch values.")
+
+        time_series_shapes = {name: arr.shape[1:] for name, arr in branch_arrays.items() if name in TIME_SERIES_BRANCHES}
+        static_shapes = {name: arr.shape[1] for name, arr in branch_arrays.items() if name in STATIC_BRANCHES}
+        self.input_order_ = list(time_series_shapes.keys()) + list(static_shapes.keys())
+        self.model_requires_mask_ = (
+            str(self.temporal_architecture).lower() != "bigru_attention"
+            or self.use_bigru
+            or self.use_orientation_aux_head
+            or self.use_phase_aux_head
+            or bool(self.custom_aux_heads_)
+        )
+        model_inputs = self._model_inputs(branch_arrays, train_chunks["mask"])
+
+        y_aligned = self._align_y(train_chunks["sequence_ids"], y)
+        self.le_ = LabelEncoder()
+        self.le_.fit(y_aligned)
+        self.classes_ = self.le_.classes_
+        y_enc = self.le_.transform(y_aligned)
+
+        validation_arrays = None
+        validation_inputs = None
+        validation_labels = None
+        if validation_chunks is not None:
+            train_chunk_ids = pd.Index(train_chunks["sequence_ids"])
+            validation_chunk_ids = pd.Index(validation_chunks["sequence_ids"])
+            overlap = train_chunk_ids.unique().intersection(validation_chunk_ids.unique())
+            if not overlap.empty:
+                raise AssertionError(f"Sequence leakage between train and validation chunks: {overlap.tolist()}")
+            validation_arrays = self._split_branches(
+                validation_chunks["X"], validation_chunks["mask"], self.branch_groups_
+            )
+            validation_inputs = self._model_inputs(validation_arrays, validation_chunks["mask"])
+            validation_y = self._align_y(validation_chunks["sequence_ids"], y)
+            try:
+                validation_labels = self.le_.transform(validation_y)
+            except ValueError as exc:
+                raise ValueError(
+                    "Internal validation contains a target class absent from the training split."
+                ) from exc
+            validation_data = (validation_inputs, self._classification_targets(validation_labels))
+
+        sample_weight = None
+        if self.class_weight_mode == "balanced":
+            uniq_classes = np.unique(y_enc)
+            weights = compute_class_weight("balanced", classes=uniq_classes, y=y_enc)
+            weight_map = dict(zip(uniq_classes, weights))
+            sample_weight = np.array([weight_map[v] for v in y_enc], dtype=np.float32)
+        self.sample_weight_ = sample_weight
+
+        if self.use_orientation_aux_head:
+            orientation_training = self._orientation_labels(train_chunks["sequence_ids"], y)
+            self.orientation_le_ = LabelEncoder().fit(orientation_training)
+        self.custom_aux_encoders_ = {}
+        for spec in self.custom_aux_heads_:
+            raw = self._aux_column_labels(train_chunks["sequence_ids"], y, spec["target"])
+            if spec["task"] == "classification":
+                encoder = LabelEncoder().fit(raw)
+                self.custom_aux_encoders_[spec["name"]] = encoder
+                spec["num_classes"] = len(encoder.classes_)
+        phase_training = fit_params.pop("phase_labels", None)
+        phase_validation = fit_params.pop("validation_phase_labels", None)
+        if self.use_phase_aux_head and self.phase_label_provider is not None:
+            phase_training = self.phase_label_provider(X_train, train_chunks)
+            if validation_chunks is not None:
+                phase_validation = self.phase_label_provider(X_validation, validation_chunks)
+        del X_train, X_validation
+        self._current_chunk_mask = train_chunks["mask"]
+        train_targets, model_sample_weight = self._prepare_training_targets(
+            y_enc,
+            train_chunks["sequence_ids"],
+            y,
+            phase_training,
+        )
+        if validation_chunks is not None and (
+            self.use_orientation_aux_head or self.use_phase_aux_head or bool(self.custom_aux_heads_)
+        ):
+            self._current_chunk_mask = validation_chunks["mask"]
+            training_weights = self.sample_weight_
+            self.sample_weight_ = None
+            validation_targets, validation_weights = self._prepare_training_targets(
+                validation_labels,
+                validation_chunks["sequence_ids"],
+                y,
+                phase_validation,
+            )
+            self.sample_weight_ = training_weights
+            validation_data = (validation_inputs, validation_targets, validation_weights)
+
+        # Branch indexing creates independent arrays. Providers have now read
+        # the original chunk dictionaries; release their duplicate feature
+        # tensors before TensorFlow copies the model inputs to its runtime.
+        del train_chunks["X"]
+        if validation_chunks is not None:
+            del validation_chunks["X"]
+
+        self.model_ = self._build_model(
+            time_series_shapes, static_shapes, len(self.classes_), train_chunks["mask"].shape[1],
+        )
+        self._before_supervised_fit(
+            time_series_shapes=time_series_shapes, static_shapes=static_shapes,
+            sequence_length=train_chunks["mask"].shape[1], model_inputs=model_inputs,
+            train_targets=train_targets, sample_weight=model_sample_weight,
+            validation_data=validation_data,
         )
 
         cb = self._build_callbacks(has_validation_data=validation_data is not None)
