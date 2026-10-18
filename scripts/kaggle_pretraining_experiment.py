@@ -38,7 +38,7 @@ def profile_paths(profile='pilot'):
     model = 'model1' if profile == 'model1-large' else 'model2'
     return (BUILD / profile,
             ROOT / 'kaggle' / f'pretraining-{model}-large-kernel-metadata.json',
-            f'multibranch_pretraining_{model}_large.ipynb')
+            'multibranch_pretraining.ipynb' if model == 'model1' else 'multibranch_ssl.ipynb')
 
 
 def source_hash(notebook):
@@ -134,6 +134,8 @@ def prepare(iterations=None, notebook_name=None, first_run=False, profile='pilot
     notebook_path = ROOT / 'notebooks' / notebook_name
     if notebook_path.resolve().parent != (ROOT / 'notebooks').resolve():
         raise RuntimeError('Notebook must be directly inside the notebooks directory.')
+    if not notebook_path.exists() and profile == 'pilot' and notebook_name == NOTEBOOK_NAME:
+        notebook_path = ROOT / 'archive' / 'notebooks' / NOTEBOOK_NAME
     notebook = json.loads(notebook_path.read_text(encoding='utf-8'))
     iteration_cells = []
     for cell in notebook['cells']:

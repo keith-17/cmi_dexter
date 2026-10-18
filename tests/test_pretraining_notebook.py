@@ -29,7 +29,7 @@ from base_utils import ECat, EFloat, EInt, SensorAugmentor, SequenceExtractor
 class PretrainingNotebookTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.notebook = json.loads((ROOT / "notebooks/multibranch_pretraining_v1.ipynb").read_text(encoding="utf-8"))
+        cls.notebook = json.loads((ROOT / "archive/notebooks/multibranch_pretraining_v1.ipynb").read_text(encoding="utf-8"))
         cls.original = json.loads((ROOT / "notebooks/multibranch_v1.ipynb").read_text(encoding="utf-8"))
 
     def source(self, index):

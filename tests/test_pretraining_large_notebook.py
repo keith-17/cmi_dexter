@@ -65,7 +65,7 @@ class LargePretrainingNotebookTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.notebooks = {
-            variant: json.loads((ROOT / f"notebooks/multibranch_pretraining_{variant}_large.ipynb").read_text(encoding="utf-8"))
+            variant: json.loads((ROOT / "notebooks" / ("multibranch_pretraining.ipynb" if variant == "model1" else "multibranch_ssl.ipynb")).read_text(encoding="utf-8"))
             for variant in ("model1", "model2")
         }
         cls.original = json.loads((ROOT / "notebooks/multibranch_v1.ipynb").read_text(encoding="utf-8"))

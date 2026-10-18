@@ -43,7 +43,7 @@ def recordings():
 class PretrainingIntegrationContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.notebook = json.loads((ROOT / 'notebooks/multibranch_pretraining_v1.ipynb').read_text(encoding='utf-8'))
+        cls.notebook = json.loads((ROOT / 'archive/notebooks/multibranch_pretraining_v1.ipynb').read_text(encoding='utf-8'))
 
     def source(self, index):
         return ''.join(self.notebook['cells'][index]['source'])

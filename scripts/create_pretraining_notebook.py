@@ -465,7 +465,7 @@ print('Epochs:', PRETRAINING_EPOCHS, 'pretraining +', FINETUNING_EPOCHS, 'fine-t
             cell["outputs"] = []
         cell["metadata"].pop("execution", None)
         cell["metadata"].pop("papermill", None)
-    destination = ROOT / "notebooks/multibranch_pretraining_v1.ipynb"
+    destination = ROOT / "archive/notebooks/multibranch_pretraining_v1.ipynb"
     destination.write_text(json.dumps(notebook, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(destination)
 

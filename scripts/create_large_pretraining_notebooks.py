@@ -24,7 +24,7 @@ def replace_assignment(source, name, value):
 
 
 def generate(model, reference):
-    notebook = json.loads((ROOT / 'notebooks/multibranch_pretraining_v1.ipynb').read_text(encoding='utf-8'))
+    notebook = json.loads((ROOT / 'archive/notebooks/multibranch_pretraining_v1.ipynb').read_text(encoding='utf-8'))
 
     def source(index):
         return ''.join(notebook['cells'][index]['source'])
@@ -194,7 +194,8 @@ print('Balanced source budget: 9 or 10 candidates each, interleaved; total:', n_
                 raise ValueError('Generated notebooks must not define functions.')
             cell['outputs'] = []
             cell['execution_count'] = None
-    path = ROOT / 'notebooks' / f'{name}.ipynb'
+    filename = 'multibranch_pretraining.ipynb' if model == 1 else 'multibranch_ssl.ipynb'
+    path = ROOT / 'notebooks' / filename
     path.write_text(json.dumps(notebook, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
     metadata = json.loads((ROOT / 'kaggle/pretraining-kernel-metadata.json').read_text(encoding='utf-8'))
     metadata.update(id=f'keithmarange/multibranch-model-{model}-large-cpu-bayes-37',

@@ -1,7 +1,7 @@
 {
   "id": "keithmarange/multibranch-model-2-large-cpu-bayes-37",
   "title": "Multibranch model 2 large CPU Bayes 37",
-  "code_file": "multibranch_pretraining_model2_large.ipynb",
+  "code_file": "multibranch_ssl.ipynb",
   "language": "python",
   "kernel_type": "notebook",
   "is_private": true,

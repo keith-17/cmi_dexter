@@ -1,6 +1,10 @@
 # Multibranch pretraining experiments
 
-`notebooks/multibranch_pretraining_v1.ipynb` follows the multibranch v1 workflow.
+The active notebooks are `notebooks/multibranch_pretraining.ipynb` (supervised
+pretraining) and `notebooks/multibranch_ssl.ipynb` (masked SSL). Both follow the
+multibranch v1 workflow. The original five-candidate pilot is retained at
+`archive/notebooks/multibranch_pretraining_v1.ipynb` for reproducibility; the
+legacy `pilot` workflow profile resolves that archived notebook automatically.
 It calls the sequence extractor in `src/base_utils.py` and the staged models in
 `src/pretraining_utils.py`. Set `MODEL_VARIANT` to `model_1` for supervised
 gesture pretraining or `model_2` for masked-signal self-supervision. The branches

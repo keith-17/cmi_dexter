@@ -66,7 +66,7 @@ class PretrainingWorkflowTests(unittest.TestCase):
         profiles = {}
         for model in (1, 2):
             profile = f'model{model}-large'
-            filename = f'multibranch_pretraining_model{model}_large.ipynb'
+            filename = 'multibranch_pretraining.ipynb' if model == 1 else 'multibranch_ssl.ipynb'
             notebook = minimal_notebook()
             notebook['cells'][0]['source'] = [
                 f"MODEL_VARIANT = 'model_{model}'\n", 'FIRST_RUN = False\n',
@@ -118,7 +118,7 @@ class PretrainingWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             self.large_fixtures(root)
-            original = root / 'notebooks/multibranch_pretraining_model1_large.ipynb'
+            original = root / 'notebooks/multibranch_pretraining.ipynb'
             override = root / 'notebooks/custom-model1.ipynb'
             override.write_bytes(original.read_bytes())
             with patch.object(workflow, 'ROOT', root), patch.object(workflow, 'BUILD', root / 'build'), \
@@ -138,7 +138,7 @@ class PretrainingWorkflowTests(unittest.TestCase):
             with patch.object(workflow, 'ROOT', root), patch.object(workflow, 'BUILD', root / 'build'), \
                     patch.object(workflow.subprocess, 'run', return_value=SimpleNamespace(stdout='ssl/v0/develop\n')):
                 with self.assertRaisesRegex(RuntimeError, 'requires MODEL_VARIANT'):
-                    workflow.prepare(notebook_name='multibranch_pretraining_model2_large.ipynb', profile='model1-large')
+                    workflow.prepare(notebook_name='multibranch_ssl.ipynb', profile='model1-large')
                 with self.assertRaisesRegex(RuntimeError, 'reserved for'):
                     workflow.prepare(first_run=True, profile='model1-large')
                 with self.assertRaisesRegex(RuntimeError, 'Unknown experiment profile'):
@@ -396,7 +396,7 @@ class PretrainingWorkflowTests(unittest.TestCase):
         self.assertEqual(metadata['competition_sources'], existing['competition_sources'])
 
     def test_actual_notebook_preserves_v1_layout_and_first_cpu_configuration(self):
-        notebook = json.loads((ROOT / 'notebooks' / workflow.NOTEBOOK_NAME).read_text(encoding='utf-8'))
+        notebook = json.loads((ROOT / 'archive/notebooks' / workflow.NOTEBOOK_NAME).read_text(encoding='utf-8'))
         original = json.loads((ROOT / 'notebooks/multibranch_v1.ipynb').read_text(encoding='utf-8'))
         self.assertEqual([cell['cell_type'] for cell in notebook['cells']],
                          [cell['cell_type'] for cell in original['cells']])
