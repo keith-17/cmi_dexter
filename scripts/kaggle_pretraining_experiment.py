@@ -175,8 +175,11 @@ def prepare(iterations=None, notebook_name=None, first_run=False, profile='pilot
     if first_run:
         validate_first_run(configuration, actual_iterations)
     modules = sorted((ROOT / 'src').glob('*.py'))
-    if not REQUIRED_MODULES <= {path.name for path in modules}:
-        raise RuntimeError(f'Required Python utility modules are missing: {sorted(REQUIRED_MODULES)}.')
+    protocol_search = 'VALIDATION_PARAM_SPACE' in configuration
+    required_modules = REQUIRED_MODULES | ({'pretraining_search.py'} if protocol_search else set())
+    missing_modules = required_modules - {path.name for path in modules}
+    if missing_modules:
+        raise RuntimeError(f'Required Python utility modules are missing: {sorted(missing_modules)}.')
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED) as zipped:
         for module in modules:
@@ -201,7 +204,7 @@ def prepare(iterations=None, notebook_name=None, first_run=False, profile='pilot
     (build / metadata['code_file']).write_text(json.dumps(notebook, indent=1), encoding='utf-8')
     (build / 'kernel-metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
     experiment_name = configuration.get('experiment_name', 'multibranch_pretraining_v1')
-    suffixes = ('cv',) if configuration.get('quick_save', False) else ('cv', 'best', 'holdout')
+    suffixes = ('cv',) if configuration.get('quick_save', False) and not protocol_search else ('cv', 'best', 'holdout')
     manifest = {
         'profile': profile, 'notebook': notebook_name,
         'branch': branch, 'kernel': metadata['id'], 'source_mode': 'local_snapshot',
@@ -215,6 +218,8 @@ def prepare(iterations=None, notebook_name=None, first_run=False, profile='pilot
             'FIRST_RUN_PRETRAINING_EPOCHS', 'FIRST_RUN_FINETUNING_EPOCHS',
             'BASE_LEARNING_RATE', 'PRETRAINING_SOURCE_CHOICES',
             'BAYES_INITIAL_POINTS_PER_SOURCE', 'REFERENCE_HOLDOUT_SCORE',
+            'VALIDATION_PARAM_SPACE', 'PRETRAINING_PARAM_SPACE',
+            'FIRST_RUN_PARAM_SPACE', 'EVOLUTIONARY_STAGE_OVERRIDES',
         ) or key.startswith(('LARGE_', 'COVER_', 'INITIAL_PRETRAINING_'))
             or 'SOURCE_COVERAGE' in key},
         'search_iterations': actual_iterations, 'iteration_override': iterations,

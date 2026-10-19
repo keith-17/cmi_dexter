@@ -33,6 +33,7 @@ sys.path.insert(0, str(ROOT / "src"))
 import base_utils as data_utils
 import multibranch_utils as mb
 import pretraining_utils as pretraining
+import pretraining_search
 
 
 def full_modality_recordings():
@@ -73,20 +74,36 @@ class LargePretrainingNotebookTests(unittest.TestCase):
     def source(self, variant, index):
         return "".join(self.notebooks[variant]["cells"][index]["source"])
 
-    def namespace(self, variant, directory):
+    def namespace(self, variant, directory, validation_mode=None, source_edits=None):
         namespace = {
             "workspace_root": directory, "Path": Path, "datetime": datetime,
             "np": np, "pd": pd, "json": json, "GroupShuffleSplit": GroupShuffleSplit,
             "GroupKFold": GroupKFold, "Pipeline": Pipeline, "ECat": data_utils.ECat,
+            "data_utils": data_utils,
             "EInt": data_utils.EInt, "EFloat": data_utils.EFloat,
             "SequenceExtractor": data_utils.SequenceExtractor,
             "SensorAugmentor": data_utils.SensorAugmentor,
             "pretraining_keras": pretraining, "multibranch_keras": mb,
+            "pretraining_search": pretraining_search,
             "SKOPT_AVAILABLE": mb.HierarchicalBayesSearchCV is not None,
         }
         with redirect_stdout(StringIO()):
             for index in (3, 4, 11, 14):
-                exec(compile(self.source(variant, index), f"{variant}-cell-{index}", "exec"), namespace)
+                source = self.source(variant, index)
+                if validation_mode is not None:
+                    tree = ast.parse(source)
+                    for node in tree.body:
+                        if isinstance(node, ast.Assign) and any(
+                                isinstance(target, ast.Name) and target.id == "VALIDATION_PARAM_SPACE"
+                                for target in node.targets):
+                            lines = source.splitlines(keepends=True)
+                            lines.insert(node.end_lineno,
+                                         f"\nVALIDATION_PARAM_SPACE['validation_mode'] = [{validation_mode!r}]\n")
+                            source = "".join(lines)
+                            break
+                if source_edits is not None:
+                    source = source_edits(index, source)
+                exec(compile(source, f"{variant}-cell-{index}", "exec"), namespace)
         return namespace
 
     def test_preserves_layout_without_notebook_functions_or_stale_outputs(self):
@@ -107,7 +124,9 @@ class LargePretrainingNotebookTests(unittest.TestCase):
                 namespace = self.namespace(variant, directory)
                 self.assertEqual(namespace["n_iter"], 37)
                 self.assertEqual(namespace["train_size"], 0.7)
-                self.assertEqual(namespace["GROUP_COLUMN"], "subject")
+                self.assertEqual(namespace["VALIDATION_PARAM_SPACE"], {
+                    "validation_mode": ["sequence"], "group_column": ["subject"],
+                })
                 self.assertFalse(namespace["FIRST_RUN"])
                 estimator = clone(namespace["pipeline"]).named_steps["estimator"]
                 self.assertEqual(estimator.epochs, 150)
@@ -191,20 +210,96 @@ class LargePretrainingNotebookTests(unittest.TestCase):
         self.assertEqual(grid1["estimator__pretraining_mode"], ["supervised"])
         self.assertEqual(grid2["estimator__pretraining_mode"], ["masked_ssl"])
 
-    def test_holdout_and_cv_separate_subjects_and_keep_both_domains(self):
+    def test_default_holdout_and_cv_separate_sequences_and_keep_both_domains(self):
         frame = full_modality_recordings()
         for variant in self.notebooks:
             with self.subTest(variant=variant), TemporaryDirectory() as directory:
                 namespace = self.namespace(variant, directory)
-                namespace.update(train_df=frame.copy(), sensor_columns=[])
+                protocol, = pretraining_search.validation_protocols(namespace["VALIDATION_PARAM_SPACE"])
                 with redirect_stdout(StringIO()):
-                    exec(compile(self.source(variant, 9), "subject-split", "exec"), namespace)
-                train, test = namespace["X_train"], namespace["X_test"]
+                    train, test, groups, cv = pretraining_search.split_validation_protocol(
+                        frame, protocol, train_size=namespace["train_size"],
+                        n_splits=namespace["n_splits"], random_state=namespace["random_state"])
+                self.assertTrue(set(train.sequence_id).isdisjoint(test.sequence_id))
+                self.assertTrue(set(train.subject).intersection(test.subject))
+                self.assertEqual(set(train.is_target), {0, 1})
+                self.assertEqual(set(test.is_target), {0, 1})
+                pd.testing.assert_series_equal(groups, train.sequence_id)
+                for fitting, validation in cv.split(train, groups=groups):
+                    self.assertTrue(set(train.iloc[fitting].sequence_id).isdisjoint(train.iloc[validation].sequence_id))
+
+    def test_subject_option_separates_subjects_in_holdout_and_cv(self):
+        frame = full_modality_recordings()
+        for variant in self.notebooks:
+            with self.subTest(variant=variant), TemporaryDirectory() as directory:
+                namespace = self.namespace(variant, directory, validation_mode="subject")
+                protocol, = pretraining_search.validation_protocols(namespace["VALIDATION_PARAM_SPACE"])
+                self.assertEqual(protocol, {"validation_mode": "subject", "group_column": "subject"})
+                with redirect_stdout(StringIO()):
+                    train, test, groups, cv = pretraining_search.split_validation_protocol(
+                        frame, protocol, train_size=namespace["train_size"],
+                        n_splits=namespace["n_splits"], random_state=namespace["random_state"])
                 self.assertTrue(set(train.subject).isdisjoint(test.subject))
                 self.assertEqual(set(train.is_target), {0, 1})
                 self.assertEqual(set(test.is_target), {0, 1})
-                for fitting, validation in namespace["cv_object"].split(train, namespace["y_train"], namespace["groups"]):
+                pd.testing.assert_series_equal(groups, train.subject)
+                for fitting, validation in cv.split(train, groups=groups):
                     self.assertTrue(set(train.iloc[fitting].subject).isdisjoint(train.iloc[validation].subject))
+
+    def test_selected_mode_reaches_both_internal_validation_stages_and_manifest(self):
+        frame = full_modality_recordings()
+        labels = frame[["sequence_id", "subject", "is_target", "gesture", "bfrb"]].copy()
+        for variant in self.notebooks:
+            for mode, expected in (("sequence", None), ("subject", "subject")):
+                with self.subTest(variant=variant, mode=mode), TemporaryDirectory() as directory:
+                    namespace = self.namespace(variant, directory, validation_mode=mode)
+                    estimator = clone(namespace["pipeline"]).named_steps["estimator"]
+                    # The protocol runner applies these coupled fields to each
+                    # clone before candidate fitting, never as competing scores.
+                    protocol, = pretraining_search.validation_protocols(namespace["VALIDATION_PARAM_SPACE"])
+                    for name in ("validation_group_column", "pretraining_validation_group_column"):
+                        estimator.set_params(**{name: protocol["group_column"]})
+                        self.assertEqual(getattr(estimator, name), expected)
+                    estimator.set_params(extractor__pretraining_source="all")
+                    estimator.extractor_ = clone(estimator.extractor)
+                    fitting, validation = estimator._split_validation_sequences(frame, labels)
+                    self.assertTrue(set(fitting.sequence_id).isdisjoint(validation.sequence_id))
+                    self.assertTrue(set(estimator.preprocessing_sequence_ids_).isdisjoint(estimator.validation_sequence_ids_))
+                    self.assertTrue(set(estimator.preprocessing_sequence_ids_).isdisjoint(estimator.pretraining_validation_sequence_ids_))
+                    self.assertTrue(set(estimator._pretraining_X.sequence_id).isdisjoint(estimator.pretraining_validation_sequence_ids_))
+                    if mode == "subject":
+                        fitting_subjects = set(frame.loc[frame.sequence_id.isin(estimator.preprocessing_sequence_ids_), "subject"])
+                        validation_subjects = set(frame.loc[frame.sequence_id.isin(estimator.validation_sequence_ids_), "subject"])
+                        self.assertTrue(fitting_subjects.isdisjoint(validation_subjects))
+                    config_path = namespace["results_dir"] / f'{namespace["experiment_name"]}_configuration.json'
+                    saved = json.loads(config_path.read_text(encoding="utf-8"))
+                    self.assertEqual(saved["validation_param_space"], namespace["VALIDATION_PARAM_SPACE"])
+
+    def test_sequence_mode_allows_missing_subject_and_subject_mode_rejects_it(self):
+        frame = full_modality_recordings().drop(columns="subject")
+        for variant in self.notebooks:
+            for mode in ("sequence", "subject"):
+                with self.subTest(variant=variant, mode=mode), TemporaryDirectory() as directory:
+                    namespace = self.namespace(variant, directory, validation_mode=mode)
+                    protocol, = pretraining_search.validation_protocols(namespace["VALIDATION_PARAM_SPACE"])
+                    with redirect_stdout(StringIO()):
+                        if mode == "subject":
+                            with self.assertRaisesRegex(ValueError, "subject"):
+                                pretraining_search.split_validation_protocol(
+                                    frame, protocol, train_size=namespace["train_size"],
+                                    n_splits=namespace["n_splits"], random_state=namespace["random_state"])
+                        else:
+                            train, test, _, _ = pretraining_search.split_validation_protocol(
+                                frame, protocol, train_size=namespace["train_size"],
+                                n_splits=namespace["n_splits"], random_state=namespace["random_state"])
+                            self.assertTrue(set(train.sequence_id).isdisjoint(test.sequence_id))
+
+    def test_invalid_validation_mode_is_rejected(self):
+        for variant in self.notebooks:
+            with self.subTest(variant=variant), TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(ValueError, "validation_mode"):
+                    namespace = self.namespace(variant, directory, validation_mode="rows")
+                    pretraining_search.validation_protocols(namespace["VALIDATION_PARAM_SPACE"])
 
     def assert_real_one_epoch(self, variant):
         frame = full_modality_recordings()

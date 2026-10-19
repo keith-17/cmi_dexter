@@ -261,6 +261,66 @@ class PretrainingWorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'exactly five'):
             workflow.validate_first_run(configuration, 6)
 
+    def test_protocol_quick_run_embeds_helper_and_requires_complete_results(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            notebook = minimal_notebook()
+            stage_choices = {
+                'VALIDATION_PARAM_SPACE': {'validation_mode': ['sequence', 'subject'], 'group_column': ['subject']},
+                'PRETRAINING_PARAM_SPACE': {'estimator__pretraining_epochs': [5, 30]},
+                'FIRST_RUN_PARAM_SPACE': {'estimator__epochs': [5, 10]},
+                'EVOLUTIONARY_STAGE_OVERRIDES': {'estimator__pretraining_learning_rate': [0.00001, 0.0001]},
+            }
+            notebook['cells'][0]['source'].extend(f'{name} = {value!r}\n' for name, value in stage_choices.items())
+            metadata = self.fixture(root, notebook)
+            helper = root / 'src/pretraining_search.py'
+            helper.write_text('# protocol search helper snapshot\n', encoding='utf-8')
+            with patch.object(workflow, 'ROOT', root), patch.object(workflow, 'BUILD', root / 'build'), \
+                    patch.object(workflow, 'METADATA', root / 'kaggle/pretraining-kernel-metadata.json'), \
+                    patch.object(workflow.subprocess, 'run', return_value=SimpleNamespace(stdout='ssl/v0/develop\n')):
+                workflow.prepare()
+            manifest = json.loads((root / 'build/submission.json').read_text())
+            self.assertEqual(manifest['csv_names'], [f'multibranch_pretraining_v1_{suffix}.csv'
+                                                    for suffix in ('cv', 'best', 'holdout')])
+            for name, value in stage_choices.items():
+                self.assertEqual(manifest['configuration'][name], value)
+            self.assertIn(str(Path('src') / 'pretraining_search.py'), manifest['sha256'])
+            packaged = json.loads((root / 'build' / metadata['code_file']).read_text())
+            tree = ast.parse(''.join(packaged['cells'][0]['source']))
+            payload = next(node.args[0].value for node in ast.walk(tree)
+                           if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                           and node.func.attr == 'b64decode')
+            with zipfile.ZipFile(io.BytesIO(base64.b64decode(payload))) as archive:
+                self.assertEqual(archive.read('pretraining_search.py'), helper.read_bytes())
+            self.assertEqual(manifest['submitted_source_sha256'], workflow.source_hash(packaged))
+
+    def test_protocol_notebook_requires_packaged_search_helper(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            notebook = minimal_notebook()
+            notebook['cells'][0]['source'].append("VALIDATION_PARAM_SPACE = {'validation_mode': ['sequence']}\n")
+            self.fixture(root, notebook)
+            with patch.object(workflow, 'ROOT', root), patch.object(workflow, 'BUILD', root / 'build'), \
+                    patch.object(workflow, 'METADATA', root / 'kaggle/pretraining-kernel-metadata.json'), \
+                    patch.object(workflow.subprocess, 'run', return_value=SimpleNamespace(stdout='ssl/v0/develop\n')):
+                with self.assertRaisesRegex(RuntimeError, 'pretraining_search.py'):
+                    workflow.prepare()
+
+    def test_protocol_result_collection_preserves_separate_complete_result_sets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            downloaded = root / 'downloaded'
+            expected = {f'experiment_{suffix}.csv' for suffix in ('cv', 'best', 'holdout')}
+            for protocol in ('sequence', 'subject__subject'):
+                directory = downloaded / 'run/validation_protocols' / protocol
+                directory.mkdir(parents=True)
+                for name in expected:
+                    (directory / name).write_text('score\n0.7\n')
+            workflow.collect(downloaded, root / 'results', expected)
+            for protocol in ('sequence', 'subject__subject'):
+                directory = root / 'results/run/validation_protocols' / protocol
+                self.assertEqual({path.name for path in directory.glob('*.csv')}, expected)
+
     def test_first_run_refuses_regularisation_augmentation_zero_lr_and_missing_sources(self):
         configuration = workflow.literal_configuration(minimal_notebook())
         for key, value in [('estimator__dropout', 0.1), ('estimator__augmentor__prob', 0.5),

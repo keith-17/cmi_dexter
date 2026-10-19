@@ -12,6 +12,106 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def configure_validation(notebook):
+    """Expose one split choice for holdout, CV and both training stages."""
+    config = "".join(notebook["cells"][3]["source"])
+    old_config = "# All records from a wearer stay in one holdout/CV partition, including pretraining.\nGROUP_COLUMN = 'subject'"
+    new_config = """# Split complete sequences by default; choose 'subject' to hold out entire wearers.
+VALIDATION_MODE = 'sequence'  # 'sequence' or 'subject'
+GROUP_COLUMN = 'subject'  # Used only when VALIDATION_MODE is 'subject'.
+if VALIDATION_MODE not in {'sequence', 'subject'}:
+    raise ValueError("VALIDATION_MODE must be 'sequence' or 'subject'.")
+SPLIT_GROUP_COLUMN = GROUP_COLUMN if VALIDATION_MODE == 'subject' else 'sequence_id'
+VALIDATION_GROUP_COLUMN = GROUP_COLUMN if VALIDATION_MODE == 'subject' else None"""
+    if "VALIDATION_MODE =" not in config:
+        if old_config not in config:
+            raise ValueError("Missing validation configuration boundary.")
+        config = config.replace(old_config, new_config)
+    notebook["cells"][3]["source"] = config.splitlines(keepends=True)
+    split = """# Apply the selected grouping before either training stage or chunk extraction.
+if VALIDATION_MODE == 'sequence':
+    # Restore V1's balanced sequence split; wearers can occur in both partitions.
+    try:
+        train_sample_df, hold_out_df = data_utils.sample_balanced_split(
+            train_df, train_pct=train_size, test_pct=(1 - train_size),
+            random_state=random_state,
+        )
+    except (KeyError, ValueError) as split_error:
+        print(f'Balanced split unavailable ({split_error}); using sequence-grouped random split.')
+        sequence_df = train_df[['sequence_id']].drop_duplicates().sort_values('sequence_id')
+        splitter = GroupShuffleSplit(n_splits=1, train_size=train_size, random_state=random_state)
+        train_idx, test_idx = next(splitter.split(sequence_df, groups=sequence_df['sequence_id']))
+        train_ids = sequence_df.iloc[train_idx]['sequence_id']
+        test_ids = sequence_df.iloc[test_idx]['sequence_id']
+        train_sample_df = train_df[train_df['sequence_id'].isin(train_ids)].copy()
+        hold_out_df = train_df[train_df['sequence_id'].isin(test_ids)].copy()
+else:
+    if GROUP_COLUMN not in train_df:
+        raise ValueError(f'Missing group column {GROUP_COLUMN!r} for subject validation.')
+    sequence_df = train_df[['sequence_id', GROUP_COLUMN]].drop_duplicates()
+    if sequence_df['sequence_id'].duplicated().any() or sequence_df[GROUP_COLUMN].isna().any():
+        raise ValueError('Validation groups must be non-missing and constant per sequence.')
+    sequence_df = sequence_df.sort_values('sequence_id')
+    if sequence_df[GROUP_COLUMN].nunique() < 3:
+        raise ValueError('Need at least three subjects/groups for independent holdout and CV training.')
+    splitter = GroupShuffleSplit(n_splits=1, train_size=train_size, random_state=random_state)
+    train_idx, test_idx = next(splitter.split(sequence_df, groups=sequence_df[GROUP_COLUMN]))
+    train_ids = sequence_df.iloc[train_idx]['sequence_id']
+    test_ids = sequence_df.iloc[test_idx]['sequence_id']
+    train_sample_df = train_df[train_df['sequence_id'].isin(train_ids)].copy()
+    hold_out_df = train_df[train_df['sequence_id'].isin(test_ids)].copy()
+
+X_train = train_sample_df
+X_test = hold_out_df
+# Keep both source domains in X/y; fitting selects pretraining and fine-tuning separately.
+label_columns = [column for column in X_train.columns
+                 if column not in sensor_columns and column not in {'row_id', 'sequence_counter'}]
+y_train = X_train[label_columns].copy()
+y_test = X_test[label_columns].copy()
+groups = X_train[SPLIT_GROUP_COLUMN]
+
+print('Validation mode:', VALIDATION_MODE, '| split group:', SPLIT_GROUP_COLUMN)
+print('Train sequences:', X_train['sequence_id'].nunique())
+print('Holdout sequences:', X_test['sequence_id'].nunique())
+assert set(X_train['sequence_id']).isdisjoint(set(X_test['sequence_id']))
+if VALIDATION_MODE == 'subject':
+    print('Train subjects:', X_train[GROUP_COLUMN].nunique(), 'Holdout subjects:', X_test[GROUP_COLUMN].nunique())
+    assert set(X_train[GROUP_COLUMN]).isdisjoint(set(X_test[GROUP_COLUMN]))
+
+del train_df, train_sample_df, hold_out_df
+"""
+    notebook["cells"][9]["source"] = split.splitlines(keepends=True)
+    for cell in notebook["cells"]:
+        source = "".join(cell["source"])
+        if cell["cell_type"] == "code":
+            # Both fields must change together: either non-None field groups both stages.
+            source = source.replace("validation_group_column=GROUP_COLUMN",
+                                    "validation_group_column=VALIDATION_GROUP_COLUMN")
+            source = source.replace("validation_group_column': [GROUP_COLUMN]",
+                                    "validation_group_column': [VALIDATION_GROUP_COLUMN]")
+            source = source.replace("validation_group_column': GROUP_COLUMN",
+                                    "validation_group_column': VALIDATION_GROUP_COLUMN")
+            if "'group_column': GROUP_COLUMN," in source and "'validation_mode': VALIDATION_MODE" not in source:
+                source = source.replace("'group_column': GROUP_COLUMN,",
+                                        "'group_column': GROUP_COLUMN,\n"
+                                        "               'validation_mode': VALIDATION_MODE,\n"
+                                        "               'split_group_column': SPLIT_GROUP_COLUMN,")
+        else:
+            source = source.replace(
+                "The holdout and CV partitions separate wearers before either training stage.",
+                "`VALIDATION_MODE='sequence'` keeps complete sequences apart by default. "
+                "Choose `'subject'` to keep entire wearers apart in holdout, CV and both stages' internal validation.",
+            )
+            source = source.replace(
+                "Outer holdout and CV split wearers 70/30, and internal validation also separates\n"
+                "wearers. The old holdout score is a reference, not a directly comparable result.",
+                "Validation defaults to complete sequences, with a balanced 70/30 outer split.\n"
+                "Choose VALIDATION_MODE='subject' to keep entire wearers apart in holdout, CV\n"
+                "and both stages' internal validation. The old score remains a reference.",
+            )
+        cell["source"] = source.splitlines(keepends=True)
+
+
 def main():
     notebook = json.loads((ROOT / "notebooks/multibranch_v1.ipynb").read_text(encoding="utf-8"))
 
@@ -455,6 +555,7 @@ print('Epochs:', PRETRAINING_EPOCHS, 'pretraining +', FINETUNING_EPOCHS, 'fine-t
         "'target': TARGET_COL,\n        'model_variant': MODEL_VARIANT,\n        'pretraining_mode': PRETRAINING_MODE,"
     ))
 
+    configure_validation(notebook)
     for index, cell in enumerate(notebook["cells"]):
         if cell["cell_type"] == "code":
             text = "".join(cell["source"])

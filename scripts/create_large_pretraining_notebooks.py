@@ -10,6 +10,13 @@ from pathlib import Path
 from pprint import pformat
 import re
 
+if __package__:
+    from .create_pretraining_notebook import configure_validation
+    from .pretraining_search_configuration import configure_search_parameters
+else:
+    from create_pretraining_notebook import configure_validation
+    from pretraining_search_configuration import configure_search_parameters
+
 
 ROOT = Path(__file__).resolve().parents[1]
 REFERENCE = ROOT / 'kaggle' / 'pretraining-large-reference.json'
@@ -187,6 +194,8 @@ print('Balanced source budget: 9 or 10 candidates each, interleaved; total:', n_
         "search.candidate_checkpoint_path = results_dir / 'partial_cv.csv'\n"
         'search.fit(X_train, y_train, groups=groups)')
     set_source(17, training)
+    configure_validation(notebook)
+    configure_search_parameters(notebook)
     for cell in notebook['cells']:
         if cell['cell_type'] == 'code':
             tree = ast.parse(''.join(cell['source']))
