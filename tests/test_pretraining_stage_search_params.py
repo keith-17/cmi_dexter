@@ -18,8 +18,6 @@ PREFIX = "estimator__"
 EXTRACTOR = PREFIX + "extractor__"
 STAGE_DEFAULTS = {
     PREFIX + "pretraining_epochs": [30],
-    PREFIX + "epochs": [150],
-    PREFIX + "learning_rate": [1e-4],
     PREFIX + "pretraining_learning_rate": [1e-4],
     PREFIX + "finetuning_learning_rate": [None],
     EXTRACTOR + "pretraining_source": ["non_target", "all", "target", "baseline"],
@@ -94,11 +92,9 @@ class StageSearchParameterTests(unittest.TestCase):
                     actual.set_params(**{key: choices[-1]})
                     self.assertEqual(actual.get_params(deep=True)[key], choices[-1])
 
-    def test_expanded_choices_survive_late_large_run_overrides(self):
+    def test_expanded_stage_choices_reach_both_searches(self):
         choices = {
             PREFIX + "pretraining_epochs": [3, 11],
-            PREFIX + "epochs": [7, 21],
-            PREFIX + "learning_rate": [2e-5, 3e-4],
             PREFIX + "pretraining_learning_rate": [1e-5, 2e-4],
             EXTRACTOR + "pretraining_include_classes": [None, ["wave", "glasses"]],
             EXTRACTOR + "pretraining_filters": [None, {"subject": ["p2"]}],
@@ -123,7 +119,6 @@ class StageSearchParameterTests(unittest.TestCase):
                                                                            "choices", []))[-1])
                                  for key in choices}
                     copy = clone(namespace["pipeline"]).set_params(**candidate)
-                    self.assertEqual(copy.named_steps["estimator"].epochs, 21)
                     self.assertEqual(copy.named_steps["estimator"].pretraining_epochs, 11)
                     extractor = copy.named_steps["estimator"].extractor
                     self.assertEqual(decoded(extractor.pretraining_filters), {"subject": ["p2"]})
@@ -171,8 +166,8 @@ class StageSearchParameterTests(unittest.TestCase):
     def test_evolutionary_integer_float_ranges_survive_final_compilation(self):
         def edits(index, source):
             if index == 14:
-                return insert_after_assignment(source, "EVOLUTIONARY_STAGE_OVERRIDES", """
-EVOLUTIONARY_STAGE_OVERRIDES.update({
+                return insert_after_assignment(source, "EVOLUTIONARY_PARAM_SPACE", """
+EVOLUTIONARY_PARAM_SPACE.update({
     'estimator__pretraining_epochs': EInt(3, 12),
     'estimator__learning_rate': EFloat(1e-5, 1e-3, distribution='log-uniform'),
     'estimator__extractor__pretraining_sample_fraction': EFloat(0.25, 1.0),
@@ -192,7 +187,8 @@ EVOLUTIONARY_STAGE_OVERRIDES.update({
                     self.assertEqual((space[EXTRACTOR + "pretraining_sample_fraction"].low,
                                       space[EXTRACTOR + "pretraining_sample_fraction"].high), (0.25, 1.0))
                 self.assertEqual(namespace["GRID_PARAM_SPACE"][PREFIX + "pretraining_epochs"], [30])
-                self.assertEqual(namespace["GRID_PARAM_SPACE"][PREFIX + "learning_rate"], [1e-4])
+                self.assertEqual(namespace["GRID_PARAM_SPACE"][PREFIX + "learning_rate"],
+                                 [1e-5, 5e-5, 1e-4])
 
     def test_finetuning_domain_and_filters_reach_the_actual_selector(self):
         frame = recordings()
@@ -216,29 +212,48 @@ EVOLUTIONARY_STAGE_OVERRIDES.update({
                 self.assertEqual(set(selected.sequence_id), {"c"})
                 self.assertEqual(len(selected), len(frame[frame.sequence_id == "c"]))
 
-    def test_first_run_budgets_only_replace_stage_epochs_when_enabled(self):
+    def test_primary_training_candidates_take_precedence_over_stage_defaults(self):
         def edits(index, source):
-            if index == 3:
-                source = source.replace("FIRST_RUN = False", "FIRST_RUN = True")
-            elif index == 14:
-                source = insert_after_assignment(source, "PRETRAINING_PARAM_SPACE", """
-PRETRAINING_PARAM_SPACE['estimator__pretraining_epochs'] = [30, 45]
-PRETRAINING_PARAM_SPACE['estimator__epochs'] = [150, 200]
+            if index != 14:
+                return source
+            source = insert_after_assignment(source, "GRID_PARAM_SPACE", """
+GRID_PARAM_SPACE.update({
+    'estimator__epochs': [7, 21],
+    'estimator__learning_rate': [2e-5, 3e-4],
+})
 """)
-            return source
+            source = insert_after_assignment(source, "EVOLUTIONARY_PARAM_SPACE", """
+EVOLUTIONARY_PARAM_SPACE.update({
+    'estimator__epochs': EInt(4, 15),
+    'estimator__learning_rate': EFloat(1e-6, 1e-3, distribution='log-uniform'),
+})
+""")
+            return insert_after_assignment(source, "PRETRAINING_PARAM_SPACE", """
+PRETRAINING_PARAM_SPACE.update({
+    'estimator__epochs': [999],
+    'estimator__learning_rate': [0.9],
+})
+""")
 
         for variant in ("model1", "model2"):
             with self.subTest(variant=variant), TemporaryDirectory() as directory:
                 namespace = self.namespace(variant, directory, edits)
-                pilot = namespace["FIRST_RUN_PARAM_SPACE"]
-                self.assertEqual(pilot[PREFIX + "pretraining_epochs"], [5])
-                self.assertEqual(pilot[PREFIX + "epochs"], [5])
-                self.assertTrue(namespace["FIRST_RUN"])
-                self.assert_compiled_choices(namespace, PREFIX + "pretraining_epochs", [5])
-                self.assert_compiled_choices(namespace, PREFIX + "epochs", [5])
-                estimator = namespace["pipeline"].named_steps["estimator"]
-                self.assertEqual((estimator.pretraining_epochs, estimator.epochs), (5, 5))
-                self.assertEqual(namespace["PRETRAINING_PARAM_SPACE"][PREFIX + "epochs"], [150, 200])
+                grid = namespace["GRID_PARAM_SPACE"]
+                self.assertEqual(grid[PREFIX + "epochs"], [7, 21])
+                self.assertEqual(grid[PREFIX + "learning_rate"], [2e-5, 3e-4])
+                if namespace["SKOPT_AVAILABLE"]:
+                    bayesian = namespace["BAYESIAN_PARAM_SPACE"]
+                    self.assertEqual(list(bayesian[PREFIX + "epochs"].categories), [7, 21])
+                    self.assertEqual(list(bayesian[PREFIX + "learning_rate"].categories),
+                                     [2e-5, 3e-4])
+                for name in ("EVOLUTIONARY_PARAM_SPACE", "EVOLUTIONARY_SEARCH_SPACE"):
+                    space = namespace[name]
+                    self.assertEqual((space[PREFIX + "epochs"].low,
+                                      space[PREFIX + "epochs"].high), (4, 15))
+                    self.assertEqual((space[PREFIX + "learning_rate"].low,
+                                      space[PREFIX + "learning_rate"].high), (1e-6, 1e-3))
+                self.assertEqual(namespace["BEST_PARAMS"][PREFIX + "epochs"], 7)
+                self.assertEqual(namespace["BEST_PARAMS"][PREFIX + "learning_rate"], 2e-5)
 
     def test_searched_epochs_and_separate_learning_rates_reach_training_calls(self):
         frame = recordings()

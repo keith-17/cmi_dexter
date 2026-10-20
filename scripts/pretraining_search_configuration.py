@@ -13,8 +13,6 @@ import re
 _STAGE_SPACE = '''# Stage settings use the same candidate lists for Bayesian and evolutionary search.
 # One value fixes a parameter; add values to search it. Baseline skips pretraining.
 PRETRAINING_PARAM_SPACE = {
-    'estimator__epochs': [150],
-    'estimator__learning_rate': [1e-4],
     'estimator__pretraining_mode': [PRETRAINING_MODE],
     'estimator__pretraining_epochs': [30],
     'estimator__pretraining_batch_size': [128],
@@ -85,23 +83,6 @@ PRETRAINING_PARAM_SPACE = {
     'estimator__extractor__stage_target_values': [(1,)],
 }
 
-# Optional evolutionary numeric ranges, for example an EInt or EFloat value.
-# Shared stage candidates above are used unless a key is overridden here.
-EVOLUTIONARY_STAGE_OVERRIDES = {}
-
-FIRST_RUN_PARAM_SPACE = {
-    'estimator__pretraining_epochs': [5],
-    'estimator__epochs': [5],
-}
-ACTIVE_STAGE_PARAM_SPACE = dict(PRETRAINING_PARAM_SPACE)
-if FIRST_RUN:
-    ACTIVE_STAGE_PARAM_SPACE.update(FIRST_RUN_PARAM_SPACE)
-
-# Sequence splitting is the default. Adding 'subject' runs a separate full search.
-VALIDATION_PARAM_SPACE = {
-    'validation_mode': ['sequence'],
-    'group_column': ['subject'],
-}
 '''
 
 _TRAINING_SUFFIX = '''validation_runs = run_validation_searches(
@@ -122,23 +103,42 @@ experiment_succeeded = last_run.get('experiment_succeeded', False)
 eval_results = last_run.get('eval_results', {})
 '''
 
-_MANIFEST = '''with open(results_dir / f'{experiment_name}_configuration.json', 'w', encoding='utf-8') as stream:
-    json.dump({'model_variant': MODEL_VARIANT, 'pretraining_mode': PRETRAINING_MODE,
-               'iterations': n_iter, 'train_size': train_size,
-               'validation_param_space': VALIDATION_PARAM_SPACE,
-               'reference_holdout_score': REFERENCE_HOLDOUT_SCORE,
-               'fixed_params': LARGE_FIXED_PARAMS, 'varying_params': LARGE_PARAM_SPACE,
-               'pretraining_param_space': PRETRAINING_PARAM_SPACE,
-               'active_stage_param_space': ACTIVE_STAGE_PARAM_SPACE,
-               'first_run': FIRST_RUN, 'first_run_param_space': FIRST_RUN_PARAM_SPACE,
-               'evolutionary_stage_overrides': EVOLUTIONARY_STAGE_OVERRIDES},
-              stream, indent=2, default=str)
-print('Reference-only unsupported parameters:', LARGE_UNSUPPORTED_REFERENCE_PARAMS)
-print('Pretraining sources:', ACTIVE_STAGE_PARAM_SPACE['estimator__extractor__pretraining_source'])
-print('Validation choices:', VALIDATION_PARAM_SPACE['validation_mode'])
-print('Bayesian candidates per validation choice:', n_iter)
+_VALIDATION_SPACE = """# Sequence splitting is the default. Add 'subject' for a separate full search.
+VALIDATION_PARAM_SPACE = {
+    'validation_mode': ['sequence'],
+    'group_column': ['subject'],
+}
+"""
 
-'''
+_PARAMETER_SUFFIX = """# Add stage settings without replacing either editable search space.
+for _key, _choices in PRETRAINING_PARAM_SPACE.items():
+    GRID_PARAM_SPACE.setdefault(_key, _choices)
+    EVOLUTIONARY_PARAM_SPACE.setdefault(_key, ECat(_choices))
+BEST_PARAMS = {key: choices[0] for key, choices in GRID_PARAM_SPACE.items()}
+
+# Build the search spaces from the configured candidates.
+if SKOPT_AVAILABLE:
+    BAYESIAN_PARAM_SPACE = multibranch_keras.prepare_multibranch_bayesian_space(GRID_PARAM_SPACE)
+else:
+    BAYESIAN_PARAM_SPACE = GRID_PARAM_SPACE
+EVOLUTIONARY_SEARCH_SPACE = multibranch_keras.prepare_multibranch_evolutionary_space(EVOLUTIONARY_PARAM_SPACE)
+
+_pipeline_params = pipeline.get_params(deep=True)
+for space_name, candidate_space in (
+    ('grid', GRID_PARAM_SPACE), ('bayesian', BAYESIAN_PARAM_SPACE),
+    ('evolutionary', EVOLUTIONARY_SEARCH_SPACE),
+):
+    unknown_params = set(candidate_space) - set(_pipeline_params)
+    if unknown_params:
+        raise ValueError(f'{space_name}: unknown parameters={sorted(unknown_params)}')
+
+if search_mode == 'bayes':
+    param_space = BAYESIAN_PARAM_SPACE
+elif search_mode == 'evo':
+    param_space = EVOLUTIONARY_SEARCH_SPACE
+else:
+    param_space = GRID_PARAM_SPACE
+"""
 
 
 def _assignment(source, name):
@@ -148,23 +148,19 @@ def _assignment(source, name):
     raise ValueError(f'Missing notebook assignment: {name}')
 
 
-def _replace_assignment(source, name, replacement):
-    node = _assignment(source, name)
-    lines = source.splitlines(keepends=True)
-    return ''.join(lines[:node.lineno - 1]) + replacement.rstrip() + '\n' + ''.join(lines[node.end_lineno:])
-
-
 def configure_search_parameters(notebook):
-    """Configure stage search lists and matching validation in a large notebook."""
+    """Keep editable model/stage candidates and configure validation orchestration."""
     def source(index):
         return ''.join(notebook['cells'][index]['source'])
 
     def set_source(index, value):
         notebook['cells'][index]['source'] = value.splitlines(keepends=True)
 
-    # Already converted notebooks retain their user-edited candidate lists.
-    if 'ACTIVE_STAGE_PARAM_SPACE' in source(14):
-        return notebook
+    params = source(14)
+    try:
+        validation = ast.get_source_segment(params, _assignment(params, 'VALIDATION_PARAM_SPACE'))
+    except ValueError:
+        validation = _VALIDATION_SPACE
 
     imports = source(2)
     if 'from pretraining_search import run_validation_searches' not in imports:
@@ -174,19 +170,33 @@ def configure_search_parameters(notebook):
     set_source(2, imports)
 
     config = source(3)
-    start = config.index('# The first CPU run')
-    stop = config.index('PROBLEMATIC_IDEAL_SKEW_THRESHOLD', start)
-    config = config[:start] + config[stop:]
+    if '# The first CPU run' in config:
+        start = config.index('# The first CPU run')
+        stop = config.index('PROBLEMATIC_IDEAL_SKEW_THRESHOLD', start)
+        config = config[:start] + config[stop:]
+    config_lines = config.splitlines(keepends=True)
+    for node in reversed(ast.parse(config).body):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id in {
+                'FIRST_RUN', 'LARGE_RUN', 'COVER_PRETRAINING_SOURCES',
+                'REFERENCE_HOLDOUT_SCORE', 'REFERENCE_BEST_PARAMS',
+                'PROBLEMATIC_IDEAL_SKEW_THRESHOLD', 'PROBLEMATIC_FEATURES_THRESHOLD',
+                'PROBLEMATIC_FEATURE_COLUMNS',
+            } for target in node.targets
+        ):
+            del config_lines[node.lineno - 1:node.end_lineno]
+    config = ''.join(config_lines)
     config = config.replace('quick_save = True         # True -> save only the CV CSV with best_score & holdout_score appended; False -> full save',
                             'quick_save = True         # Always save CV/best/holdout CSVs; False also saves model weights.')
+    if 'VALIDATION_PARAM_SPACE =' not in config:
+        config += '\n' + validation.rstrip() + '\n'
     set_source(3, config)
 
-    set_source(9, '''# Keep complete sequences available; each selected validation protocol splits them
-# before stage selection and extraction. Sequence splitting remains the default.
+    set_source(9, """# Each validation protocol splits complete sequences before stage selection.
 experiment_df = train_df
 del train_df
 print('Available sequences:', experiment_df['sequence_id'].nunique())
-''')
+""")
 
     constructor = source(11)
     stage_names = {
@@ -201,6 +211,7 @@ print('Available sequences:', experiment_df['sequence_id'].nunique())
         'pretraining_learning_rate', 'pretraining_use_lr_scheduler',
         'pretraining_early_stopping_patience', 'learning_rate', 'epochs',
         'pretraining_validation_group_column', 'validation_group_column',
+        'ideal_skew_threshold', 'problematic_features_threshold', 'problematic_feature_cols',
     }
     constructor = ''.join(line for line in constructor.splitlines(keepends=True)
                           if not re.match(r'\s*(' + '|'.join(stage_names) + r')\s*=', line))
@@ -210,78 +221,49 @@ print('Available sequences:', experiment_df['sequence_id'].nunique())
                                       '    validation_group_column=None,\n')
     set_source(11, constructor)
 
-    params = source(14)
-    params = _replace_assignment(params, 'PRETRAINING_PARAM_SPACE', _STAGE_SPACE)
-    params = params.replace('GRID_PARAM_SPACE.update(PRETRAINING_PARAM_SPACE)\n'
-                            'for _key, _choices in PRETRAINING_PARAM_SPACE.items():\n'
-                            '    EVOLUTIONARY_PARAM_SPACE[_key] = ECat(_choices)\n', '')
-    # The old pilot block was overwritten by the large block; retain only its
-    # requested five-epoch limits, now declared alongside the stage lists.
-    start = params.index('# Preserve the V1 full spaces separately')
-    stop = params.index('# Large-run overrides', start)
-    params = params[:start] + params[stop:]
-    params = params.replace('LARGE_FIXED_PARAMS.update({key: values[0] for key, values in PRETRAINING_PARAM_SPACE.items()})\n', '')
-    stage_keys = {ast.literal_eval(key) for key in _assignment(_STAGE_SPACE, 'PRETRAINING_PARAM_SPACE').value.keys}
-    # Stage defaults now have one editable home. Keep all other existing large
-    # architecture settings verbatim, including any user edits.
-    lines = params.splitlines(keepends=True)
-    inside_large = False
-    kept = []
-    for line in lines:
-        if line.startswith('LARGE_FIXED_PARAMS.update({'):
-            inside_large = True
-        key = re.match(r"\s*['\"]([^'\"]+)['\"]\s*:", line)
-        if not (inside_large and key and key.group(1) in stage_keys):
-            kept.append(line)
-        if inside_large and line.startswith('})'):
-            inside_large = False
-    params = ''.join(kept)
-    params = params.replace('for _key, _value in LARGE_FIXED_PARAMS.items():\n',
-                            'LARGE_FIXED_PARAMS = {key: value for key, value in LARGE_FIXED_PARAMS.items()\n'
-                            '                      if key not in PRETRAINING_PARAM_SPACE}\n'
-                            'for _key, _value in LARGE_FIXED_PARAMS.items():\n')
-    params = params.replace("    'estimator__extractor__pretraining_source': PRETRAINING_SOURCE_CHOICES,\n", '')
-    params = params.replace('GRID_PARAM_SPACE.update(LARGE_PARAM_SPACE)\n',
-                            'GRID_PARAM_SPACE.update(LARGE_PARAM_SPACE)\n'
-                            'GRID_PARAM_SPACE.update(ACTIVE_STAGE_PARAM_SPACE)\n')
-    params = params.replace('EVOLUTIONARY_PARAM_SPACE = {key: ECat(values) for key, values in GRID_PARAM_SPACE.items()}\n',
-                            'EVOLUTIONARY_PARAM_SPACE = {key: ECat(values) for key, values in GRID_PARAM_SPACE.items()}\n'
-                            'EVOLUTIONARY_PARAM_SPACE.update(EVOLUTIONARY_STAGE_OVERRIDES)\n'
-                            'if FIRST_RUN:\n'
-                            '    EVOLUTIONARY_PARAM_SPACE.update({key: ECat(values) for key, values in FIRST_RUN_PARAM_SPACE.items()})\n')
-    start = params.index("with open(results_dir / f'{experiment_name}_configuration.json'")
-    stop = params.index('# ============================================================\n# Build and validate', start)
-    params = params[:start] + _MANIFEST + params[stop:]
-    params = params.replace("print('Epochs:', PRETRAINING_EPOCHS, 'pretraining +', FINETUNING_EPOCHS, 'fine-tuning; LR:', BASE_LEARNING_RATE)",
-                            "print('Epoch candidates:', ACTIVE_STAGE_PARAM_SPACE['estimator__pretraining_epochs'], 'pretraining;',\n"
-                            "      ACTIVE_STAGE_PARAM_SPACE['estimator__epochs'], 'fine-tuning; LR:',\n"
-                            "      ACTIVE_STAGE_PARAM_SPACE['estimator__learning_rate'])")
-    set_source(14, params)
+    # Preserve both user-editable model spaces verbatim. Discard generated overrides
+    # after them, including pilot settings and automatic parameter expansion.
+    evolutionary = _assignment(params, 'EVOLUTIONARY_PARAM_SPACE')
+    prefix = ''.join(params.splitlines(keepends=True)[:evolutionary.end_lineno])
+    stage = _assignment(params, 'PRETRAINING_PARAM_SPACE')
+    stage_source = ast.get_source_segment(params, stage)
+    if any(name.id in {'FIRST_RUN', 'PRETRAINING_EPOCHS', 'BASE_LEARNING_RATE'}
+           for name in ast.walk(stage) if isinstance(name, ast.Name)):
+        stage_source = ast.get_source_segment(
+            _STAGE_SPACE, _assignment(_STAGE_SPACE, 'PRETRAINING_PARAM_SPACE'))
+    else:
+        # Older converted notebooks duplicated fine-tuning settings here.
+        # They already belong to GRID_PARAM_SPACE / EVOLUTIONARY_PARAM_SPACE.
+        lines = stage_source.splitlines(keepends=True)
+        remove_lines = set()
+        for key, value in zip(stage.value.keys, stage.value.values):
+            if isinstance(key, ast.Constant) and key.value in {'estimator__epochs', 'estimator__learning_rate'}:
+                remove_lines.update(range(key.lineno - stage.lineno, value.end_lineno - stage.lineno + 1))
+        stage_source = ''.join(line for index, line in enumerate(lines) if index not in remove_lines)
+    set_source(14, prefix.rstrip() + '\n\n' + stage_source.rstrip() + '\n\n' + _PARAMETER_SUFFIX)
 
     training = source(17)
-    start = training.index('search.candidate_checkpoint_path')
-    set_source(17, training[:start] + _TRAINING_SUFFIX)
+    start = training.find('search.candidate_checkpoint_path')
+    if start < 0:
+        start = training.find('search.fit(X_train, y_train, groups=groups)')
+    if start < 0:
+        start = training.index('validation_runs = run_validation_searches(')
+    training = training[:start].replace(
+        '# Preserve saved values even when outside the current search ranges.',
+        '# Use the first configured grid choices for this single-candidate run.')
+    set_source(17, training + _TRAINING_SUFFIX)
     set_source(20, source(20).replace('save_dir = results_dir / timestamp', "save_dir = last_run['results_dir']"))
-    set_source(22, '''# Each protocol's holdout was evaluated once after its own search/refit.
+    set_source(22, """# Each protocol's holdout was evaluated once after its own search/refit.
 if experiment_succeeded:
     print('Last validation protocol:', last_run['validation_mode'])
     print('Holdout competition score:', eval_results['competition_score'])
 pd.DataFrame(protocol_results)
-''')
-    set_source(24, '''# CV, best, holdout, histories and diagnostics are saved separately per protocol.
+""")
+    set_source(24, """# CV, best, holdout, histories and diagnostics are saved separately per protocol.
 protocol_summary = pd.DataFrame(protocol_results)
 print(protocol_summary.to_string(index=False))
 print('Results:', validation_runs['results_dir'])
-''')
-
-    markdown = source(0)
-    markdown = markdown.replace('The four pretraining sources share the same architecture ranges and receive\n9 or 10 evaluations each. Their first visits are interleaved. Each source uses\nthree initial proposals, followed by Bayesian adaptation.',
-                                'The configured pretraining sources share the same architecture ranges.\nTheir first visits are interleaved, followed by Bayesian adaptation.')
-    markdown = re.sub(r'Validation defaults to complete sequences,.*?old score remains a reference\.',
-                      "Validation defaults to complete sequences. Add 'subject' to VALIDATION_PARAM_SPACE\n"
-                      'only to run a separate search with wearers held apart. Each protocol saves its\n'
-                      'own CV, best and holdout CSVs. The old score remains a reference.', markdown, flags=re.DOTALL)
-    set_source(0, markdown)
+""")
 
     for index in (2, 3, 9, 11, 14, 17, 20, 22, 24):
         ast.parse(source(index))

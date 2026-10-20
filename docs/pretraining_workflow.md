@@ -10,20 +10,19 @@ It calls the sequence extractor in `src/base_utils.py` and the staged models in
 gesture pretraining or `model_2` for masked-signal self-supervision. The branches
 and fine-tuning model remain those of `src/multibranch_utils.py`.
 
-Edit `PRETRAINING_PARAM_SPACE` in the Parameters cell to choose stage lengths,
-learning rates, source domains, labels, class lists, metadata filters, sequence
-lengths, sampling limits, balancing and target-domain definitions. A one-item list
-keeps a value fixed; add items to search alternatives. These choices feed both
-Bayesian and evolutionary search and take precedence over the reference defaults.
-The default full budgets remain 30 pretraining epochs and 150 fine-tuning epochs.
-`learning_rate` controls fine-tuning unless `finetuning_learning_rate` explicitly
-overrides it; `pretraining_learning_rate` can be searched independently.
+Edit `GRID_PARAM_SPACE` for grid/Bayesian candidates and
+`EVOLUTIONARY_PARAM_SPACE` for evolutionary candidates. These declared ranges
+control the search directly. `PRETRAINING_PARAM_SPACE` adds shared stage settings
+such as pretraining epochs, learning rate, source domains, labels, class filters,
+sampling limits and target-domain definitions. Existing entries in either main
+space take precedence. Fine-tuning epochs and learning rate live in those main
+spaces; `finetuning_learning_rate=None` follows the selected `learning_rate`.
 
 Both objectives retain the four source candidates: `non_target`, `all`, `target`
 and `baseline`. The baseline skips pretraining and trains the downstream model
 from scratch. Class lists and metadata filters apply inside each training fold.
-For evolutionary integer or continuous ranges, add `EInt` or `EFloat` entries in
-`EVOLUTIONARY_STAGE_OVERRIDES`; other entries use the shared candidate lists.
+For evolutionary integer or continuous ranges, put `EInt` or `EFloat` entries
+directly in `EVOLUTIONARY_PARAM_SPACE`.
 
 `VALIDATION_PARAM_SPACE` defaults to `validation_mode: ['sequence']` and
 `group_column: ['subject']`. Sequence mode restores the original balanced outer
@@ -45,10 +44,8 @@ The archived pilot's `FIRST_RUN = True` fixes default feature settings, disables
 augmentations, regularisation and learning-rate scheduling, and keeps the base
 learning rate positive. It uses five pretraining epochs and five fine-tuning
 epochs per fit for the initial CPU search. Set `FIRST_RUN = False` to use the
-full configurable search spaces and training budgets. In the active large
-notebooks, `FIRST_RUN_PARAM_SPACE` exposes the short stage budgets (five epochs
-each) using the same estimator parameter names; `FIRST_RUN=True` selects those
-budgets instead of the full stage lengths.
+full configurable search spaces and training budgets. The active notebooks
+use their declared epoch candidates directly.
 
 The first five Bayesian candidates search across the four source choices and
 five BERT widths. Five sampled candidates are not an exhaustive comparison of
@@ -106,22 +103,10 @@ replace the model-1 run or its local provenance.
 ```
 
 `scripts/create_large_pretraining_notebooks.py` recreates both notebooks from the
-V1 pretraining layout and `kaggle/pretraining-large-reference.json`. That reference
-contains the supplied result (holdout 0.8118239920); its JSON values are treated
-as configuration data. The original downloaded file is never edited.
-
-Both profiles use the reference feature spaces, chunk length 200, a balanced
-70/30 sequence split by default, 128-filter four-layer temporal CNN branches,
-static width 100, AdamW at 1e-4, cosine scheduling and batch normalization. Fine-tuning allows 150 epochs
-with patience 20; pretraining allows 30 with patience 8. Augmentation, dropout,
-weight decay and label smoothing are zero. BERT width, depth, heads, feed-forward
-width and final dense width vary over explicitly listed large settings.
-
-The reference predates the temporal BERT builder. Its per-branch CNN dictionaries
-do not control BERT; the active `branch_cnn_*` parameters are set explicitly here.
-Thermal processing is therefore larger than in the original, and its 225-unit
-branch embeddings are not reproduced. The original score also used a different
-partition, so it must not be treated as a directly comparable wearer holdout.
+V1 pretraining layout. The active notebooks use their declared parameter ranges;
+reference results and large-run presets do not overwrite those choices.
+Regenerating notebooks replaces local notebook edits, so edit the active files
+directly when configuring an experiment.
 
 Bayesian compilation splits the four pretraining sources into fixed-source
 subspaces under one shared budget and visits them in round-robin order. A

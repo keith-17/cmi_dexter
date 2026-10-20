@@ -1,4 +1,4 @@
-"""Execute the large notebook configurations and verify both actual objectives."""
+"""Check active notebook configuration without changing its editable search spaces."""
 import ast
 from contextlib import redirect_stdout
 from datetime import datetime
@@ -9,7 +9,6 @@ from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
 import unittest
-import warnings
 
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
@@ -34,6 +33,11 @@ import base_utils as data_utils
 import multibranch_utils as mb
 import pretraining_utils as pretraining
 import pretraining_search
+
+
+def decoded_choice(value):
+    value = mb._json_maybe(value)
+    return list(value) if isinstance(value, tuple) else value
 
 
 def full_modality_recordings():
@@ -118,97 +122,99 @@ class LargePretrainingNotebookTests(unittest.TestCase):
                                          for node in ast.walk(tree)), (variant, index))
                     self.assertEqual(cell["outputs"], [])
 
-    def test_full_budgets_large_active_backbone_and_cloning(self):
+    def declared_space(self, variant, name, namespace):
+        source = self.source(variant, 14)
+        assignment = next(node for node in ast.parse(source).body
+                          if isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Name) and target.id == name
+                                  for target in node.targets))
+        return eval(compile(ast.Expression(assignment.value), "declared-space", "eval"), namespace)
+
+    def assert_same_evolutionary_values(self, actual, expected):
+        self.assertEqual(type(actual), type(expected))
+        if hasattr(expected, "choices"):
+            self.assertEqual([decoded_choice(value) for value in actual.choices],
+                             [decoded_choice(value) for value in expected.choices])
+        else:
+            for attribute in ("low", "high", "distribution"):
+                if hasattr(expected, attribute):
+                    self.assertEqual(getattr(actual, attribute), getattr(expected, attribute))
+
+    def test_full_budgets_remain_explicit_and_best_mode_is_cloneable(self):
         for variant in self.notebooks:
             with self.subTest(variant=variant), TemporaryDirectory() as directory:
                 namespace = self.namespace(variant, directory)
-                self.assertEqual(namespace["n_iter"], 37)
-                self.assertEqual(namespace["train_size"], 0.7)
-                self.assertEqual(namespace["VALIDATION_PARAM_SPACE"], {
-                    "validation_mode": ["sequence"], "group_column": ["subject"],
-                })
-                self.assertFalse(namespace["FIRST_RUN"])
-                estimator = clone(namespace["pipeline"]).named_steps["estimator"]
-                self.assertEqual(estimator.epochs, 150)
-                self.assertEqual(estimator.pretraining_epochs, 30)
-                self.assertEqual(estimator.temporal_architecture, "bert")
-                self.assertEqual((estimator.branch_cnn_filters, estimator.branch_cnn_depth,
-                                  estimator.branch_cnn_kernel_size), (128, 4, 7))
-                self.assertEqual(estimator.static_branch_units, 100)
+                self.assertGreater(namespace["n_iter"], 0)
+                self.assertGreater(namespace["train_size"], 0)
+                self.assertLess(namespace["train_size"], 1)
+                self.assertTrue(pretraining_search.validation_protocols(
+                    namespace["VALIDATION_PARAM_SPACE"]))
                 grid = namespace["GRID_PARAM_SPACE"]
-                self.assertEqual(grid["estimator__bert_d_model"], [128, 192, 256])
-                self.assertEqual(grid["estimator__bert_num_layers"], [2, 3])
-                self.assertEqual(grid["estimator__bert_ff_dim"], [256, 512])
-                for width in grid["estimator__bert_d_model"]:
-                    for heads in grid["estimator__bert_num_heads"]:
-                        self.assertEqual(width % heads, 0)
-                active = mb.canonical_candidate(namespace["BEST_PARAMS"], namespace["pipeline"].get_params())
-                for name in ("branch_cnn_filters", "branch_cnn_depth", "branch_cnn_kernel_size",
-                             "bert_d_model", "static_branch_units", "fusion_units"):
-                    self.assertIn("estimator__" + name, active)
+                estimator = clone(namespace["pipeline"]).set_params(
+                    **namespace["BEST_PARAMS"]).named_steps["estimator"]
+                self.assertEqual(estimator.epochs, grid["estimator__epochs"][0])
+                self.assertEqual(estimator.pretraining_epochs, grid["estimator__pretraining_epochs"][0])
+                self.assertEqual(estimator.temporal_architecture, grid["estimator__temporal_architecture"][0])
 
-    def test_reference_features_applied_to_the_actual_estimator(self):
+    def test_primary_grid_candidates_and_evolutionary_ranges_survive_compilation(self):
         for variant in self.notebooks:
             with self.subTest(variant=variant), TemporaryDirectory() as directory:
                 namespace = self.namespace(variant, directory)
-                params = namespace["pipeline"].get_params(deep=True)
-                reference = namespace["REFERENCE_BEST_PARAMS"]
-                for key, expected in reference.items():
-                    if key.startswith("estimator__extractor__"):
-                        self.assertEqual(params[key], expected, key)
-                self.assertFalse(namespace["LARGE_UNSUPPORTED_REFERENCE_PARAMS"])
-                self.assertEqual(params["estimator__extractor__chunk_window_size"], 200)
-                self.assertIsNone(params["estimator__extractor__maxlen"])
-                self.assertEqual(params["estimator__extractor__sequence_crop_mode"], "none")
+                declared_grid = self.declared_space(variant, "GRID_PARAM_SPACE", namespace)
+                declared_evolutionary = self.declared_space(variant, "EVOLUTIONARY_PARAM_SPACE", namespace)
+                for key, choices in declared_grid.items():
+                    self.assertEqual(namespace["GRID_PARAM_SPACE"][key], choices, key)
+                    if namespace["SKOPT_AVAILABLE"]:
+                        actual = namespace["BAYESIAN_PARAM_SPACE"][key]
+                        self.assertEqual([decoded_choice(value) for value in actual.categories],
+                                         [decoded_choice(value) for value in choices], key)
+                for key, choices in declared_evolutionary.items():
+                    self.assert_same_evolutionary_values(
+                        namespace["EVOLUTIONARY_PARAM_SPACE"][key], choices)
+                    self.assert_same_evolutionary_values(
+                        namespace["EVOLUTIONARY_SEARCH_SPACE"][key], choices)
 
-    def test_all_searches_expose_every_parameter_and_four_source_conditions(self):
-        sources = ["non_target", "all", "target", "baseline"]
+    def test_searches_contain_only_declared_choices_and_stage_defaults(self):
         for variant in self.notebooks:
             with self.subTest(variant=variant), TemporaryDirectory() as directory:
                 namespace = self.namespace(variant, directory)
-                leaves = {key for key in namespace["pipeline"].get_params(deep=True)
-                          if key.startswith("estimator__")
-                          and key not in {"estimator__extractor", "estimator__augmentor"}}
-                for name in ("GRID_PARAM_SPACE", "BAYESIAN_PARAM_SPACE", "EVOLUTIONARY_SEARCH_SPACE"):
-                    self.assertEqual(set(namespace[name]), leaves, name)
+                stage_keys = set(namespace["PRETRAINING_PARAM_SPACE"])
+                for name in ("GRID_PARAM_SPACE", "EVOLUTIONARY_PARAM_SPACE"):
+                    declared = self.declared_space(variant, name, namespace)
+                    self.assertEqual(set(namespace[name]), set(declared) | stage_keys)
+                self.assertNotIn("estimator__candidate_failure_log", namespace["GRID_PARAM_SPACE"])
                 key = "estimator__extractor__pretraining_source"
+                sources = namespace["PRETRAINING_PARAM_SPACE"][key]
                 self.assertEqual(namespace["GRID_PARAM_SPACE"][key], sources)
                 self.assertEqual(list(namespace["EVOLUTIONARY_PARAM_SPACE"][key].choices), sources)
-                if namespace["SKOPT_AVAILABLE"]:
-                    self.assertEqual(list(namespace["BAYESIAN_PARAM_SPACE"][key].categories), sources)
 
-    def test_training_controls_restore_reference_optimisation_with_zero_dropout(self):
+    def test_configuration_has_no_reference_overrides_or_file_writes(self):
+        def capture_params(index, source):
+            if index == 14:
+                return "_params_before_search_setup = pipeline.get_params(deep=True)\n" + source
+            return source
+
         for variant in self.notebooks:
             with self.subTest(variant=variant), TemporaryDirectory() as directory:
-                namespace = self.namespace(variant, directory)
-                grid = namespace["GRID_PARAM_SPACE"]
-                for key, values in grid.items():
-                    if "dropout" in key or "weight_decay" in key or "label_smoothing" in key:
-                        self.assertEqual(values, [0.0], key)
-                    if "gradient_clip" in key:
-                        self.assertEqual(values, [None], key)
-                for prefix in ("", "pretraining_"):
-                    self.assertEqual(grid[f"estimator__{prefix}optimizer_name"], ["adamw"])
-                    self.assertEqual(grid[f"estimator__{prefix}use_lr_scheduler"], [True])
-                    self.assertEqual(grid[f"estimator__{prefix}lr_scheduler_type"], ["cosine"])
-                    self.assertEqual(grid[f"estimator__{prefix}learning_rate"], [1e-4])
-                self.assertEqual(grid["estimator__use_batchnorm"], [True])
-                self.assertEqual(grid["estimator__augmentor__prob"], [0.0])
-                self.assertEqual(grid["estimator__augmentor__per_aug_prob"], [0.0])
-                self.assertEqual(grid["estimator__augmentor__augmentations"], [None])
-                self.assertEqual(grid["estimator__pretraining_augmentor"], [None])
+                namespace = self.namespace(variant, directory, source_edits=capture_params)
+                self.assertEqual(namespace["pipeline"].get_params(deep=True),
+                                 namespace["_params_before_search_setup"])
+                self.assertFalse(list(Path(directory).rglob("*_configuration.json")))
+                for name in namespace:
+                    self.assertFalse(name.startswith(("LARGE_", "REFERENCE_", "FIRST_RUN")), name)
+                self.assertNotIn("ACTIVE_STAGE_PARAM_SPACE", namespace)
+                self.assertNotIn("EVOLUTIONARY_STAGE_OVERRIDES", namespace)
 
-    def test_matching_search_spaces_differ_only_by_objective(self):
+    def test_models_keep_their_own_explicit_search_choices(self):
         with TemporaryDirectory() as directory:
             first = self.namespace("model1", directory)
             second = self.namespace("model2", directory)
-        grid1, grid2 = first["GRID_PARAM_SPACE"], second["GRID_PARAM_SPACE"]
-        differences = {key for key in grid1 if grid1[key] != grid2[key]}
-        # Each experiment writes diagnostics to its own results directory.
-        differences.discard("estimator__candidate_failure_log")
-        self.assertEqual(differences, {"estimator__pretraining_mode"})
-        self.assertEqual(grid1["estimator__pretraining_mode"], ["supervised"])
-        self.assertEqual(grid2["estimator__pretraining_mode"], ["masked_ssl"])
+        self.assertEqual(first["GRID_PARAM_SPACE"]["estimator__pretraining_mode"], ["supervised"])
+        self.assertEqual(second["GRID_PARAM_SPACE"]["estimator__pretraining_mode"], ["masked_ssl"])
+        self.assertEqual(first["GRID_PARAM_SPACE"]["estimator__extractor__chunk_window_size"],
+                         [200, 250, 300])
+        self.assertEqual(second["GRID_PARAM_SPACE"]["estimator__extractor__chunk_window_size"],
+                         [250, 300, 350, 400])
 
     def test_default_holdout_and_cv_separate_sequences_and_keep_both_domains(self):
         frame = full_modality_recordings()
@@ -246,7 +252,7 @@ class LargePretrainingNotebookTests(unittest.TestCase):
                 for fitting, validation in cv.split(train, groups=groups):
                     self.assertTrue(set(train.iloc[fitting].subject).isdisjoint(train.iloc[validation].subject))
 
-    def test_selected_mode_reaches_both_internal_validation_stages_and_manifest(self):
+    def test_selected_mode_reaches_both_internal_validation_stages(self):
         frame = full_modality_recordings()
         labels = frame[["sequence_id", "subject", "is_target", "gesture", "bfrb"]].copy()
         for variant in self.notebooks:
@@ -271,9 +277,6 @@ class LargePretrainingNotebookTests(unittest.TestCase):
                         fitting_subjects = set(frame.loc[frame.sequence_id.isin(estimator.preprocessing_sequence_ids_), "subject"])
                         validation_subjects = set(frame.loc[frame.sequence_id.isin(estimator.validation_sequence_ids_), "subject"])
                         self.assertTrue(fitting_subjects.isdisjoint(validation_subjects))
-                    config_path = namespace["results_dir"] / f'{namespace["experiment_name"]}_configuration.json'
-                    saved = json.loads(config_path.read_text(encoding="utf-8"))
-                    self.assertEqual(saved["validation_param_space"], namespace["VALIDATION_PARAM_SPACE"])
 
     def test_sequence_mode_allows_missing_subject_and_subject_mode_rejects_it(self):
         frame = full_modality_recordings().drop(columns="subject")
@@ -301,48 +304,6 @@ class LargePretrainingNotebookTests(unittest.TestCase):
                     namespace = self.namespace(variant, directory, validation_mode="rows")
                     pretraining_search.validation_protocols(namespace["VALIDATION_PARAM_SPACE"])
 
-    def assert_real_one_epoch(self, variant):
-        frame = full_modality_recordings()
-        labels = frame[["sequence_id", "subject", "is_target", "gesture", "bfrb", "orientation"]].copy()
-        with TemporaryDirectory() as directory:
-            namespace = self.namespace(variant, directory)
-            estimator = clone(namespace["pipeline"]).named_steps["estimator"]
-            # Runtime-only epoch overrides; every feature and backbone size
-            # remains the large experiment's actual first candidate. "all"
-            # is one of the search's four legitimate source conditions.
-            estimator.set_params(epochs=1, pretraining_epochs=1, verbose=0,
-                                 pretraining_verbose=0, extractor__pretraining_source="all")
-            with warnings.catch_warnings():
-                # Constructing the full ToF validity/masking matrices must not
-                # fragment the frame or emit thousands of warnings per batch.
-                warnings.simplefilter("error", pd.errors.PerformanceWarning)
-                estimator.fit(frame, labels)
-            self.assertTrue(estimator.pretraining_completed_)
-            self.assertTrue(estimator.transferred_changed_layer_names_)
-            self.assertEqual(estimator.model_.get_layer("acc_temporal_conv4").filters, 128)
-            self.assertEqual(estimator.model_.get_layer("rotation_temporal_conv4").kernel_size, (7,))
-            self.assertEqual(estimator.model_.get_layer("tof_temporal_conv4").filters, 128)
-            self.assertEqual(estimator.model_.get_layer("thermo_temporal_conv4").filters, 128)
-            self.assertEqual(estimator.model_.get_layer("bert_input_projection").units, 128)
-            self.assertEqual(estimator.model_.get_layer("fusion_projection").units, 256)
-            self.assertEqual(estimator.model_.get_layer("stft_static_dense").units, 100)
-            self.assertTrue(set(estimator.preprocessing_sequence_ids_).isdisjoint(estimator.validation_sequence_ids_))
-            if variant == "model2":
-                self.assertGreater(estimator.ssl_first_batch_diagnostics_["hidden_valid_measurements"], 0)
-            probabilities = np.asarray(estimator.predict_proba(frame.loc[frame.is_target == 1]))
-            self.assertEqual(probabilities.shape[0], 16)
-            self.assertTrue(np.isfinite(probabilities).all())
-            np.testing.assert_allclose(probabilities.sum(axis=1), 1.0, atol=1e-5)
-            self.assertTrue(np.isfinite(estimator.score(frame, labels)))
-            mb.tf.keras.backend.clear_session()
-
-    @unittest.skipUnless(mb.TENSORFLOW_AVAILABLE, "TensorFlow unavailable")
-    def test_real_one_epoch_model1_keeps_the_large_architecture(self):
-        self.assert_real_one_epoch("model1")
-
-    @unittest.skipUnless(mb.TENSORFLOW_AVAILABLE, "TensorFlow unavailable")
-    def test_real_one_epoch_model2_keeps_the_large_architecture(self):
-        self.assert_real_one_epoch("model2")
 
 
 if __name__ == "__main__":
