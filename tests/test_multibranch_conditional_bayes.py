@@ -22,19 +22,22 @@ class ConditionalBayesianTests(unittest.TestCase):
         settings.update(controls)
         return HierarchicalBayesSearchCV(dry_pipeline(), search_spaces=space, **settings)
 
-    def test_bert_spends_budget_on_active_widths_instead_of_shared_gru_options(self):
+    def test_bert_preserves_requested_gru_domains_and_fit_values(self):
         cat = self.Categorical
         search = self.search({
             'estimator__temporal_architecture': cat(['bert']),
             'estimator__bert_d_model': cat([32, 64, 128]),
-            'estimator__gru_units': cat(list(range(4, 300))),
+            'estimator__gru_units': cat([4, 8, 16]),
             'estimator__gru_layers': cat([1, 2, 3, 4]),
         }).fit(self.X, self.y)
         self.assertEqual(search.unique_candidate_count_, 3)
         self.assertEqual(len(FIT_LOG), 6)
-        self.assertEqual({params['bert_d_model'] for params in FIT_LOG}, {32, 64, 128})
         for space in search.conditional_search_spaces_:
-            self.assertFalse(any('gru_' in key for key in space))
+            self.assertEqual(set(space['estimator__gru_units'].categories), {4, 8, 16})
+            self.assertEqual(set(space['estimator__gru_layers'].categories), {1, 2, 3, 4})
+        for params in FIT_LOG:
+            self.assertIn(params['gru_units'], (4, 8, 16))
+            self.assertIn(params['gru_layers'], (1, 2, 3, 4))
 
     def test_repeated_optimizer_points_do_not_consume_the_distinct_fit_budget(self):
         cat = self.Categorical
@@ -52,7 +55,7 @@ class ConditionalBayesianTests(unittest.TestCase):
         self.assertGreater(search.duplicate_proposal_count_, 0)
         self.assertTrue(all(not call.args[1:] and not call.kwargs for call in ask.call_args_list))
 
-    def test_architecture_subspaces_share_one_budget_and_reallocate_exhausted_slots(self):
+    def test_architecture_subspaces_share_one_budget_and_keep_all_requested_values(self):
         cat = self.Categorical
         search = self.search({
             'estimator__temporal_architecture': cat(['bert', 'bigru_attention']),
@@ -62,10 +65,12 @@ class ConditionalBayesianTests(unittest.TestCase):
         self.assertEqual(search.requested_candidate_count_, 4)
         self.assertEqual(search.unique_candidate_count_, 4)
         self.assertEqual(len(FIT_LOG), 8)
-        architectures = [params['estimator__temporal_architecture'] for params in search.cv_results_['params']]
-        self.assertEqual(architectures.count('bert'), 1)
-        self.assertEqual(architectures.count('bigru_attention'), 3)
-        self.assertTrue(search.search_exhausted_)
+        params = search.cv_results_['params']
+        architectures = [p['estimator__temporal_architecture'] for p in params]
+        self.assertEqual(architectures.count('bert'), 2)
+        self.assertEqual(architectures.count('bigru_attention'), 2)
+        self.assertTrue(all(p['estimator__use_bigru'] is True for p in params))
+        self.assertTrue(all(p['estimator__gru_units'] in (8, 16, 32) for p in params))
 
     def test_callback_stops_the_entire_search_after_a_real_evaluation(self):
         cat = self.Categorical

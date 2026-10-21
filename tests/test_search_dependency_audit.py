@@ -1,5 +1,6 @@
 """Non-architecture no-op search knobs and their active counterexamples."""
 import ast
+from copy import deepcopy
 import json
 from pathlib import Path
 import sys
@@ -12,84 +13,89 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from base_utils import (SequenceExtractor, SensorAugmentor, inactive_sequence_parameters,
                         prepare_random_forest_bayesian_spaces)
-from multibranch_utils import canonical_candidate, conditional_bayesian_spaces, HierarchicalGASearchCV
+from multibranch_utils import candidate_error, conditional_bayesian_spaces, HierarchicalGASearchCV
 from test_multibranch_conditional_ga import CountingInt
-from test_multibranch_hierarchical_search import dry_pipeline, toy_data
+from test_multibranch_hierarchical_search import FIT_LOG, dry_pipeline, toy_data
 
 
 class TrainingDependencies(unittest.TestCase):
-    def test_optimizer_and_loss_specific_parameters(self):
-        for optimizer, active in (("adam", set()), ("adamw", {"weight_decay"}), ("sgd", {"momentum"})):
-            result = canonical_candidate(dict(optimizer_name=optimizer, momentum=0.7, weight_decay=0.01))
-            self.assertEqual(set(result) & {"momentum", "weight_decay"}, active)
-        self.assertNotIn("label_smoothing", canonical_candidate(dict(loss_name="focal", label_smoothing=0.2)))
-        self.assertIn("label_smoothing", canonical_candidate(dict(loss_name="sparse_cce", label_smoothing=0.2)))
+    def assert_retained(self, params, base=None):
+        FIT_LOG.clear()
+        pipeline = dry_pipeline()
+        if base:
+            pipeline.set_params(**{'estimator__' + key: value for key, value in base.items()})
+        supplied = {'estimator__' + key: value for key, value in params.items()}
+        before = deepcopy(params)
+        search = HierarchicalGASearchCV(pipeline, param_grid={key: [value] for key, value in supplied.items()},
+            population_size=2, tournament_size=2, generations=0, refit=False, cv=2, verbose=0)
+        x, y = toy_data()
+        search.fit(x, y)
+        self.assertEqual(len(search.cv_results_['params']), 1)
+        reported = search.cv_results_['params'][0]
+        self.assertEqual(set(reported), set(supplied))
+        for key, value in supplied.items():
+            actual = reported[key]
+            if isinstance(value, (dict, list, tuple)) and isinstance(actual, str):
+                actual = json.loads(actual)
+            self.assertEqual(actual, value)
+        self.assertEqual(len(FIT_LOG), 2)
+        for fitted in FIT_LOG:
+            for key in params:
+                self.assertEqual(fitted[key], reported['estimator__' + key])
+        self.assertEqual(params, before)
 
-    def test_scheduler_family_and_validation_dependencies(self):
-        knobs = dict(lr_scheduler_type="plateau", lr_factor=0.2, lr_patience=3,
+    def test_optimizer_and_loss_settings_reach_fit_unchanged(self):
+        for optimizer in ('adam', 'adamw', 'sgd'):
+            self.assert_retained(dict(optimizer_name=optimizer, momentum=0.7, weight_decay=0.01))
+        for loss in ('focal', 'sparse_cce'):
+            self.assert_retained(dict(loss_name=loss, label_smoothing=0.2))
+
+    def test_scheduler_settings_are_kept_for_disabled_and_unused_families(self):
+        knobs = dict(lr_scheduler_type='plateau', lr_factor=0.2, lr_patience=3,
                      min_lr=1e-5, cosine_t_max=10, warmup_epochs=2)
-        self.assertFalse(set(knobs) & set(canonical_candidate(knobs)))
-        plateau = canonical_candidate(dict(knobs, use_lr_scheduler=True))
-        self.assertIn("lr_factor", plateau)
-        self.assertNotIn("warmup_epochs", plateau)
-        cosine = canonical_candidate(dict(knobs, use_lr_scheduler=True, lr_scheduler_type="cosine"))
-        self.assertIn("warmup_epochs", cosine)
-        self.assertNotIn("lr_factor", cosine)
-        no_validation = canonical_candidate(dict(knobs, use_lr_scheduler=True, validation_split=0))
-        self.assertNotIn("min_lr", no_validation)
-        self.assertIn("min_lr", canonical_candidate(dict(knobs, use_lr_scheduler=True,
-                          lr_scheduler_type="cosine", validation_split=0)))
+        self.assert_retained(knobs)
+        self.assert_retained(dict(knobs, use_lr_scheduler=True))
+        self.assert_retained(dict(knobs, use_lr_scheduler=True, lr_scheduler_type='cosine'))
+        self.assert_retained(dict(knobs, use_lr_scheduler=True, validation_split=0))
 
-    def test_disabled_augmentation_and_selected_transform_controls(self):
+    def test_disabled_augmentation_keeps_every_requested_value(self):
         aug = SensorAugmentor(prob=0.5, per_aug_prob=0.5)
-        base = {"augmentor": aug}
-        disabled = canonical_candidate({"augmentor__prob": 0, "augmentor__noise_std": 8,
-                                        "augmentor__per_aug_prob": 0.8}, base)
-        self.assertNotIn("augmentor__noise_std", disabled)
-        self.assertEqual(disabled["augmentor__per_aug_prob"], 0)
-        jitter = canonical_candidate({"augmentor__augmentations": '["jitter"]',
-                                      "augmentor__noise_std": 8, "augmentor__jitter_sigma": 0.2}, base)
-        self.assertNotIn("augmentor__noise_std", jitter)
-        self.assertIn("augmentor__jitter_sigma", jitter)
-        empty = canonical_candidate({"augmentor__augmentations": []}, base)
-        self.assertEqual(empty["augmentor__augmentations"], [])
+        self.assert_retained({'augmentor__prob': 0, 'augmentor__noise_std': 8,
+                              'augmentor__per_aug_prob': 0.8}, {'augmentor': aug})
+        self.assert_retained({'augmentor__augmentations': '["jitter"]',
+                              'augmentor__noise_std': 8, 'augmentor__jitter_sigma': 0.2}, {'augmentor': aug})
+        self.assert_retained({'augmentor__augmentations': []}, {'augmentor': aug})
 
-    def test_temporal_spatial_only_branch_drops_generic_cnn_but_keeps_spatial_filters(self):
-        params = dict(temporal_architecture="phase_attention", tof_encoder_type="spatial_cnn",
-                      extractor__acc_modes="", extractor__rotation_modes="", extractor__thm_modes="",
-                      extractor__tof_modes="raw", extractor__stft_configs=None, extractor__cwt_configs=None,
+    def test_spatial_only_candidate_keeps_other_branch_settings(self):
+        params = dict(temporal_architecture='phase_attention', tof_encoder_type='spatial_cnn',
+                      extractor__acc_modes='', extractor__rotation_modes='', extractor__thm_modes='',
+                      extractor__tof_modes='raw', extractor__stft_configs=None, extractor__cwt_configs=None,
                       static_branch_units=20, branch_cnn_filters=32, use_se=True, se_ratio=8,
                       use_residual=True, use_batchnorm=True, cnn_filters=64, tof_spatial_filters=16)
-        active = canonical_candidate(params)
-        for name in ("static_branch_units", "branch_cnn_filters", "use_se", "se_ratio"):
-            self.assertNotIn(name, active)
-        for name in ("use_residual", "use_batchnorm", "cnn_filters", "tof_spatial_filters"):
-            self.assertIn(name, active)
-        active = canonical_candidate(dict(params, extractor__acc_modes="raw"))
-        self.assertIn("branch_cnn_filters", active)
-        self.assertIn("use_se", active)
+        self.assert_retained(params)
+        self.assert_retained(dict(params, extractor__acc_modes='raw'))
 
-    def test_unknown_extractor_subclasses_are_not_pruned_as_native(self):
+    def test_unknown_extractor_subclass_is_not_mutated(self):
         class Custom(SequenceExtractor):
             pass
-        params = {"extractor": Custom(), "extractor__use_dead_reckoning": True}
-        self.assertIn("extractor__use_dead_reckoning", canonical_candidate(params))
+        extractor = Custom()
+        params = {'extractor': extractor, 'extractor__use_dead_reckoning': True}
+        self.assertIsNone(candidate_error(params))
+        self.assertIs(params['extractor'], extractor)
+        self.assertTrue(params['extractor__use_dead_reckoning'])
+        self.assertFalse(extractor.use_dead_reckoning)
 
-    def test_legacy_branch_dicts_drop_disabled_sensors_and_unused_filter_tail(self):
-        common = dict(extractor__rotation_modes="", extractor__tof_modes="", extractor__thm_modes="",
+    def test_branch_dicts_keep_disabled_sensors_and_complete_filter_lists(self):
+        common = dict(extractor__rotation_modes='', extractor__tof_modes='', extractor__thm_modes='',
                       extractor__stft_configs=None, extractor__cwt_configs=None,
-                      branch_num_conv_layers=2, branch_filter_mode="custom")
-        first = canonical_candidate(dict(common, branch_filters={"acc": [16, 32, 999], "tof": 888}))
-        second = canonical_candidate(dict(common, branch_filters={"acc": [16, 32, 1], "tof": -5}))
-        self.assertEqual(first, second)
-        self.assertEqual(first["branch_filters"], {"acc": [16, 32]})
-        scalar = canonical_candidate(dict(common, branch_filters={"acc": 16}))
-        repeated = canonical_candidate(dict(common, branch_filters={"acc": [16, 16]}))
-        self.assertEqual(scalar, repeated)
+                      branch_num_conv_layers=2, branch_filter_mode='custom')
+        self.assert_retained(dict(common, branch_filters={'acc': [16, 32, 999], 'tof': 888}))
+        self.assert_retained(dict(common, branch_filters={'acc': [16, 32, 1], 'tof': 5}))
+        self.assert_retained(dict(common, branch_filters={'acc': 16}))
+        self.assert_retained(dict(common, branch_filters={'acc': [16, 16]}))
 
-    def test_missing_branch_entry_keeps_its_real_builder_fallback(self):
-        active = canonical_candidate(dict(branch_filters={"tof": 16}, extractor__tof_modes=""))
-        self.assertEqual(active["branch_filters"]["acc"], [32])
+    def test_missing_branch_entries_are_not_inserted(self):
+        self.assert_retained(dict(branch_filters={'tof': 16}, extractor__tof_modes=''))
 
 
 class ExtractorDependencies(unittest.TestCase):
@@ -125,18 +131,16 @@ class ExtractorDependencies(unittest.TestCase):
         self.assertNotIn("stft_nperseg", partial)
         self.assertIn("stft_nperseg", inactive_sequence_parameters({"stft_window_seconds": 0.5}))
 
-    def test_spectral_unused_internal_fields_and_aliases_share_a_candidate(self):
-        first = {"extractor__stft_configs": [{"acc_modes": "raw", "window_seconds": 0.5,
-                                              "nperseg": 8, "scaling": "density"}],
-                 "extractor__cwt_configs": [{"acc_modes": "raw", "widths": [2, 3, 4],
-                                             "n_scales": 20, "min_scale": 3}]}
-        second = {"extractor__stft_configs": [{"acc_modes": "jerk", "window_seconds": 0.5,
-                                               "nperseg": 32, "scaling": "psd"}],
-                  "extractor__cwt_configs": [{"acc_modes": "", "widths": [2, 3, 4],
-                                              "n_scales": 40, "min_scale": 4}]}
-        before = json.loads(json.dumps(first))
-        self.assertEqual(canonical_candidate(first), canonical_candidate(second))
-        self.assertEqual(first, before)
+    def test_spectral_configuration_fields_are_retained_without_rewriting(self):
+        configs = [{'acc_modes': 'raw', 'window_seconds': 0.5, 'nperseg': 8, 'scaling': 'density'},
+                   {'acc_modes': 'jerk', 'window_seconds': 0.5, 'nperseg': 32, 'scaling': 'psd'}]
+        params = {'extractor__stft_configs': [[config] for config in configs]}
+        before = deepcopy(params)
+        compiled = conditional_bayesian_spaces(params)[0]
+        actual = [json.loads(value) if isinstance(value, str) else value
+                  for value in compiled['extractor__stft_configs'].categories]
+        self.assertEqual(actual, [[config] for config in configs])
+        self.assertEqual(params, before)
 
     def test_dead_reckoning_unconsumed_vs_explicit_spectral_consumer(self):
         x = pd.DataFrame({"sequence_id": ["a"] * 12, "sequence_counter": range(12),
@@ -201,31 +205,34 @@ class SearchIntegration(unittest.TestCase):
                                               "estimator__use_se": [True]}, np.random.default_rng(5))
         self.assertTrue(proposal["estimator__use_se"])
 
-    def test_ga_does_not_draw_non_sgd_momentum_or_disabled_scheduler_rates(self):
+    def test_ga_samples_and_retains_every_requested_training_setting(self):
         momentum, warmup = CountingInt(1, 8), CountingInt(1, 8)
         search = HierarchicalGASearchCV(dry_pipeline(), param_grid={
-            "estimator__optimizer_name": ["adam"], "estimator__momentum": momentum,
-            "estimator__use_lr_scheduler": [False], "estimator__warmup_epochs": warmup,
+            'estimator__optimizer_name': ['adam'], 'estimator__momentum': momentum,
+            'estimator__use_lr_scheduler': [False], 'estimator__warmup_epochs': warmup,
         }, population_size=2, tournament_size=2, generations=0, refit=False, cv=2, verbose=0)
         x, y = toy_data()
         search.fit(x, y)
-        self.assertEqual((momentum.draws, warmup.draws), (0, 0))
+        self.assertGreaterEqual(momentum.draws, 2)
+        self.assertGreaterEqual(warmup.draws, 2)
+        for params in search.cv_results_['params']:
+            self.assertIn('estimator__momentum', params)
+            self.assertIn('estimator__warmup_epochs', params)
 
-    def test_bayes_keeps_dependencies_when_their_switch_is_searched(self):
+    def test_bayes_keeps_requested_dimensions_for_fixed_and_searched_switches(self):
         try:
             from skopt.space import Categorical
         except ImportError:
-            self.skipTest("scikit-optimize unavailable")
-        space = dict(temporal_architecture=Categorical(["bert"]),
-                     optimizer_name=Categorical(["adam", "sgd"]), momentum=Categorical([0.1, 0.9]),
+            self.skipTest('scikit-optimize unavailable')
+        space = dict(temporal_architecture=Categorical(['bert']),
+                     optimizer_name=Categorical(['adam', 'sgd']), momentum=Categorical([0.1, 0.9]),
                      use_lr_scheduler=Categorical([False, True]), warmup_epochs=Categorical([0, 2]),
-                     lr_scheduler_type=Categorical(["cosine"]))
-        compiled = conditional_bayesian_spaces(space)[0]
-        self.assertIn("momentum", compiled)
-        self.assertIn("warmup_epochs", compiled)
-        compiled = conditional_bayesian_spaces(dict(space, optimizer_name=["adam"], use_lr_scheduler=[False]))[0]
-        self.assertNotIn("momentum", compiled)
-        self.assertNotIn("warmup_epochs", compiled)
+                     lr_scheduler_type=Categorical(['cosine']))
+        for requested in (space, dict(space, optimizer_name=['adam'], use_lr_scheduler=[False])):
+            compiled = conditional_bayesian_spaces(requested)[0]
+            self.assertEqual(set(compiled), set(requested))
+            self.assertEqual(tuple(compiled['momentum'].categories), (0.1, 0.9))
+            self.assertEqual(tuple(compiled['warmup_epochs'].categories), (0, 2))
 
 
 class ForestDependencies(unittest.TestCase):

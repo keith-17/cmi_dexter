@@ -1,5 +1,6 @@
 """Architecture-aware search regressions without expensive model training."""
 import unittest
+from copy import deepcopy
 from unittest.mock import patch
 
 import numpy as np
@@ -8,7 +9,7 @@ from sklearn.base import clone
 from sklearn.pipeline import Pipeline
 
 from test_multibranch_utils_params import mba, ECat, EInt, make_pipeline
-from multibranch_utils import candidate_error, canonical_candidate
+from multibranch_utils import candidate_error
 from multibranch_utils import (
     HierarchicalGASearchCV,
     HierarchicalBayesSearchCV,
@@ -57,22 +58,14 @@ class CandidateHierarchyTests(unittest.TestCase):
         search._initialise_rules(self.y, {})
         self.assertEqual(search._penalty(), -5.0)
 
-    def test_bert_retains_branch_cnn_but_discards_other_backbone_knobs(self):
-        params = {
-            'estimator__temporal_architecture': 'bert',
-            'estimator__branch_cnn_filters': 16,
-            'estimator__branch_cnn_depth': 3,
-            'estimator__cnn_depth': 99,
-            'estimator__gru_units': 99,
-            'estimator__phase_attention_units': 99,
-            'estimator__branch_num_conv_layers': 99,
-        }
-        active = canonical_candidate(params, self.base)
-        self.assertEqual(active['estimator__branch_cnn_filters'], 16)
-        self.assertEqual(active['estimator__branch_cnn_depth'], 3)
-        for name in ('cnn_depth', 'gru_units', 'phase_attention_units', 'branch_num_conv_layers'):
-            self.assertNotIn('estimator__' + name, active)
+    def test_bert_preflight_preserves_all_supplied_backbone_knobs(self):
+        params = {'estimator__temporal_architecture': 'bert',
+                  'estimator__branch_cnn_filters': 16, 'estimator__branch_cnn_depth': 3,
+                  'estimator__cnn_depth': -99, 'estimator__gru_units': -99,
+                  'estimator__phase_attention_units': -99, 'estimator__branch_num_conv_layers': -99}
+        before = deepcopy(params)
         self.assertIsNone(candidate_error(params, self.base, y=self.y))
+        self.assertEqual(params, before)
 
     def test_irrelevant_invalid_values_do_not_disqualify_bert(self):
         params = {'estimator__temporal_architecture': 'bert',
@@ -88,26 +81,26 @@ class CandidateHierarchyTests(unittest.TestCase):
             with self.subTest(extra=extra):
                 self.assertTrue(candidate_error(params, self.base, y=self.y))
 
-    def test_bert_attention_pooling_keeps_attention_options(self):
-        params = {'estimator__temporal_architecture': 'bert',
-                  'estimator__bert_pooling': 'attention',
-                  'estimator__attention_type': 'additive', 'estimator__attention_units': 17}
-        active = canonical_candidate(params, self.base)
-        self.assertEqual(active['estimator__attention_units'], 17)
-        self.assertEqual(active['estimator__attention_type'], 'additive')
+    def test_bert_attention_validation_tracks_pooling_without_rewriting_options(self):
+        params = {'estimator__temporal_architecture': 'bert', 'estimator__bert_pooling': 'attention',
+                  'estimator__attention_type': 'additive', 'estimator__attention_units': 0}
+        before = deepcopy(params)
+        self.assertIn('attention_units', candidate_error(params, self.base))
+        self.assertEqual(params, before)
         params['estimator__bert_pooling'] = 'avg'
-        active = canonical_candidate(params, self.base)
-        self.assertNotIn('estimator__attention_units', active)
-        self.assertNotIn('estimator__attention_type', active)
+        before = deepcopy(params)
+        self.assertIsNone(candidate_error(params, self.base))
+        self.assertEqual(params, before)
 
-    def test_aux_flags_activate_temporal_branch_encoder_on_legacy_backbone(self):
+    def test_aux_flags_activate_validation_without_dropping_legacy_values(self):
         params = {'estimator__temporal_architecture': 'bigru_attention',
                   'estimator__use_bigru': False, 'estimator__use_orientation_aux_head': True,
-                  'estimator__branch_cnn_depth': 3, 'estimator__branch_num_conv_layers': 7}
-        active = canonical_candidate(params, self.base)
-        self.assertEqual(active['estimator__branch_cnn_depth'], 3)
-        self.assertNotIn('estimator__branch_num_conv_layers', active)
+                  'estimator__branch_cnn_depth': 3, 'estimator__branch_num_conv_layers': 0}
+        before = deepcopy(params)
         self.assertIsNone(candidate_error(params, self.base, y=self.y))
+        self.assertEqual(params, before)
+        params['estimator__branch_cnn_depth'] = 0
+        self.assertIn('branch_cnn_depth', candidate_error(params, self.base, y=self.y))
 
     def test_orientation_requires_labels_only_when_enabled(self):
         labels = self.y.drop(columns='orientation')
@@ -132,20 +125,18 @@ class CandidateHierarchyTests(unittest.TestCase):
             with self.subTest(heads=heads):
                 self.assertTrue(candidate_error({'estimator__custom_aux_heads': heads}, self.base, y=self.y))
 
-    def test_disabled_aux_weights_do_not_create_distinct_candidates(self):
-        params = {'estimator__use_orientation_aux_head': False,
-                  'estimator__use_phase_aux_head': False,
-                  'estimator__orientation_loss_weight': 0.01,
-                  'estimator__phase_loss_weight': 0.99}
-        active = canonical_candidate(params, self.base)
-        self.assertNotIn('estimator__orientation_loss_weight', active)
-        self.assertNotIn('estimator__phase_loss_weight', active)
+    def test_disabled_aux_weights_remain_unchanged_during_validation(self):
+        params = {'estimator__use_orientation_aux_head': False, 'estimator__use_phase_aux_head': False,
+                  'estimator__orientation_loss_weight': -0.01, 'estimator__phase_loss_weight': -0.99}
+        before = deepcopy(params)
+        self.assertIsNone(candidate_error(params, self.base))
+        self.assertEqual(params, before)
 
-    def test_cnn_branch_encoder_alias_has_one_canonical_representation(self):
-        fixed = {'estimator__temporal_architecture': 'bert'}
-        alias = canonical_candidate(dict(fixed, estimator__branch_encoder_type='cnn'), self.base)
-        name = canonical_candidate(dict(fixed, estimator__branch_encoder_type='conv1d'), self.base)
-        self.assertEqual(alias, name)
+    def test_branch_encoder_aliases_are_accepted_without_rewriting(self):
+        for value in ('cnn', 'conv1d'):
+            params = {'estimator__temporal_architecture': 'bert', 'estimator__branch_encoder_type': value}
+            self.assertIsNone(candidate_error(params, self.base))
+            self.assertEqual(params['estimator__branch_encoder_type'], value)
 
 
 class HierarchicalGATests(unittest.TestCase):
@@ -160,20 +151,21 @@ class HierarchicalGATests(unittest.TestCase):
         controls.update(kwargs)
         return HierarchicalGASearchCV(dry_pipeline(), param_grid=space, **controls)
 
-    def test_inactive_genes_share_cache_and_are_not_applied(self):
+    def test_all_sampled_genes_are_reported_and_applied_to_fits(self):
         search = self.search({
             'estimator__temporal_architecture': ECat(['bert']),
             'estimator__cnn_filters': ECat([17, 19, 23]),
             'estimator__orientation_loss_weight': ECat([0.1, 0.2]),
         }).fit(self.X, self.y)
-        self.assertEqual(len(search.cv_results_['params']), 1)
-        self.assertEqual(len(FIT_LOG), 2)
-        self.assertGreater(search.reused_candidate_count_, 0)
-        for effective in FIT_LOG:
-            self.assertEqual(effective['cnn_filters'], mba.MultiBranchSequenceClassifier().cnn_filters)
-            self.assertEqual(effective['orientation_loss_weight'], mba.MultiBranchSequenceClassifier().orientation_loss_weight)
-        params = search.cv_results_['params'][0]
-        self.assertNotIn('estimator__cnn_filters', params)
+        proposals = search.cv_results_['params']
+        self.assertGreater(len(proposals), 1)
+        self.assertEqual(len(FIT_LOG), 2 * len(proposals))
+        for params in proposals:
+            self.assertIn(params['estimator__cnn_filters'], (17, 19, 23))
+            self.assertIn(params['estimator__orientation_loss_weight'], (0.1, 0.2))
+            matching = [fit for fit in FIT_LOG if fit['cnn_filters'] == params['estimator__cnn_filters']
+                        and fit['orientation_loss_weight'] == params['estimator__orientation_loss_weight']]
+            self.assertEqual(len(matching), 2)
 
     def test_all_invalid_space_terminates_with_finite_penalty_without_fit(self):
         search = self.search({
@@ -200,7 +192,7 @@ class HierarchicalGATests(unittest.TestCase):
         self.assertTrue(all(params['bert_d_model'] == 32 for params in FIT_LOG))
         self.assertTrue((search.cv_results_['mean_test_score'] >= 0).all())
 
-    def test_aux_off_on_choices_train_both_hierarchies_and_report_parameter_union(self):
+    def test_aux_off_on_choices_keep_complete_parameters_in_both_hierarchies(self):
         search = self.search({
             'estimator__temporal_architecture': ECat(['bigru_attention']),
             'estimator__use_bigru': ECat([False]),
@@ -211,16 +203,10 @@ class HierarchicalGATests(unittest.TestCase):
         }, population_size=8, generations=0).fit(self.X, self.y)
         result = search.cv_results_
         self.assertEqual({params['estimator__use_orientation_aux_head'] for params in result['params']}, {False, True})
-        self.assertIn('param_estimator__branch_num_conv_layers', result)
-        self.assertIn('param_estimator__branch_cnn_depth', result)
-        self.assertIn('param_estimator__orientation_loss_weight', result)
         for params in result['params']:
-            if params['estimator__use_orientation_aux_head']:
-                self.assertIn('estimator__branch_cnn_depth', params)
-                self.assertNotIn('estimator__branch_num_conv_layers', params)
-            else:
-                self.assertIn('estimator__branch_num_conv_layers', params)
-                self.assertNotIn('estimator__branch_cnn_depth', params)
+            self.assertEqual(params['estimator__branch_num_conv_layers'], 2)
+            self.assertEqual(params['estimator__branch_cnn_depth'], 3)
+            self.assertEqual(params['estimator__orientation_loss_weight'], 0.2)
 
     def test_validation_phase_labels_alone_do_not_satisfy_training_supervision(self):
         search = self.search({'estimator__use_phase_aux_head': ECat([True])})
@@ -248,18 +234,19 @@ class HierarchicalBayesTests(unittest.TestCase):
         controls.update(kwargs)
         return HierarchicalBayesSearchCV(dry_pipeline(), search_spaces=space, **controls)
 
-    def test_equivalent_valid_proposals_are_evaluated_once(self):
+    def test_distinct_supplied_values_are_evaluated_and_preserved(self):
         search = self.search({
             'estimator__temporal_architecture': self.Categorical(['bert']),
             'estimator__cnn_filters': self.Categorical([17, 19, 23]),
         }).fit(self.X, self.y)
-        self.assertEqual(len(FIT_LOG), 2)
-        self.assertEqual(len(search.cv_results_['params']), 1)
-        self.assertTrue(search.search_exhausted_)
-        self.assertEqual(search.unique_candidate_count_, 1)
-        self.assertNotIn('estimator__cnn_filters', search.conditional_search_spaces_[0])
+        self.assertEqual(len(FIT_LOG), 6)
+        self.assertEqual(len(search.cv_results_['params']), 3)
+        self.assertEqual(search.unique_candidate_count_, 3)
+        self.assertIn('estimator__cnn_filters', search.conditional_search_spaces_[0])
+        self.assertEqual({p['estimator__cnn_filters'] for p in search.cv_results_['params']}, {17, 19, 23})
+        self.assertEqual({p['cnn_filters'] for p in FIT_LOG}, {17, 19, 23})
         self.assertTrue(np.isfinite(search.optimizer_results_[0].func_vals).all())
-        self.assertEqual(len(search.optimizer_results_[0].func_vals), 1)
+        self.assertEqual(len(search.optimizer_results_[0].func_vals), 3)
 
     def test_all_invalid_proposals_finish_and_tell_finite_penalties(self):
         search = self.search({

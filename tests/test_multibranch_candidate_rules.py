@@ -1,5 +1,6 @@
 """Dependency and cheap preflight checks for unattended architecture search."""
 import json
+from copy import deepcopy
 import sys
 import unittest
 from pathlib import Path
@@ -8,38 +9,38 @@ from unittest.mock import patch
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from multibranch_utils import canonical_candidate, candidate_error
+from multibranch_utils import candidate_error
 
 
 class CandidateRulesTests(unittest.TestCase):
-    def test_bert_keeps_branch_cnn_but_drops_other_backbone_parameters(self):
+    def test_bert_validates_active_controls_without_rewriting_candidate(self):
         params = {"estimator__temporal_architecture": "bert", "estimator__branch_cnn_filters": 48,
                   "estimator__cnn_depth": -5, "estimator__gru_units": -5,
                   "estimator__branch_num_conv_layers": -5, "estimator__use_bigru": True,
                   "estimator__phase_attention_temperature": -1, "estimator__branch_encoder_type": "cnn"}
-        before = params.copy()
-        canonical = canonical_candidate(params)
-        self.assertEqual(canonical["estimator__branch_cnn_filters"], 48)
-        self.assertEqual(canonical["estimator__branch_encoder_type"], "conv1d")
-        self.assertFalse(canonical["estimator__use_bigru"])
-        for name in ("cnn_depth", "gru_units", "branch_num_conv_layers", "phase_attention_temperature"):
-            self.assertNotIn("estimator__" + name, canonical)
-        self.assertEqual(params, before)
+        before = deepcopy(params)
         self.assertIsNone(candidate_error(params))
+        self.assertEqual(params, before)
+        self.assertEqual(params["estimator__branch_encoder_type"], "cnn")
+        self.assertTrue(params["estimator__use_bigru"])
 
-    def test_both_candidate_and_base_inactive_bad_values_are_ignored(self):
+    def test_candidate_and_base_inactive_values_are_preserved_and_ignored(self):
         base = {"estimator__temporal_architecture": "bert", "estimator__cnn_depth": -1,
                 "estimator__gru_units": -1, "estimator__branch_filter_mode": "unused"}
+        params = {"estimator__branch_cnn_depth": 0}
+        before_base, before_params = deepcopy(base), deepcopy(params)
         self.assertIsNone(candidate_error({}, base))
-        self.assertIn("branch_cnn_depth", candidate_error({"estimator__branch_cnn_depth": 0}, base))
+        self.assertIn("branch_cnn_depth", candidate_error(params, base))
+        self.assertEqual((base, params), (before_base, before_params))
 
-    def test_bert_attention_uses_general_attention_controls(self):
-        params = {"temporal_architecture": "bert", "attention_type": "additive", "attention_units": 32}
-        self.assertIn("attention_units", canonical_candidate(params))
-        self.assertIn("attention_units", candidate_error(dict(params, attention_units=0)))
-        self.assertNotIn("attention_units", canonical_candidate(dict(params, bert_pooling="avg")))
-        self.assertIsNone(candidate_error(dict(params, bert_pooling="avg", attention_units=0)))
-        self.assertNotIn("attention_units", canonical_candidate(dict(params, attention_type="linear")))
+    def test_bert_attention_validates_width_only_when_consumed(self):
+        params = {"temporal_architecture": "bert", "attention_type": "additive", "attention_units": 0}
+        for extra, invalid in (({}, True), ({"bert_pooling": "avg"}, False), ({"attention_type": "linear"}, False)):
+            candidate = dict(params, **extra)
+            before = deepcopy(candidate)
+            error = candidate_error(candidate)
+            self.assertIn("attention_units", error) if invalid else self.assertIsNone(error)
+            self.assertEqual(candidate, before)
 
     def test_label_cache_reuses_column_check_only_for_same_table(self):
         y = pd.DataFrame({"sequence_id": [1, 2], "orientation": ["a", "b"]})
@@ -51,26 +52,24 @@ class CandidateRulesTests(unittest.TestCase):
         changed = y.drop(columns="orientation")
         self.assertIn("orientation", candidate_error(params, y=changed, label_cache=cache))
 
-    def test_aux_toggle_changes_legacy_branch_parameter_dependencies(self):
-        params = {"branch_num_conv_layers": 3, "branch_cnn_depth": 4, "branch_dropout": .2,
+    def test_aux_toggle_changes_validation_without_removing_branch_parameters(self):
+        legacy = {"branch_num_conv_layers": 0, "branch_cnn_depth": 4, "branch_dropout": .2,
                   "pooling_mode": "mean", "attention_units": 32}
-        legacy = canonical_candidate(params)
-        self.assertIn("branch_num_conv_layers", legacy)
-        self.assertNotIn("branch_cnn_depth", legacy)
-        temporal = canonical_candidate(params, {"use_orientation_aux_head": True})
-        self.assertNotIn("branch_num_conv_layers", temporal)
-        self.assertNotIn("pooling_mode", temporal)
-        self.assertIn("branch_cnn_depth", temporal)
-        self.assertIn("attention_units", temporal)
+        before = deepcopy(legacy)
+        self.assertIn("branch_num_conv_layers", candidate_error(legacy))
+        self.assertIsNone(candidate_error(legacy, {"use_orientation_aux_head": True}))
+        self.assertEqual(legacy, before)
+        temporal = dict(legacy, branch_num_conv_layers=3, branch_cnn_depth=0)
+        self.assertIsNone(candidate_error(temporal))
+        self.assertIn("branch_cnn_depth", candidate_error(temporal, {"use_orientation_aux_head": True}))
 
-    def test_phase_aux_keeps_class_count_without_phase_attention_internals(self):
+    def test_phase_aux_validates_supervision_without_rewriting_phase_controls(self):
         params = {"temporal_architecture": "bert", "use_phase_aux_head": True, "n_phases": 4,
                   "phase_attention_temperature": -1, "phase_attention_units": -1, "phase_fusion_mode": "unused"}
-        canonical = canonical_candidate(params)
-        self.assertEqual(canonical["n_phases"], 4)
-        self.assertNotIn("phase_attention_temperature", canonical)
+        before = deepcopy(params)
         self.assertIsNone(candidate_error(params, phase_labels_available=True))
         self.assertIn("Phase supervision", candidate_error(params))
+        self.assertEqual(params, before)
 
     def test_bert_constraints_are_active_only_for_bert(self):
         for params, reason in [({"bert_d_model": 10, "bert_num_heads": 4}, "divisible"),
@@ -82,12 +81,12 @@ class CandidateRulesTests(unittest.TestCase):
 
     def test_spatial_tof_raw_requirement_and_disabled_modality(self):
         params = {"temporal_architecture": "bert", "tof_encoder_type": "spatial_cnn_gru"}
+        before = deepcopy(params)
         self.assertIn("tof_modes='raw'", candidate_error(params))
         self.assertIsNone(candidate_error(params, {"extractor__tof_modes": "raw"}))
         self.assertIn("tof_modes='raw'", candidate_error(params, {"extractor__tof_modes": "raw|sensor_stats"}))
-        disabled = canonical_candidate(params, {"extractor__tof_modes": ""})
-        self.assertNotIn("tof_encoder_type", disabled)
         self.assertIsNone(candidate_error(params, {"extractor__tof_modes": "", "tof_gru_units": -1}))
+        self.assertEqual(params, before)
 
     def test_head_targets_windows_and_regression_are_checked(self):
         heads = [{"name": "short_head", "target": "numeric", "task": "regression", "window_size": 50}]
@@ -114,13 +113,16 @@ class CandidateRulesTests(unittest.TestCase):
         self.assertIsNone(candidate_error({"orientation_loss_weight": -1, "phase_loss_weight": -1}))
         self.assertIn("orientation_loss_weight", candidate_error({"use_orientation_aux_head": True, "orientation_loss_weight": -1}))
 
-    def test_inferred_orientation_width_and_linear_attention_width_do_not_search(self):
-        params = {"use_orientation_aux_head": True, "orientation_num_classes": 12}
-        self.assertNotIn("orientation_num_classes", canonical_candidate(params))
+    def test_inferred_orientation_and_linear_attention_widths_are_not_validated(self):
+        params = {"use_orientation_aux_head": True, "orientation_num_classes": 0}
+        before = deepcopy(params)
+        self.assertIsNone(candidate_error(params))
+        self.assertEqual(params, before)
         params = {"temporal_architecture": "cnn_attention_pool", "post_fusion_attention_type": "linear",
                   "post_fusion_attention_units": 0}
-        self.assertNotIn("post_fusion_attention_units", canonical_candidate(params))
+        before = deepcopy(params)
         self.assertIsNone(candidate_error(params))
+        self.assertEqual(params, before)
 
     def test_incompatible_candidate_is_penalized_before_extractor_or_tensorflow(self):
         import multibranch_utils as mba

@@ -677,11 +677,20 @@ def _build_temporal_fusion_model(
                     x = layers.Multiply(name=f"{name}_se_gate{layer_idx + 1}")([x, gate])
         encoded.append(x)
 
+    static_depths = _json_maybe(branch_num_conv_layers)
     for name, shape in static_shapes.items():
         branch_input = layers.Input(shape=(shape,), name=f"{name}_input")
         inputs.append(branch_input)
         input_by_name[name] = branch_input
-        x = layers.Dense(static_branch_units, activation="relu", name=f"{name}_static_dense")(branch_input)
+        static_depth = static_depths.get(name, 1) if isinstance(static_depths, dict) else 1
+        if isinstance(static_depth, bool) or not isinstance(static_depth, Integral) or static_depth <= 0:
+            raise ValueError(f"Static branch depth for {name!r} must be a positive integer, got {static_depth!r}.")
+        x = branch_input
+        for layer_idx in range(static_depth - 1):
+            x = layers.Dense(
+                static_branch_units, activation="relu", name=f"{name}_static_hidden{layer_idx + 1}"
+            )(x)
+        x = layers.Dense(static_branch_units, activation="relu", name=f"{name}_static_dense")(x)
         if static_dropout:
             x = layers.Dropout(static_dropout, name=f"{name}_static_dropout")(x)
         if mask_input is not None:
@@ -1161,6 +1170,11 @@ def build_multibranch_model(
     branch_pool_sizes = _json_maybe(branch_pool_sizes) or DEFAULT_BRANCH_POOL_SIZES
     branch_num_conv_layers = _json_maybe(branch_num_conv_layers)
     if isinstance(branch_num_conv_layers, dict):
+        for name in static_shapes:
+            if name in branch_num_conv_layers:
+                depth = branch_num_conv_layers[name]
+                if isinstance(depth, bool) or not isinstance(depth, Integral) or depth <= 0:
+                    raise ValueError(f"Static branch depth for {name!r} must be a positive integer, got {depth!r}.")
         branch_num_conv_layers = {str(k): max(1, int(v)) for k, v in branch_num_conv_layers.items()}
     else:
         branch_num_conv_layers = max(1, int(branch_num_conv_layers))
@@ -1224,12 +1238,20 @@ def build_multibranch_model(
     for name, dim in static_shapes.items():
         branch_in = layers.Input(shape=(dim,), name=f"{name}_input")
         inputs.append(branch_in)
-        x = layers.Dense(static_branch_units, activation="relu", name=f"{name}_dense1")(branch_in)
-        if use_batchnorm:
-            x = layers.BatchNormalization(name=f"{name}_bn")(x)
-        if static_dropout:
-            x = layers.Dropout(static_dropout, name=f"{name}_dropout")(x)
-        x = layers.Dense(static_branch_units, activation="relu", name=f"{name}_embed")(x)
+        # Static entries specify Dense depth; absent entries retain the original
+        # two-layer branch independently of the time-series convolution depth.
+        static_depth = branch_num_conv_layers.get(name, 2) if isinstance(branch_num_conv_layers, dict) else 2
+        x = branch_in
+        for layer_idx in range(static_depth):
+            final_layer = layer_idx == static_depth - 1
+            layer_name = f"{name}_embed" if final_layer else f"{name}_dense{layer_idx + 1}"
+            x = layers.Dense(static_branch_units, activation="relu", name=layer_name)(x)
+            if not final_layer:
+                suffix = "" if layer_idx == 0 else str(layer_idx + 1)
+                if use_batchnorm:
+                    x = layers.BatchNormalization(name=f"{name}_bn{suffix}")(x)
+                if static_dropout:
+                    x = layers.Dropout(static_dropout, name=f"{name}_dropout{suffix}")(x)
         branch_embeddings.append(x)
 
     if not branch_embeddings:
@@ -2143,11 +2165,10 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         return describe_branches(self.feature_names_, self.branch_groups_)
 
 
-"""Conditional architecture rules shared by search and estimator preflight.
+"""Architecture validation and parameter-preserving search helpers.
 
-Canonicalisation removes *inactive* dimensions, not valid architecture choices.
-In particular a BERT backbone still has modality-specific CNN encoders. The
-functions do not construct a model, fit an extractor, or mutate caller settings.
+Validation checks the selected model path without changing candidate settings.
+Search caches use complete requested parameter mappings.
 """
 
 ARCHITECTURES = {"bigru_attention", "phase_attention", "cnn_attention_pool", "bert"}
@@ -2195,51 +2216,6 @@ _EXTRA_CONTROLLERS = (
 )
 
 
-def _unused_training_parameters(settings):
-    unused = set()
-    if str(settings["optimizer_name"]).lower() != "sgd":
-        unused.add("momentum")
-    if str(settings["optimizer_name"]).lower() != "adamw":
-        unused.add("weight_decay")
-    if str(settings["loss_name"]).lower() == "focal":
-        unused.add("label_smoothing")
-    scheduler = str(settings["lr_scheduler_type"]).lower()
-    if not settings["use_lr_scheduler"]:
-        unused |= {"lr_scheduler_type", "lr_factor", "lr_patience", "min_lr", "cosine_t_max", "warmup_epochs"}
-    elif scheduler == "cosine":
-        unused |= {"lr_factor", "lr_patience"}
-    else:
-        unused |= {"cosine_t_max", "warmup_epochs"}
-        if scheduler == "plateau" and not settings["validation_split"]:
-            unused |= {"lr_factor", "lr_patience", "min_lr"}
-
-    augmentor = settings.get("augmentor")
-    if type(augmentor) is SensorAugmentor:
-        aug = augmentor.get_params(deep=False)
-        aug.update({key[len("augmentor__"):]: value for key, value in settings.items()
-                    if key.startswith("augmentor__")})
-        disabled = any(isinstance(aug.get(key), Real) and aug[key] <= 0 for key in ("prob", "per_aug_prob"))
-        try:
-            names = _coerce_augmentation_names(aug["augmentations"])
-        except (TypeError, ValueError):
-            return unused  # Preserve malformed declarations for the real validator.
-        if names == []:
-            disabled = True
-        if disabled:
-            unused.add("__augmentation_disabled__")
-            controls = {"prob", "per_aug_prob"} | ({"augmentations"} if names == [] else set())
-            unused |= {f"augmentor__{key}" for key in aug if key not in controls}
-        elif names is not None:
-            fields = {
-                "jitter": {"jitter_sigma"}, "gaussian_noise": {"noise_std"}, "scaling": {"scaling_sigma"},
-                "time_shift": {"time_shift_frac"}, "crop_resize": {"crop_frac_range"},
-                "temporal_mask": {"temporal_mask_frac", "temporal_num_masks"},
-                "channel_dropout": {"channel_drop_prob"}, "sensor_dropout": {"sensor_drop_prob"},
-                "magnitude_warp": {"warp_sigma", "warp_num_knots"},
-            }
-            selected = set(names)
-            unused |= {f"augmentor__{field}" for name, group in fields.items() if name not in selected for field in group}
-    return unused
 
 
 def _name(key):
@@ -2296,142 +2272,6 @@ def _is_temporal(settings):
     )
 
 
-def canonical_candidate(params, base_params=None):
-    """Return supplied settings with irrelevant dimensions removed.
-
-    ``base_params`` can be estimator or pipeline ``get_params(deep=True)``.
-    Only supplied keys are returned, retaining their ``estimator__`` prefix.
-    Consequently this is suitable both for sklearn ``set_params`` and for a
-    phenotype/cache key. A removed value falls back to the base estimator.
-    """
-    settings = _merged(params, base_params)
-    architecture = str(settings["temporal_architecture"]).lower()
-    temporal = _is_temporal(settings)
-    # The classifier derives its orientation output width from training labels.
-    inactive = {"orientation_num_classes"}
-    if architecture != "bert":
-        inactive |= _BERT
-    if architecture != "bigru_attention" or not settings["use_bigru"]:
-        inactive |= _GRU
-    if architecture not in {"phase_attention", "cnn_attention_pool"}:
-        inactive |= _SHARED_CNN
-    if architecture != "phase_attention":
-        inactive |= _PHASE
-        if not settings["use_phase_aux_head"]:
-            inactive.add("n_phases")
-    if architecture != "cnn_attention_pool":
-        inactive |= _POST_FUSION
-    elif str(settings["post_fusion_pooling"]).lower() not in {"attention", "attention_avg_max"}:
-        inactive |= {"post_fusion_attention_type", "post_fusion_attention_units"}
-    elif str(settings["post_fusion_attention_type"]).lower() == "linear":
-        inactive.add("post_fusion_attention_units")
-    uses_attention = (
-        architecture == "bigru_attention" and temporal
-        or architecture == "bert" and str(settings["bert_pooling"]).lower() == "attention"
-    )
-    if not uses_attention:
-        inactive |= {"attention_type", "attention_units"}
-    elif str(settings["attention_type"]).lower() == "linear":
-        inactive.add("attention_units")
-    if temporal:
-        inactive |= _LEGACY_BRANCH
-    else:
-        inactive |= _TEMPORAL | _TOF_SPATIAL | {"tof_encoder_type"}
-    if not settings["use_se"]:
-        inactive.add("se_ratio")
-    if not settings["use_orientation_aux_head"]:
-        inactive |= {"orientation_num_classes", "orientation_loss_weight"}
-    if not settings["use_phase_aux_head"]:
-        inactive |= {"phase_loss_weight", "phase_label_provider"}
-    extractor = _extractor_settings(settings)
-    inactive |= _unused_training_parameters(settings)
-    native = settings.get("extractor")
-    if native is None or isinstance(native, dict) or type(native) is SequenceExtractor:
-        inactive |= {"extractor__" + key for key in inactive_sequence_parameters(extractor, for_frame_output=False)}
-        families = sequence_feature_families(extractor)
-        time_families = families & {"acc", "rotation", "tof", "thermo"}
-        if not families & {"stft", "cwt"}:
-            inactive |= {"static_branch_units", "static_dropout"}
-        if temporal:
-            generic = time_families - ({"tof"} if str(settings["tof_encoder_type"]).lower() != "flatten_1d" else set())
-            if not generic:
-                inactive |= _BRANCH_CNN | {"use_se", "se_ratio"}
-                if architecture != "phase_attention":
-                    inactive |= {"use_batchnorm", "use_residual"}
-        elif not time_families:
-            inactive |= _LEGACY_BRANCH
-    tof_enabled = bool(_modes(extractor.get("tof_modes", "sensor_stats")))
-    tof_encoder = str(settings["tof_encoder_type"]).lower()
-    if not temporal or not tof_enabled:
-        inactive |= _TOF_SPATIAL | {"tof_encoder_type"}
-    elif tof_encoder == "flatten_1d":
-        inactive |= _TOF_SPATIAL
-    elif tof_encoder != "spatial_cnn_gru":
-        inactive.add("tof_gru_units")
-    result = {}
-    for key, value in (params or {}).items():
-        name = _name(key)
-        if name in inactive:
-            continue
-        if name == "use_bigru" and architecture != "bigru_attention":
-            value = False
-        elif name in {"augmentor__prob", "augmentor__per_aug_prob"} and "__augmentation_disabled__" in inactive:
-            value = 0.0
-        elif name == "branch_encoder_type" and str(value).lower() == "cnn":
-            value = "conv1d"
-        elif name in {"temporal_architecture", "branch_encoder_type", "tof_encoder_type",
-                      "optimizer_name", "loss_name", "lr_scheduler_type"}:
-            value = str(value).lower()
-        elif name == "extractor__motion_filter_mode" and value == "extended_kalman":
-            value = "kalman"
-        elif name == "extractor__stft_scaling" and isinstance(value, str) and value in {"density", "psd"}:
-            value = "psd"
-        elif name == "extractor__stft_scaling" and isinstance(value, str) and value in {"spectrum", "power_spectrum"}:
-            value = "power_spectrum"
-        if (name in {"extractor__stft_configs", "extractor__cwt_configs"}
-                and (native is None or isinstance(native, dict) or type(native) is SequenceExtractor)):
-            configs = _json_maybe(value)
-            if isinstance(configs, (list, tuple)) and all(isinstance(config, dict) for config in configs):
-                normalized = []
-                for config in configs:
-                    config = dict(config)
-                    config.pop("acc_modes", None)  # These extractors select signal_columns, not acc_modes.
-                    if name == "extractor__stft_configs":
-                        if config.get("window_seconds", extractor.get("stft_window_seconds")) is not None:
-                            config.pop("nperseg", None)
-                        if isinstance(config.get("scaling"), str):
-                            config["scaling"] = {"density": "psd", "spectrum": "power_spectrum"}.get(
-                                config["scaling"], config["scaling"])
-                    elif config.get("widths") is not None:
-                        config.pop("n_scales", None)
-                        config.pop("min_scale", None)
-                    normalized.append(config)
-                value = json.dumps(normalized, sort_keys=True) if isinstance(value, str) else normalized
-        if (not temporal and (native is None or isinstance(native, dict) or type(native) is SequenceExtractor)
-                and name in {"branch_filters", "branch_kernel_sizes", "branch_pool_sizes", "branch_num_conv_layers"}):
-            mapping = _json_maybe(value)
-            defaults = {"branch_filters": DEFAULT_BRANCH_FILTERS, "branch_kernel_sizes": DEFAULT_BRANCH_KERNEL_SIZES,
-                        "branch_pool_sizes": DEFAULT_BRANCH_POOL_SIZES}
-            if name in defaults and not mapping:
-                mapping = defaults[name]
-            if isinstance(mapping, dict) and time_families:
-                fallback = {"branch_filters": 32, "branch_kernel_sizes": 3,
-                            "branch_pool_sizes": 2, "branch_num_conv_layers": 1}[name]
-                mapping = {branch: mapping.get(branch, fallback) for branch in sorted(time_families)}
-                if name == "branch_filters" and str(settings["branch_filter_mode"]).lower() == "custom":
-                    depth = _json_maybe(settings.get("branch_num_conv_layers", 2))
-                    for branch, filters in mapping.items():
-                        count = depth.get(branch, 1) if isinstance(depth, dict) else depth
-                        if isinstance(count, Integral) and count > 0:
-                            values = list(filters) if isinstance(filters, (list, tuple, np.ndarray)) else [filters]
-                            if values:
-                                values = values[:count]
-                                while len(values) > 1 and values[-1] == values[-2]:
-                                    values.pop()  # The builder repeats its final width automatically.
-                                mapping[branch] = values
-                value = json.dumps(mapping, sort_keys=True) if isinstance(value, str) else mapping
-        result[key] = value
-    return result
 
 
 def _positive_integer(value):
@@ -2472,7 +2312,7 @@ def candidate_error(params, base_params=None, y=None, phase_labels_available=Fal
 
 def _candidate_error(params, base_params, y, phase_labels_available, label_cache):
     merged = _merged(params, base_params)
-    settings = canonical_candidate(merged)
+    settings = merged
     architecture = str(settings["temporal_architecture"]).lower()
     if architecture not in ARCHITECTURES:
         return f"Unsupported temporal_architecture: {architecture!r}."
@@ -2486,6 +2326,45 @@ def _candidate_error(params, base_params, y, phase_labels_available, label_cache
         heads = []
     temporal = _is_temporal(merged)
     extractor = _extractor_settings(merged)
+    # These names control validation only. Never pass a filtered mapping to fit.
+    validation_names = set(settings)
+    if architecture != "bert":
+        validation_names.difference_update(_BERT)
+    if architecture != "bigru_attention" or not settings["use_bigru"]:
+        validation_names.difference_update(_GRU)
+    if architecture not in {"phase_attention", "cnn_attention_pool"}:
+        validation_names.difference_update(_SHARED_CNN)
+    if architecture != "phase_attention":
+        validation_names.difference_update(_PHASE)
+    if architecture != "cnn_attention_pool":
+        validation_names.difference_update(_POST_FUSION)
+    if temporal:
+        validation_names.difference_update(_LEGACY_BRANCH)
+    else:
+        validation_names.difference_update(_TEMPORAL | _TOF_SPATIAL | {"tof_encoder_type"})
+    if not settings["use_orientation_aux_head"]:
+        validation_names.difference_update({"orientation_num_classes", "orientation_loss_weight"})
+    if not settings["use_phase_aux_head"]:
+        validation_names.difference_update({"phase_loss_weight", "phase_label_provider"})
+    if not settings.get("use_se", False):
+        validation_names.discard("se_ratio")
+    uses_attention = (architecture == "bigru_attention" and temporal
+                      or architecture == "bert" and str(settings["bert_pooling"]).lower() == "attention")
+    if not uses_attention:
+        validation_names.difference_update({"attention_type", "attention_units"})
+    elif str(settings.get("attention_type", "additive")).lower() == "linear":
+        validation_names.discard("attention_units")
+    if architecture == "cnn_attention_pool":
+        if str(settings["post_fusion_pooling"]).lower() not in {"attention", "attention_avg_max"}:
+            validation_names.difference_update({"post_fusion_attention_type", "post_fusion_attention_units"})
+        elif str(settings["post_fusion_attention_type"]).lower() == "linear":
+            validation_names.discard("post_fusion_attention_units")
+    if not _modes(extractor.get("tof_modes", "sensor_stats")):
+        validation_names.difference_update(_TOF_SPATIAL | {"tof_encoder_type"})
+    elif str(settings.get("tof_encoder_type", "flatten_1d")).lower() == "flatten_1d":
+        validation_names.difference_update(_TOF_SPATIAL)
+    elif str(settings.get("tof_encoder_type", "flatten_1d")).lower() != "spatial_cnn_gru":
+        validation_names.discard("tof_gru_units")
     if temporal:
         if str(settings.get("branch_encoder_type", "conv1d")).lower() not in {"conv1d", "cnn"}:
             return "branch_encoder_type must be 'conv1d' or 'cnn'."
@@ -2504,19 +2383,19 @@ def _candidate_error(params, base_params, y, phase_labels_available, label_cache
         "tof_spatial_depth", "tof_gru_units", "se_ratio",
     }
     for name in positive:
-        if name in settings and not _positive_integer(settings[name]):
+        if name in validation_names and not _positive_integer(settings[name]):
             return f"{name} must be a positive integer."
     for name in ("branch_filters", "branch_kernel_sizes", "branch_pool_sizes", "branch_num_conv_layers"):
-        if name in settings and not _positive_tree(settings[name]):
+        if name in validation_names and not _positive_tree(settings[name]):
             return f"{name} must contain positive integers."
     for name in {"dropout", "static_dropout", "conv_dropout", "branch_dropout", "fusion_dropout",
                  "cnn_dropout", "gru_dropout", "gru_recurrent_dropout", "bert_dropout", "bert_attention_dropout"}:
-        if name in settings and (not _finite_number(settings[name]) or not 0 <= settings[name] < 1):
+        if name in validation_names and (not _finite_number(settings[name]) or not 0 <= settings[name] < 1):
             return f"{name} must be in [0, 1)."
     if "learning_rate" in settings and (not _finite_number(settings["learning_rate"]) or settings["learning_rate"] <= 0):
         return "learning_rate must be finite and positive."
     for name in ("orientation_loss_weight", "phase_loss_weight"):
-        if name in settings and (not _finite_number(settings[name]) or settings[name] < 0):
+        if name in validation_names and (not _finite_number(settings[name]) or settings[name] < 0):
             return f"{name} must be finite and nonnegative."
     if architecture == "bert":
         if settings["bert_d_model"] % settings["bert_num_heads"]:
@@ -2546,7 +2425,7 @@ def _candidate_error(params, base_params, y, phase_labels_available, label_cache
             return "Invalid post_fusion_pooling."
         if pooling in {"attention", "attention_avg_max"} and settings["post_fusion_attention_type"] not in {"additive", "linear"}:
             return "post_fusion_attention_type must be 'additive' or 'linear'."
-    if "tof_encoder_type" in settings:
+    if "tof_encoder_type" in validation_names:
         encoder = str(settings["tof_encoder_type"]).lower()
         if encoder not in {"flatten_1d", "spatial_cnn", "spatial_cnn_gru"}:
             return "Unsupported tof_encoder_type."
@@ -2616,16 +2495,11 @@ except ImportError:
 
 
 def conditional_bayesian_spaces(param_space, base_params=None):
-    """Compile architecture spaces containing only potentially active dimensions.
+    """Split explicit architecture/source choices without pruning parameters.
 
-    Architecture and BiGRU switches are fixed before testing dependencies. Other
-    categorical controllers are considered together, so an auxiliary-head or
-    pooling choice cannot accidentally hide parameters used by another choice.
-    Large/non-finite controller products use conservative pruning instead of
-    enumerating a potentially enormous search space. This does not allocate the
-    Bayesian evaluation budget or reject invalid model settings. An explicit
-    pretraining-source dimension is stratified into fixed-source optimizers so
-    the shared round-robin budget covers every requested training condition.
+    Every supplied dimension and value is retained. Splitting these two axes
+    only preserves round-robin coverage of requested model/training conditions;
+    it does not infer inactive options, replace values, or add missing keys.
     """
     from itertools import product
     from skopt.space import Categorical, Dimension, Integer, check_dimension
@@ -2652,115 +2526,30 @@ def conditional_bayesian_spaces(param_space, base_params=None):
         else:
             dimensions[key] = categorical([value])
 
-    def finite_values(dimension):
+    split_keys = [key for key in dimensions if _name(key) in {
+        "temporal_architecture", "extractor__pretraining_source",
+    }]
+    choices = []
+    for key in split_keys:
+        dimension = dimensions[key]
         if isinstance(dimension, Categorical):
-            return tuple(dimension.categories)
-        if isinstance(dimension, Integer) and dimension.high - dimension.low < 4096:
-            return range(int(dimension.low), int(dimension.high) + 1)
-        return None
-
-    def representative(dimension):
-        if isinstance(dimension, Categorical):
-            return dimension.categories[0]
-        return dimension.low
-
-    by_name = {_name(key): key for key in dimensions}
-    architecture_key = by_name.get("temporal_architecture")
-    gru_key = by_name.get("use_bigru")
-    source_key = by_name.get("extractor__pretraining_source")
-    sources = finite_values(dimensions[source_key]) if source_key is not None else None
-    if source_key is not None and sources is None:
-        raise ValueError("extractor__pretraining_source requires finite categorical choices.")
-    base = _merged({}, base_params)
-    prefix = "estimator__" if any(
-        key.startswith("estimator__") for key in (*dimensions, *(base_params or {}))
-    ) else ""
-    architectures = (finite_values(dimensions[architecture_key]) if architecture_key is not None
-                     else [base["temporal_architecture"]])
-    if architectures is None:
-        raise ValueError("temporal_architecture requires finite categorical choices.")
-    # Case aliases describe the same backbone, and need only one optimizer.
-    architectures = list(dict.fromkeys(str(value).lower() for value in architectures))
-    controllers = {
-        "use_orientation_aux_head", "use_phase_aux_head", "custom_aux_heads",
-        "bert_pooling", "attention_type", "post_fusion_pooling",
-        "post_fusion_attention_type", "use_se", "tof_encoder_type",
-        "extractor", "extractor__tof_modes",
-    }
-    controllers.update(_EXTRA_CONTROLLERS)
-    spaces = []
-    for architecture in architectures:
-        if architecture == "bigru_attention" and gru_key is not None:
-            gru_values = finite_values(dimensions[gru_key])
-            if gru_values is None:
-                raise ValueError("use_bigru requires finite categorical choices.")
+            choices.append(tuple(dimension.categories))
+        elif isinstance(dimension, Integer) and dimension.high - dimension.low < 4096:
+            choices.append(range(int(dimension.low), int(dimension.high) + 1))
         else:
-            gru_values = [False if architecture != "bigru_attention" else base["use_bigru"]]
-        for use_bigru in gru_values:
-            subspace = dict(dimensions)
-            if architecture_key is not None:
-                subspace[architecture_key] = Categorical([architecture])
-            if gru_key is not None:
-                subspace[gru_key] = Categorical([use_bigru])
-            fixed_base = dict(base_params or {})
-            fixed_base[prefix + "temporal_architecture"] = architecture
-            fixed_base[prefix + "use_bigru"] = use_bigru
-            varying = []
-            combinations = 1
-            for key, dimension in subspace.items():
-                if _name(key) not in controllers:
-                    continue
-                values = finite_values(dimension)
-                if values is None or combinations * len(values) > 4096:
-                    combinations = 4097
-                    break
-                combinations *= len(values)
-                varying.append((key, values))
+            raise ValueError(f"{_name(key)} requires finite categorical choices.")
 
-            # These exclusions are independent of every other controller. In
-            # the bounded fallback, retaining extra keys is safer than dropping
-            # a dimension that an unenumerated auxiliary/modality choice needs.
-            inactive = {"orientation_num_classes"}
-            if architecture != "bert":
-                inactive |= _BERT
-            if architecture != "bigru_attention" or not use_bigru:
-                inactive |= _GRU
-            if architecture not in {"phase_attention", "cnn_attention_pool"}:
-                inactive |= _SHARED_CNN
-            if architecture != "phase_attention":
-                inactive |= _PHASE
-            if architecture != "cnn_attention_pool":
-                inactive |= _POST_FUSION
-            keep = {key for key in subspace if _name(key) not in inactive}
-            if combinations <= 4096:
-                supplied = {key: representative(value) for key, value in subspace.items()}
-                active = set()
-                try:
-                    for values in product(*(values for _, values in varying)):
-                        proposal = dict(supplied)
-                        proposal.update(zip((key for key, _ in varying), values))
-                        active.update(canonical_candidate(proposal, fixed_base))
-                except (TypeError, ValueError, AttributeError, OverflowError):
-                    # Malformed settings are the estimator preflight's concern;
-                    # do not silently discard other potentially valid choices.
-                    pass
-                else:
-                    keep = active
-            compiled = {key: dimension for key, dimension in subspace.items() if key in keep}
-            if not compiled:
-                compiled[prefix + "temporal_architecture"] = Categorical([architecture])
-            if source_key is None:
-                spaces.append(compiled)
-            else:
-                for source in sources:
-                    source_space = dict(compiled)
-                    source_space[source_key] = Categorical([source])
-                    spaces.append(source_space)
+    spaces = []
+    for values in product(*choices):
+        space = dict(dimensions)
+        for key, value in zip(split_keys, values):
+            space[key] = Categorical([value])
+        spaces.append(space)
     return spaces
 
 
 class _CandidateRules:
-    """Shared dependency checking and canonical cache keys, independent of TensorFlow."""
+    """Shared validation and complete candidate mappings, independent of TensorFlow."""
     _proposal_attempts = 32
 
     def _initialise_rules(self, y, fit_params):
@@ -2779,11 +2568,9 @@ class _CandidateRules:
         self.search_exhausted_ = False
         self.proposal_limit_reached_ = False
 
-    def _active_params(self, params):
-        base_params = getattr(self, '_base_params_', None)
-        if base_params is None:
-            base_params = self.estimator.get_params(deep=True)
-        return canonical_candidate(params, base_params)
+    def _candidate_params(self, params):
+        """Copy the complete requested candidate without changing keys or values."""
+        return dict(params)
 
     def _candidate_error(self, params):
         base_params = getattr(self, '_base_params_', None)
@@ -2804,12 +2591,7 @@ class _CandidateRules:
 
 
 class HierarchicalGASearchCV(_CandidateRules, GASearchCV):
-    """Evolve only active genes, with bounded retries for duplicate phenotypes.
-
-    Architecture and feature switches are selected before their dependent genes.
-    A changed switch therefore initialises newly active genes from their search
-    descriptors instead of inheriting unrelated, inactive values.
-    """
+    """Evolve every declared gene, with bounded retries for exact duplicates."""
     _controller_order = (
         'temporal_architecture', 'use_bigru', 'use_orientation_aux_head',
         'use_phase_aux_head', 'custom_aux_heads', 'extractor',
@@ -2846,38 +2628,14 @@ class HierarchicalGASearchCV(_CandidateRules, GASearchCV):
         controllers = [by_name[name] for name in self._controller_order if name in by_name]
         return controllers + [key for key in space if key not in controllers]
 
-    def _gene_is_active(self, key, proposal):
-        # canonical_candidate normalises use_bigru=False outside its backbone;
-        # it remains unnecessary to draw that descriptor in those architectures.
-        if _name(key) in {'extractor__sequence_crop_mode', 'extractor__maxlen'}:
-            # Joint crop controls must be drawn before final canonicalisation:
-            # a currently unlimited base sequence must not prevent enabling a cap.
-            return True
-        if _name(key) == 'use_bigru':
-            base = getattr(self, '_base_params_', None)
-            if base is None:
-                base = self.estimator.get_params(deep=True)
-            if str(_merged(proposal, base)['temporal_architecture']).lower() != 'bigru_attention':
-                return False
-        probe = dict(proposal)
-        probe.setdefault(key, None)
-        return key in self._active_params(probe)
 
-    def _conditional_proposal(self, space, rng, individual=None):
-        proposal = self._active_params(individual or {})
-        for key in tuple(proposal):
-            if not self._gene_is_active(key, proposal):
-                proposal.pop(key)
+    def _parameter_proposal(self, space, rng, individual=None):
+        proposal = self._candidate_params(individual or {})
         for key in self._ordered_genes(space):
-            if not self._gene_is_active(key, proposal):
-                proposal.pop(key, None)
-                continue
             if (individual is None or key not in proposal
                     or rng.random() <= float(self.mutation_probability)):
-                # Keep descriptor sampling in the base helper, including support
-                # for external descriptors with either sample signature.
                 proposal[key] = super()._sample_individual({key: space[key]}, rng)[key]
-        return self._active_params(proposal)
+        return proposal
 
     @staticmethod
     def _finite_gene_values(descriptor):
@@ -2897,7 +2655,7 @@ class HierarchicalGASearchCV(_CandidateRules, GASearchCV):
         return None
 
     def _finite_candidate_pool(self, space):
-        """Enumerate small conditional spaces without expanding inactive axes.
+        """Enumerate every declared axis in small finite spaces.
 
         Enumeration is capped by tree nodes, so a large or continuous space
         cannot cause an unbounded product or claim proven exhaustion.
@@ -2919,14 +2677,11 @@ class HierarchicalGASearchCV(_CandidateRules, GASearchCV):
             if visited > self._finite_enumeration_limit:
                 raise IncompleteSpace
             if index == len(ordered):
-                active = self._active_params(proposal)
+                active = self._candidate_params(proposal)
                 if self._candidate_error(active) is None:
                     candidates[self._canonical_key(active)] = active
                 return
             key = ordered[index]
-            if not self._gene_is_active(key, proposal):
-                visit(index + 1, proposal)
-                return
             values = self._finite_gene_values(space[key])
             if values is None:
                 raise IncompleteSpace
@@ -2959,7 +2714,7 @@ class HierarchicalGASearchCV(_CandidateRules, GASearchCV):
         for attempt in range(self._proposal_attempts):
             # A duplicate child should explore another phenotype even when a
             # zero mutation probability would otherwise recreate it forever.
-            proposal = self._conditional_proposal(space, rng, individual if attempt == 0 else None)
+            proposal = self._parameter_proposal(space, rng, individual if attempt == 0 else None)
             reason = self._candidate_error(proposal)
             if reason is not None:
                 self._reject(reason)
@@ -2999,15 +2754,13 @@ class HierarchicalGASearchCV(_CandidateRules, GASearchCV):
                     child2[key] = parent1[key]
                 elif rng.random() < 0.5:
                     child1[key], child2[key] = parent2[key], parent1[key]
-        return self._active_params(child1), self._active_params(child2)
+        return self._candidate_params(child1), self._candidate_params(child2)
 
-    def _canonical_key(self, individual):
-        return super()._canonical_key(self._active_params(individual))
 
     def _evaluate_individual(self, params, X, y, splits, fit_params):
-        # Includes invalid canonical candidates recorded with a finite penalty.
+        # Invalid candidates retain their complete parameters in the finite-penalty row.
         self.unique_candidate_count_ = getattr(self, 'unique_candidate_count_', 0) + 1
-        active = self._active_params(params)
+        active = self._candidate_params(params)
         reason = self._candidate_error(params)
         if reason is not None:
             self._reject(reason)
@@ -3023,7 +2776,7 @@ class HierarchicalGASearchCV(_CandidateRules, GASearchCV):
 
     def _build_cv_results(self, records, maximize):
         results = super()._build_cv_results(records, maximize)
-        # Different backbones have different active genes; include their union in the CSV.
+        # Include every supplied parameter in the CSV, including sparse custom candidates.
         for key in sorted({key for record in records for key in record['params']}):
             results[f'param_{key}'] = [record['params'].get(key) for record in records]
         results['candidate_error'] = [record.get('candidate_error') for record in records]
@@ -3097,7 +2850,7 @@ if BayesSearchCV is not None:
                 state['seen'].add(coordinate)
                 proposal = dict(zip(sorted(state['space']), point))
                 reason = self._candidate_error(proposal)
-                active = self._active_params(proposal)
+                active = self._candidate_params(proposal)
                 if reason is not None:
                     self._reject(reason)
                     self._invalid_fallback_ = active
