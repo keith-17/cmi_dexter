@@ -280,8 +280,11 @@ class PretrainingWorkflowTests(unittest.TestCase):
                     patch.object(workflow.subprocess, 'run', return_value=SimpleNamespace(stdout='ssl/v0/develop\n')):
                 workflow.prepare()
             manifest = json.loads((root / 'build/submission.json').read_text())
-            self.assertEqual(manifest['csv_names'], [f'multibranch_pretraining_v1_{suffix}.csv'
-                                                    for suffix in ('cv', 'best', 'holdout')])
+            self.assertEqual(manifest['csv_names'], ['multibranch_pretraining_v1_experiments.csv'])
+            self.assertEqual(manifest['result_names'], [
+                'multibranch_pretraining_v1_experiments.csv',
+                'multibranch_pretraining_v1_summary.json',
+            ])
             for name, value in stage_choices.items():
                 self.assertEqual(manifest['configuration'][name], value)
             self.assertIn(str(Path('src') / 'pretraining_search.py'), manifest['sha256'])
@@ -306,7 +309,7 @@ class PretrainingWorkflowTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'pretraining_search.py'):
                     workflow.prepare()
 
-    def test_protocol_result_collection_preserves_separate_complete_result_sets(self):
+    def test_legacy_protocol_result_collection_preserves_separate_complete_result_sets(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             downloaded = root / 'downloaded'
@@ -320,6 +323,67 @@ class PretrainingWorkflowTests(unittest.TestCase):
             for protocol in ('sequence', 'subject__subject'):
                 directory = root / 'results/run/validation_protocols' / protocol
                 self.assertEqual({path.name for path in directory.glob('*.csv')}, expected)
+
+    def test_result_collection_requires_csv_and_json_in_the_same_run(self):
+        expected = {'experiment_experiments.csv', 'experiment_summary.json'}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            downloaded = root / 'downloaded'
+            first = downloaded / 'first-run'
+            second = downloaded / 'second-run'
+            first.mkdir(parents=True)
+            second.mkdir(parents=True)
+            (first / 'experiment_experiments.csv').write_text('mean_test_score\n0.7\n')
+            (second / 'experiment_summary.json').write_text('{"holdout_score": 0.6}')
+            with self.assertRaisesRegex(RuntimeError, 'No complete result set'):
+                workflow.collect(downloaded, root / 'results', expected)
+            self.assertFalse((root / 'results').exists())
+
+            summary = '{"holdout_score": 0.8, "best_params": {"epochs": 5}}'
+            (first / 'experiment_summary.json').write_text(summary)
+            (first / 'unwanted.csv').write_text('unused\n1\n')
+            workflow.collect(downloaded, root / 'results', expected)
+            target = root / 'results/first-run'
+            self.assertEqual({path.name for path in target.iterdir()}, expected)
+            self.assertEqual((target / 'experiment_summary.json').read_text(), summary)
+            self.assertFalse((root / 'results/second-run').exists())
+
+    def test_download_requests_and_collects_the_experiments_csv_and_summary_json(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            build = root / 'build'
+            build.mkdir()
+            notebook = minimal_notebook()
+            metadata = {'id': 'owner/new-kernel', 'code_file': workflow.NOTEBOOK_NAME}
+            expected = ['experiment_experiments.csv', 'experiment_summary.json']
+            manifest = {'kernel': metadata['id'], 'version': 1,
+                        'submitted_source_sha256': workflow.source_hash(notebook),
+                        'csv_names': [expected[0]], 'result_names': expected}
+            (build / 'submitted.json').write_text(json.dumps(manifest))
+
+            def fake_cli(*args):
+                if args[1] == 'status':
+                    return 'KernelWorkerStatus.COMPLETE'
+                target = Path(args[args.index('-p') + 1])
+                target.mkdir(parents=True, exist_ok=True)
+                if args[1] == 'pull':
+                    (target / 'kernel-metadata.json').write_text(json.dumps(metadata))
+                    (target / metadata['code_file']).write_text(json.dumps(notebook))
+                elif args[1] == 'output':
+                    pattern = args[args.index('--file-pattern') + 1]
+                    self.assertIn(r'experiment_experiments\.csv', pattern)
+                    self.assertIn(r'experiment_summary\.json', pattern)
+                    output = target / 'run'
+                    output.mkdir()
+                    (output / expected[0]).write_text('mean_test_score\n0.7\n')
+                    (output / expected[1]).write_text('{"holdout_score": 0.8}')
+                return ''
+
+            with patch.object(workflow, 'ROOT', root), patch.object(workflow, 'BUILD', build), \
+                    patch.object(workflow, 'cli', side_effect=fake_cli):
+                destination = workflow.download(metadata)
+            self.assertEqual({path.name for path in (destination / 'run').iterdir()}, set(expected))
+            self.assertTrue((destination / 'local_submission.json').exists())
 
     def test_first_run_refuses_regularisation_augmentation_zero_lr_and_missing_sources(self):
         configuration = workflow.literal_configuration(minimal_notebook())

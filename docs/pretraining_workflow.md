@@ -33,10 +33,26 @@ choice applies only to subject mode.
 
 When both modes are listed, each gets a separate full search with matching outer
 holdout, CV and internal validation. Each search receives the configured candidate
-budget. Their CV, best and holdout CSVs and histories are saved in separate
-`validation_protocols` folders; `validation_summary.csv` identifies each result.
-The scores are not ranked together. Held-out sequences are excluded from
-preprocessing and both training stages in either mode.
+budget. Held-out sequences are excluded from preprocessing and both training
+stages in either mode.
+
+Each active run saves exactly two result files under `results_dir/timestamp`:
+
+- `<experiment_name>_experiments.csv` contains every evaluated experiment, its
+  parameters and CV results, sorted with the best experiment first. Validation
+  protocol columns identify how each score was measured; scores from different
+  protocols use different evaluation sets.
+- `<experiment_name>_summary.json` contains the best parameters, holdout score,
+  training information and per-protocol results, including failed protocols.
+
+Ranking uses descending mean CV score. If the highest-scoring candidate cannot
+be refitted, its row records the error; `selected_for_holdout` and the JSON's
+`best_candidate_id` identify the usable candidate selected for final evaluation.
+
+Separate histories, model files, plots, failure logs and intermediate CSVs are
+no longer written by the active pretraining search. `quick_save` is retained for
+compatibility and does not change these two outputs. The archived pilot keeps
+its original output format.
 
 ## First CPU run
 
@@ -81,8 +97,10 @@ Builds and source hashes are recorded in `kaggle_build/multibranch_pretraining/`
 
 `download` requires a completed run and an acknowledged local submission. It
 checks that the remote notebook source matches that submission before collecting
-the configured result CSVs under `results/kaggle_pretraining/`. `pull` saves a
-remote copy inside the build directory without replacing the local notebook.
+the experiment CSV and summary JSON together under `results/kaggle_pretraining/`.
+Older submissions are collected using the file list in their original manifest.
+`pull` saves a remote copy inside the build directory without replacing the local
+notebook.
 `wait` polls status at intervals of 15–60 seconds and collects completed results.
 
 To run another model or budget, change notebook configuration and omit
@@ -112,5 +130,6 @@ Bayesian compilation splits the four pretraining sources into fixed-source
 subspaces under one shared budget and visits them in round-robin order. A
 37-candidate run allocates 9/9/9/10 evaluations, with all four sources visited in
 the first four valid candidates. Each optimizer uses three initial points, then
-adapts to its observations. The search writes an atomic `partial_cv.csv` after
-each completed evaluation; final CSV and holdout evaluation retain the V1 flow.
+adapts to its observations. After searching and evaluating the best refitted
+candidate on holdout data, the active run writes the ranked experiments CSV and
+summary JSON described above.

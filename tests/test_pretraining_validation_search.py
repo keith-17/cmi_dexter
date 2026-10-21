@@ -146,7 +146,7 @@ class ValidationSearchTests(unittest.TestCase):
         self.assertEqual(fixed[0][0]["estimator__validation_group_column"].categories, (None,))
         self.assertEqual(original[0][0]["estimator__validation_group_column"].categories, ("wrong",))
 
-    def test_separate_searches_save_complete_outputs_even_in_quick_mode(self):
+    def test_separate_searches_save_only_csv_and_json_even_with_full_save_requested(self):
         learning_rate = EFloat(1e-5, 1e-3, distribution="log-uniform")
         template = ToySearch(Pipeline([("estimator", ToyEstimator())]), {
             "estimator__validation_group_column": ECat(["wrong"]),
@@ -159,7 +159,7 @@ class ValidationSearchTests(unittest.TestCase):
                 template, self.frame, validation_param_space={"validation_mode": ["sequence", "subject"]},
                 sensor_columns=["acc_x"], train_size=0.7, n_splits=1,
                 random_state=42, target_col="bfrb", results_dir=directory,
-                experiment_name="test", timestamp="run", quick_save=True)
+                experiment_name="test", timestamp="run", quick_save=False)
             self.assertEqual(len(ToySearch.observed), 2)
             self.assertTrue(outcome["last_run"]["experiment_succeeded"])
             for record, protocol in zip(ToySearch.observed, outcome["protocol_results"]):
@@ -168,21 +168,26 @@ class ValidationSearchTests(unittest.TestCase):
                 self.assertEqual(record["params"]["estimator__pretraining_validation_group_column"], column)
                 self.assertEqual(record["space"]["estimator__learning_rate"].lower, learning_rate.lower)
                 self.assertEqual(record["space"]["estimator__learning_rate"].upper, learning_rate.upper)
-                destination = Path(protocol["results_dir"])
-                self.assertEqual(record["path"].parent, destination)
-                self.assertEqual(Path(record["params"]["estimator__candidate_failure_log"]).parent, destination)
-                for filename in ("test_cv.csv", "test_best.csv", "test_holdout.csv",
-                                 "pretraining_history.json", "finetuning_history.json"):
-                    self.assertTrue((destination / filename).is_file(), filename)
+                self.assertIsNone(record["path"])
+                self.assertIsNone(record["params"]["estimator__candidate_failure_log"])
                 self.assertEqual(protocol["holdout_score"], 1.0)
-                best = pd.read_csv(destination / "test_best.csv")
-                self.assertEqual(len(best), 1)
-                metadata = json.loads((destination / "configuration.json").read_text())
-                self.assertFalse(set(metadata["train_groups"]) & set(metadata["holdout_groups"]))
+                self.assertGreater(protocol["configuration"]["train_sequences"], 0)
             self.assertEqual(template.estimator.named_steps["estimator"].validation_group_column, "old")
             self.assertEqual(template.param_grid["estimator__validation_group_column"].choices, ["wrong"])
-            summary = pd.read_csv(Path(outcome["results_dir"]) / "validation_summary.csv")
-            self.assertEqual(summary["status"].tolist(), ["complete", "complete"])
+            self.assertEqual({path.name for path in Path(directory).rglob("*") if path.is_file()},
+                             {"test_experiments.csv", "test_summary.json"})
+            experiments = pd.read_csv(outcome["experiments_path"])
+            self.assertEqual(len(experiments), 2)
+            self.assertEqual(experiments["rank"].tolist(), [1, 2])
+            self.assertEqual(experiments["validation_mode"].tolist(), ["sequence", "subject"])
+            self.assertTrue(experiments["selected_for_holdout"].all())
+            summary = json.loads(outcome["summary_path"].read_text())
+            self.assertEqual([result["status"] for result in summary["protocols"]], ["complete", "complete"])
+            self.assertEqual(summary["best_cv_score"], 0.75)
+            self.assertEqual(summary["holdout_score"], 1.0)
+            self.assertEqual(summary["best_params"], json.loads(experiments.iloc[0]["params"]))
+            self.assertEqual(summary["training_info"]["epochs_ran"]["finetuning"], 2)
+            self.assertEqual(summary["training_info"]["history"]["finetuning"]["loss"], [0.8, 0.5])
 
     def test_failed_protocol_is_recorded_without_claiming_success(self):
         template = ToySearch(Pipeline([("estimator", ToyEstimator())]), {"estimator__learning_rate": [0.001]})
@@ -194,9 +199,79 @@ class ValidationSearchTests(unittest.TestCase):
                 random_state=42, target_col="bfrb", results_dir=directory,
                 experiment_name="test", timestamp="run")
             self.assertEqual([result["status"] for result in outcome["protocol_results"]], ["failed", "complete"])
-            failed = Path(outcome["protocol_results"][0]["results_dir"])
-            self.assertTrue((failed / "protocol_error.json").is_file())
-            self.assertFalse((failed / "test_best.csv").exists())
+            summary = json.loads(outcome["summary_path"].read_text())
+            self.assertEqual(summary["status"], "partial")
+            self.assertIn("Missing group column", summary["protocols"][0]["error"])
+            self.assertEqual(summary["validation_mode"], "sequence")
+            self.assertEqual(len(list(Path(directory).rglob("*.*"))), 2)
+
+    def test_all_failed_runs_still_produce_two_readable_results(self):
+        template = ToySearch(Pipeline([("estimator", ToyEstimator())]), {"estimator__learning_rate": [0.001]})
+        with TemporaryDirectory() as directory:
+            outcome = workflow.run_validation_searches(
+                template, self.frame.drop(columns="subject"),
+                validation_param_space={"validation_mode": ["subject"]},
+                sensor_columns=["acc_x"], train_size=0.7, n_splits=1,
+                random_state=42, target_col="bfrb", results_dir=directory,
+                experiment_name="test", timestamp="run")
+            self.assertTrue(pd.read_csv(outcome["experiments_path"]).empty)
+            summary = json.loads(outcome["summary_path"].read_text())
+            self.assertEqual(summary["status"], "failed")
+            self.assertIsNone(summary["holdout_score"])
+            self.assertEqual(summary["best_params"], {})
+
+    def test_holdout_failure_keeps_refitted_parameters_and_training_info(self):
+        template = ToySearch(Pipeline([("estimator", ToyEstimator())]), {"estimator__learning_rate": [0.001]})
+        with TemporaryDirectory() as directory, \
+                patch.object(workflow, "_refit_candidate", side_effect=refit_toy), \
+                patch.object(workflow, "_holdout_results", side_effect=ValueError("Invalid predictions")):
+            outcome = workflow.run_validation_searches(
+                template, self.frame, sensor_columns=["acc_x"], train_size=0.7, n_splits=1,
+                random_state=42, target_col="bfrb", results_dir=directory,
+                experiment_name="test", timestamp="run")
+            summary = json.loads(outcome["summary_path"].read_text())
+            self.assertEqual(summary["status"], "failed")
+            self.assertIsNone(summary["holdout_score"])
+            self.assertEqual(summary["best_params"]["estimator__learning_rate"], 0.001)
+            self.assertEqual(summary["training_info"]["epochs_ran"]["finetuning"], 2)
+            self.assertEqual(summary["protocols"][0]["error"], "ValueError: Invalid predictions")
+            experiments = pd.read_csv(outcome["experiments_path"])
+            self.assertTrue(experiments.iloc[0]["selected_for_holdout"])
+            self.assertTrue(pd.isna(experiments.iloc[0]["holdout_score"]))
+
+    def test_ranked_csv_keeps_every_candidate_and_nested_parameter_and_refit_failure(self):
+        params = [{"estimator__learning_rate": rate, "layers": {"acc": [np.int64(32), 64]}}
+                  for rate in (0.001, 0.002, 0.003, 0.004, 0.005)]
+        search = SimpleNamespace(
+            cv_results_={"params": params, "mean_test_score": [0.7, np.nan, 0.9, 0.8, np.inf]},
+            best_index_=3, refit_errors_=[{"candidate": 2, "error": "Cannot refit"}])
+        rows = workflow._experiment_rows(search, {"validation_mode": "sequence", "group_column": None},
+                                         0.85, True, 1)
+        with TemporaryDirectory() as directory:
+            csv_path, json_path = workflow._save_results(
+                [rows], [{"status": "complete", "best_cv_score": np.float64(0.8),
+                          "holdout_score": 0.85, "best_params": params[3], "best_candidate_id": 4}],
+                root=Path(directory), experiment_name="test", timestamp="run", target_col="bfrb")
+            csv = pd.read_csv(csv_path)
+            self.assertEqual(csv["candidate_id"].tolist(), [3, 4, 1, 2, 5])
+            self.assertEqual(csv["rank"].tolist(), [1, 2, 3, 4, 5])
+            self.assertEqual(json.loads(csv.iloc[0]["param_layers"]), {"acc": [32, 64]})
+            self.assertEqual(csv.iloc[0]["refit_error"], "Cannot refit")
+            self.assertFalse(csv.iloc[0]["selected_for_holdout"])
+            self.assertTrue(csv.iloc[1]["selected_for_holdout"])
+            self.assertEqual(csv.iloc[1]["holdout_score"], 0.85)
+            self.assertTrue(csv.loc[~csv["selected_for_holdout"], "holdout_score"].isna().all())
+            summary = json.loads(json_path.read_text(), parse_constant=lambda value: self.fail(value))
+            self.assertEqual(summary["best_params"]["layers"], {"acc": [32, 64]})
+            self.assertEqual(summary["best_candidate_id"], 4)
+            self.assertEqual(summary["top_cv_candidate_id"], 3)
+
+    def test_json_normalizes_nonfinite_training_values_without_losing_types(self):
+        value = {"loss": np.array([0.5, np.nan, np.inf]), "epochs": np.int64(3),
+                 "missing": np.ma.masked, "scalar": np.array(0.5), "enabled": np.bool_(True)}
+        self.assertEqual(workflow._json_value(value),
+                         {"loss": [0.5, None, None], "epochs": 3, "missing": None,
+                          "scalar": 0.5, "enabled": True})
 
 
 if __name__ == "__main__":

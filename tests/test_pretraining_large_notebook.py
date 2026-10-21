@@ -110,7 +110,7 @@ class LargePretrainingNotebookTests(unittest.TestCase):
                 exec(compile(source, f"{variant}-cell-{index}", "exec"), namespace)
         return namespace
 
-    def test_preserves_layout_without_notebook_functions_or_stale_outputs(self):
+    def test_preserves_layout_without_notebook_functions_or_false_curve_save_claims(self):
         for variant, notebook in self.notebooks.items():
             self.assertEqual(len(notebook["cells"]), 26)
             self.assertEqual([cell["cell_type"] for cell in notebook["cells"]],
@@ -120,7 +120,9 @@ class LargePretrainingNotebookTests(unittest.TestCase):
                     tree = ast.parse("".join(cell["source"]))
                     self.assertFalse(any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
                                          for node in ast.walk(tree)), (variant, index))
-                    self.assertEqual(cell["outputs"], [])
+                    # Active notebooks may retain the user's training logs and
+                    # inline figures from previous runs.
+                    self.assertNotIn('Saved curves to', str(cell.get('outputs', [])))
 
     def declared_space(self, variant, name, namespace):
         source = self.source(variant, 14)

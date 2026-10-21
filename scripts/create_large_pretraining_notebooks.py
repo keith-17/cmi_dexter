@@ -45,8 +45,7 @@ Edit GRID_PARAM_SPACE and EVOLUTIONARY_PARAM_SPACE to choose model candidates;
 PRETRAINING_PARAM_SPACE supplies the stage settings.
 
 Validation defaults to complete sequences. Add 'subject' to VALIDATION_PARAM_SPACE
-for a separate search with wearers held apart. Each protocol saves its own results.
-Completed Bayesian candidates are saved to partial_cv.csv before the next trial.
+for a separate search with wearers held apart.
 """)
     config = source(3)
     for key, value in {

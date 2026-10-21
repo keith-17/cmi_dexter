@@ -91,7 +91,7 @@ _TRAINING_SUFFIX = '''validation_runs = run_validation_searches(
     sensor_columns=sensor_columns,
     train_size=train_size, n_splits=n_splits, random_state=random_state,
     target_col=TARGET_COL, results_dir=results_dir,
-    experiment_name=experiment_name, timestamp=timestamp, quick_save=quick_save,
+    experiment_name=experiment_name, timestamp=timestamp,
 )
 last_run = validation_runs['last_run']
 protocol_results = validation_runs['protocol_results']
@@ -148,6 +148,74 @@ def _assignment(source, name):
     raise ValueError(f'Missing notebook assignment: {name}')
 
 
+def configure_result_outputs(notebook):
+    """Keep notebook reporting inline and let the runner save its two artifacts.
+
+    This focused transformation also updates active notebooks without rebuilding
+    their user-edited search spaces or discarding unrelated execution outputs.
+    """
+    def source(index):
+        return ''.join(notebook['cells'][index]['source'])
+
+    def set_source(index, value):
+        notebook['cells'][index]['source'] = value.splitlines(keepends=True)
+
+    description = (
+        'Each run saves two files in its timestamped results folder: '
+        '`<experiment_name>_experiments.csv` lists all experiments and parameters, '
+        'sorted by CV score with the best first; `<experiment_name>_summary.json` '
+        'contains holdout scores, training information and best parameters.\n'
+    )
+    introduction = source(0)
+    if '<experiment_name>_experiments.csv' not in introduction:
+        set_source(0, introduction.rstrip() + '\n\n' + description)
+
+    config = re.sub(r'^quick_save\s*=.*\n?', '', source(3), flags=re.MULTILINE)
+    config = config.replace('results_dir.mkdir(parents=True, exist_ok=True)\n', '')
+    set_source(3, config)
+
+    # Keep orientation eligibility and exclusion IDs in memory, without a file.
+    preparation = source(7)
+    lines = preparation.splitlines(keepends=True)
+    for node in reversed(ast.parse(preparation).body):
+        if isinstance(node, ast.With) and '_input_exclusions.json' in ast.get_source_segment(preparation, node):
+            del lines[node.lineno - 1:node.end_lineno]
+    set_source(7, ''.join(lines))
+    set_source(17, source(17).replace(', quick_save=quick_save', ''))
+    set_source(19, '# Analysis\n\nTraining curves are displayed inline.\n')
+
+    analysis = source(20)
+    lines = analysis.splitlines(keepends=True)
+    for node in sorted(ast.walk(ast.parse(analysis)), key=lambda node: getattr(node, 'lineno', 0), reverse=True):
+        if isinstance(node, ast.With) and 'pretraining_history.json' in ast.get_source_segment(analysis, node):
+            del lines[node.lineno - 1:node.end_lineno]
+    analysis = ''.join(line for line in lines if not any(text in line for text in (
+        'save_dir =', 'save_dir.mkdir(', 'curves_path =', 'plt.savefig(',
+        '# save next to the other results', "print(f'Saved curves to",
+    )))
+    set_source(20, analysis)
+    set_source(24, """# The runner saves one ranked experiments CSV and one summary JSON for this run.
+print('Experiments CSV:', validation_runs['experiments_path'])
+print('Summary JSON:', validation_runs['summary_path'])
+""")
+
+    # Preserve historical logs and figures, removing only the false curve claim.
+    for output in notebook['cells'][20].get('outputs', []):
+        if output.get('output_type') == 'stream':
+            text = output.get('text', [])
+            lines = text.splitlines(keepends=True) if isinstance(text, str) else text
+            output['text'] = [line for line in lines if 'Saved curves to' not in line]
+    final_cell = notebook['cells'][24]
+    if any(any(marker in str(output) for marker in (
+        'Results:', 'Results saved to', 'Quick results saved to',
+    )) for output in final_cell.get('outputs', [])):
+        final_cell['outputs'] = []
+        final_cell['execution_count'] = None
+    for index in (3, 7, 17, 20, 24):
+        ast.parse(source(index))
+    return notebook
+
+
 def configure_search_parameters(notebook):
     """Keep editable model/stage candidates and configure validation orchestration."""
     def source(index):
@@ -186,8 +254,6 @@ def configure_search_parameters(notebook):
         ):
             del config_lines[node.lineno - 1:node.end_lineno]
     config = ''.join(config_lines)
-    config = config.replace('quick_save = True         # True -> save only the CV CSV with best_score & holdout_score appended; False -> full save',
-                            'quick_save = True         # Always save CV/best/holdout CSVs; False also saves model weights.')
     if 'VALIDATION_PARAM_SPACE =' not in config:
         config += '\n' + validation.rstrip() + '\n'
     set_source(3, config)
@@ -252,18 +318,13 @@ print('Available sequences:', experiment_df['sequence_id'].nunique())
         '# Preserve saved values even when outside the current search ranges.',
         '# Use the first configured grid choices for this single-candidate run.')
     set_source(17, training + _TRAINING_SUFFIX)
-    set_source(20, source(20).replace('save_dir = results_dir / timestamp', "save_dir = last_run['results_dir']"))
     set_source(22, """# Each protocol's holdout was evaluated once after its own search/refit.
 if experiment_succeeded:
     print('Last validation protocol:', last_run['validation_mode'])
     print('Holdout competition score:', eval_results['competition_score'])
 pd.DataFrame(protocol_results)
 """)
-    set_source(24, """# CV, best, holdout, histories and diagnostics are saved separately per protocol.
-protocol_summary = pd.DataFrame(protocol_results)
-print(protocol_summary.to_string(index=False))
-print('Results:', validation_runs['results_dir'])
-""")
+    configure_result_outputs(notebook)
 
     for index in (2, 3, 9, 11, 14, 17, 20, 22, 24):
         ast.parse(source(index))

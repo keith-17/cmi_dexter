@@ -204,7 +204,11 @@ def prepare(iterations=None, notebook_name=None, first_run=False, profile='pilot
     (build / metadata['code_file']).write_text(json.dumps(notebook, indent=1), encoding='utf-8')
     (build / 'kernel-metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
     experiment_name = configuration.get('experiment_name', 'multibranch_pretraining_v1')
-    suffixes = ('cv',) if configuration.get('quick_save', False) and not protocol_search else ('cv', 'best', 'holdout')
+    if protocol_search:
+        result_names = [f'{experiment_name}_experiments.csv', f'{experiment_name}_summary.json']
+    else:
+        suffixes = ('cv',) if configuration.get('quick_save', False) else ('cv', 'best', 'holdout')
+        result_names = [f'{experiment_name}_{suffix}.csv' for suffix in suffixes]
     manifest = {
         'profile': profile, 'notebook': notebook_name,
         'branch': branch, 'kernel': metadata['id'], 'source_mode': 'local_snapshot',
@@ -227,7 +231,8 @@ def prepare(iterations=None, notebook_name=None, first_run=False, profile='pilot
         'submitted_source_sha256': source_hash(notebook),
         'sha256': {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
                    for path in [notebook_path, *modules]},
-        'csv_names': [f'{experiment_name}_{suffix}.csv' for suffix in suffixes],
+        'csv_names': [name for name in result_names if name.endswith('.csv')],
+        'result_names': result_names,
     }
     (build / 'submission.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
     print(f'Prepared {metadata["id"]} from branch {branch}: {build}')
@@ -260,8 +265,8 @@ def collect(download_dir, destination, expected_names):
                     raise RuntimeError('Unsafe path in downloaded output archive.')
             zipped.extractall(archive.parent)
     groups = {}
-    for path in download_dir.rglob('*.csv'):
-        if path.name in expected_names:
+    for path in download_dir.rglob('*'):
+        if path.is_file() and path.name in expected_names:
             groups.setdefault(path.parent, set()).add(path.name)
     complete = [parent for parent, names in groups.items() if names == expected_names]
     if not complete:
@@ -296,7 +301,7 @@ def download(metadata, profile='pilot'):
     notebook = json.loads((remote / remote_metadata['code_file']).read_text(encoding='utf-8'))
     if source_hash(notebook) != manifest['submitted_source_sha256']:
         raise RuntimeError('Latest remote source differs from submitted source; outputs not collected.')
-    expected_names = set(manifest['csv_names'])
+    expected_names = set(manifest.get('result_names') or manifest['csv_names'])
     pattern = '(?:' + '|'.join(re.escape(name) for name in sorted(expected_names)) + ')$'
     cli('kernels', 'output', metadata['id'], '-p', str(downloaded), '--file-pattern', pattern)
     destination = ROOT / 'results' / 'kaggle_pretraining' / stamp
