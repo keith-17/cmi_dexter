@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import traceback
 from fractions import Fraction
 from pathlib import Path
 import warnings
@@ -2368,6 +2369,12 @@ class SequenceExtractor(HoneycombBase):
             combined[self.sequence_col] = processed[self.sequence_col].values
         elif self.sequence_col not in combined.columns:
             combined[self.sequence_col] = 0
+        augmentor = getattr(self, "_training_feature_augmentor", None)
+        if (augmentor is not None and augmentor._diagnostics_enabled()
+                and self.counter_col in processed):
+            # Diagnostic metadata is excluded from the model schema. Preserve
+            # the processed timeline, including resampling, without a row cache.
+            combined[self.counter_col] = processed[self.counter_col].values
         if add_context:
             feature_cols = [c for c in combined.columns if c not in self._non_feature_cols()]
             combined = self._append_global_context(combined, feature_cols)
@@ -2408,7 +2415,24 @@ class SequenceExtractor(HoneycombBase):
             processed,
             add_context=self.add_global_context and str(self.output_format).lower() != "frame",
         )
-        return combined
+        return self._apply_feature_augmentation(combined)
+
+    def _apply_feature_augmentation(self, combined):
+        """Training-only hook, installed temporarily by the sequence classifier.
+
+        Geometry, resampling and spectral calculations have finished here. Zero
+        rotation features are now missing model inputs, never raw quaternions
+        passed to gravity removal or rotation differentiation.
+        """
+        augmentor = getattr(self, "_training_feature_augmentor", None)
+        if augmentor is None:
+            return combined
+        columns = [c for c in combined if c not in self._non_feature_cols()]
+        try:
+            return augmentor.transform_features(combined, feature_columns=columns)
+        except Exception as exc:
+            exc.failure_stage = "augmentation"
+            raise
 
     def _stat_vector(self, arr: np.ndarray, stat: str) -> np.ndarray:
         if arr.size == 0:
@@ -2535,10 +2559,10 @@ class SequenceExtractor(HoneycombBase):
         """Reuse fitted training features without keeping a dataset cache on the estimator."""
         combined = self._fit_features(X, y, **fit_params)
         if str(self.output_format).lower() == "frame":
-            return self._frame_from_features(combined)
+            return self._frame_from_features(self._apply_feature_augmentation(combined))
         if self.add_global_context:
             combined = self._append_global_context(combined, self.base_feature_names_)
-        return self._chunks_from_features(combined)
+        return self._chunks_from_features(self._apply_feature_augmentation(combined))
 
     # ---------- transform ----------
 
@@ -3779,11 +3803,15 @@ def build_quick_results_df(search_or_cv_results: Any, holdout_score: Optional[fl
 
 
 def augment_jitter(x, sigma=0.03, rng=None):
+    if sigma == 0 or x.size == 0:
+        return x.copy()
     rng = rng or np.random.default_rng()
     return x + rng.normal(loc=0.0, scale=sigma, size=x.shape)
 
 
 def augment_gaussian_noise(x, std=0.05, rng=None):
+    if std == 0 or x.size == 0:
+        return x.copy()
     rng = rng or np.random.default_rng()
     ch_std = np.nanstd(x, axis=0, keepdims=True)
     ch_std = np.where(ch_std == 0, 1.0, ch_std)
@@ -3791,15 +3819,19 @@ def augment_gaussian_noise(x, std=0.05, rng=None):
 
 
 def augment_scaling(x, sigma=0.1, rng=None):
+    if sigma == 0 or x.size == 0:
+        return x.copy()
     rng = rng or np.random.default_rng()
     factor = rng.normal(loc=1.0, scale=sigma)
     return x * factor
 
 
 def augment_time_shift(x, max_shift_frac=0.1, rng=None):
+    if max_shift_frac <= 0 or len(x) <= 1:
+        return x.copy()
     rng = rng or np.random.default_rng()
     T = x.shape[0]
-    max_shift = max(1, int(T * max_shift_frac))
+    max_shift = min(T - 1, max(1, int(T * max_shift_frac)))
     shift = rng.integers(-max_shift, max_shift + 1)
     if shift == 0:
         return x.copy()
@@ -3839,8 +3871,10 @@ def _normalize_crop_frac_range(value):
 
 
 def augment_crop_resize(x, crop_frac_range=(0.5, 0.9), rng=None):
-    rng = rng or np.random.default_rng()
     crop_frac_range = _normalize_crop_frac_range(crop_frac_range)
+    if len(x) <= 1 or crop_frac_range == (1.0, 1.0):
+        return x.copy()
+    rng = rng or np.random.default_rng()
     x = np.asarray(x, dtype=float)
     squeeze = False
     if x.ndim == 1:
@@ -3864,17 +3898,21 @@ def augment_crop_resize(x, crop_frac_range=(0.5, 0.9), rng=None):
 
 
 def augment_temporal_mask(x, mask_frac=0.1, num_masks=1, rng=None):
+    if mask_frac <= 0 or num_masks <= 0 or len(x) == 0:
+        return x.copy()
     rng = rng or np.random.default_rng()
     T = x.shape[0]
-    mask_len = max(1, int(T * mask_frac))
+    mask_len = min(T, max(1, int(T * mask_frac)))
     out = x.copy()
     for _ in range(num_masks):
-        start = rng.integers(0, max(1, T - mask_len))
+        start = rng.integers(0, T - mask_len + 1)
         out[start : start + mask_len] = 0.0
     return out
 
 
 def augment_channel_dropout(x, drop_prob=0.1, rng=None):
+    if drop_prob <= 0 or x.size == 0:
+        return x.copy()
     rng = rng or np.random.default_rng()
     C = x.shape[1]
     mask = rng.random(C) >= drop_prob
@@ -3882,6 +3920,8 @@ def augment_channel_dropout(x, drop_prob=0.1, rng=None):
 
 
 def augment_sensor_dropout(x, sensor_groups, drop_prob=0.3, rng=None):
+    if drop_prob <= 0 or x.size == 0:
+        return x.copy()
     rng = rng or np.random.default_rng()
     out = x.copy()
     for _name, col_idx in sensor_groups.items():
@@ -3893,6 +3933,8 @@ def augment_sensor_dropout(x, sensor_groups, drop_prob=0.3, rng=None):
 
 
 def augment_magnitude_warp(x, sigma=0.2, num_knots=4, rng=None):
+    if sigma == 0 or num_knots <= 0 or len(x) <= 1:
+        return x.copy()
     rng = rng or np.random.default_rng()
     if CubicSpline is None:
         return x
@@ -3920,10 +3962,12 @@ _AUGMENTATION_REGISTRY = {
 ALL_AUGMENTATION_NAMES = tuple(_AUGMENTATION_REGISTRY.keys())
 
 _SENSOR_PREFIXES = {
-    "acc":  ("acc_",),
-    "rot":  ("rot_",),
+    "acc":  ("acc_", "lin_acc_"),
+    "rot":  ("rot_", "rot6d_", "ang_vel_"),
     "tof":  ("tof_", "depth_"),
     "thm":  ("thm_", "thermal_", "temp_"),
+    "stft": ("stft_",),
+    "cwt": ("cwt_",),
 }
 
 
@@ -3955,6 +3999,15 @@ def _coerce_augmentation_names(value):
 
 
 class SensorAugmentor(BaseEstimator, TransformerMixin):
+    """Sequence augmentation with an explicit geometry boundary.
+
+    ``transform`` accepts raw recordings and preserves all raw acceleration and
+    rotation columns together. Generic component arithmetic/interpolation is
+    not an orientation augmentation. The native multibranch path instead calls
+    ``transform_features`` after cleaning, gravity removal, rotation derivatives
+    and spectra, so dropout can zero IMU model features safely. A zero processed
+    quaternion feature is a masked input, not an orientation for further math.
+    """
     def __init__(
         self,
         augmentations: Optional[List[str]] = None,
@@ -3974,6 +4027,9 @@ class SensorAugmentor(BaseEstimator, TransformerMixin):
         sequence_col: str = "sequence_id",
         counter_col: str = "sequence_counter",
         seed: Optional[int] = 42,
+        diagnostics: bool = False,
+        diagnostic_max_sequences: int = 5,
+        diagnostic_max_locations: int = 5,
     ):
         self.augmentations = augmentations
         self.prob = prob
@@ -3992,38 +4048,188 @@ class SensorAugmentor(BaseEstimator, TransformerMixin):
         self.sequence_col = sequence_col
         self.counter_col = counter_col
         self.seed = seed
+        self.diagnostics = diagnostics
+        self.diagnostic_max_sequences = diagnostic_max_sequences
+        self.diagnostic_max_locations = diagnostic_max_locations
 
     def fit(self, X, y=None):
         self._rng = np.random.default_rng(self.seed)
+        self.diagnostics_ = []
         names = _coerce_augmentation_names(self.augmentations)
         self.aug_names_ = list(ALL_AUGMENTATION_NAMES if names is None else names)
         skip = {self.sequence_col, self.counter_col}
         self.sensor_cols_ = [
             c for c in X.columns
             if c not in skip
-            and c.startswith(("acc_", "lin_acc_", "rot_", "tof_", "thm_"))
+            and c.startswith(tuple(p for prefixes in _SENSOR_PREFIXES.values() for p in prefixes))
             and pd.api.types.is_numeric_dtype(X[c].dtype)
         ]
-        self.sensor_groups_ = _detect_sensor_groups(self.sensor_cols_)
+        self.protected_sensor_cols_ = [c for c in self.sensor_cols_
+                                       if c.startswith(("acc_", "rot_", "rot6d_", "ang_vel_"))]
+        self.mutable_sensor_cols_ = [c for c in self.sensor_cols_ if c not in self.protected_sensor_cols_]
+        self.sensor_groups_ = _detect_sensor_groups(self.mutable_sensor_cols_)
         return self
 
     def transform(self, X, y=None):
         check_is_fitted(self, "sensor_cols_")
-        if self.prob <= 0 or self.per_aug_prob <= 0 or not self.aug_names_ or not self.sensor_cols_:
+        self.diagnose_input(X)
+        return self._transform_frame(X, self.mutable_sensor_cols_, raw=True)
+
+    def transform_features(self, X, feature_columns=None):
+        """Augment already calculated features, never followed by geometry.
+
+        The extractor supplies its actual feature columns, including arbitrary
+        spectral prefixes. Metadata and numeric labels are not guessed as model
+        features when this method is used independently.
+        """
+        check_is_fitted(self, "sensor_cols_")
+        if feature_columns is None:
+            prefixes = tuple(p for group in _SENSOR_PREFIXES.values() for p in group)
+            feature_columns = [c for c in X if c.startswith(prefixes)]
+        skip = {self.sequence_col, self.counter_col, "mask", "dt", "rot_dt"}
+        columns = [c for c in feature_columns if c not in skip and c in X
+                   and pd.api.types.is_numeric_dtype(X[c].dtype)]
+        return self._transform_frame(X, columns, raw=False)
+
+    def _diagnostics_enabled(self):
+        return bool(self.diagnostics or getattr(self, "diagnostics_enabled_", False))
+
+    def _validity(self, frame, columns, raw):
+        """Only called in opt-in diagnostics; locations are bounded, data omitted."""
+        limit = max(0, int(self.diagnostic_max_locations))
+        values = frame[columns].to_numpy(dtype=float)
+        bad = ~np.isfinite(values)
+
+        def location(row):
+            item = {"row_position": int(row), "index": str(frame.index[row])}
+            if self.counter_col in frame:
+                item["counter"] = str(frame[self.counter_col].iloc[row])
+            return item
+
+        nonfinite = []
+        if limit and bad.any():
+            for row in range(len(frame)):
+                for col in np.flatnonzero(bad[row])[:limit - len(nonfinite)]:
+                    nonfinite.append({**location(row), "column": columns[col]})
+                if len(nonfinite) >= limit:
+                    break
+        result = {"nonfinite_count": int(bad.sum()), "nonfinite_locations": nonfinite,
+                  "zero_quaternion_count": 0, "near_zero_quaternion_count": 0,
+                  "quaternion_locations": []}
+        qcols = ["rot_w", "rot_x", "rot_y", "rot_z"]
+        if raw and all(c in frame for c in qcols):
+            q = frame[qcols].to_numpy(dtype=float)
+            norms = np.linalg.norm(q, axis=1)
+            zero = np.isfinite(norms) & (norms <= 0)
+            near = np.isfinite(norms) & (norms > 0) & (norms <= 1e-12)
+            result["zero_quaternion_count"] = int(zero.sum())
+            result["near_zero_quaternion_count"] = int(near.sum())
+            result["quaternion_locations"] = [
+                {**location(row), "norm": float(norms[row])}
+                for row in np.flatnonzero(zero | near)[:limit]
+            ]
+        result["invalid"] = bool(result["nonfinite_count"] or result["zero_quaternion_count"])
+        return result
+
+    def _diagnostic_report(self, frame, columns, raw):
+        validity = self._validity(frame, columns, raw)
+        context = dict(getattr(self, "diagnostic_context_", {}))
+        return {**context, "seed": self.seed,
+                "rng_state": self._rng.bit_generator.state,
+                "sequence_id": str(frame[self.sequence_col].iloc[0]),
+                "stage": "raw" if raw else "features",
+                "input_invalid": validity["invalid"], "input_validity": validity,
+                "operations": [], "first_invalid_operation": "input" if validity["invalid"] else None,
+                "validity": validity}
+
+    def _save_diagnostic(self, report):
+        if any(saved is report for saved in self.diagnostics_):
+            return
+        limit = max(0, int(self.diagnostic_max_sequences))
+        if len(self.diagnostics_) < limit:
+            self.diagnostics_.append(report)
+        elif limit and report.get("first_invalid_operation") is not None:
+            self.diagnostics_[-1] = report
+
+    def _raise_invalid(self, report):
+        error = InvalidExtractorParams(
+            "Augmentation input was already invalid before augmentation"
+            if report["input_invalid"] else
+            f"Augmentation operation {report['first_invalid_operation']!r} created invalid data"
+        )
+        error.augmentation_diagnostics = report
+        error.failure_stage = "augmentation"
+        self._save_diagnostic(report)
+        raise error
+
+    def diagnose_input(self, X):
+        """Optionally record invalid raw input before any augmentation operation."""
+        if not self._diagnostics_enabled():
+            return
+        columns = [c for c in self.sensor_cols_ if c in X]
+        for positions in X.groupby(self.sequence_col, sort=False).indices.values():
+            grp = X.iloc[positions]
+            report = self._diagnostic_report(grp, columns, raw=True)
+            # Missing values may be intentionally interpolated by SignalCleaner.
+            # Record them; the cleaner still decides whether they are recoverable.
+            if report["validity"]["zero_quaternion_count"]:
+                self._raise_invalid(report)
+            if report["input_invalid"] or report["validity"]["near_zero_quaternion_count"]:
+                self._save_diagnostic(report)
+
+    def _transform_frame(self, X, columns, raw):
+        if self.prob <= 0 or self.per_aug_prob <= 0 or not self.aug_names_ or not columns:
             return X
         out = X.copy()
-        for seq_id, grp in out.groupby(self.sequence_col, sort=False):
-            if self._rng.random() > self.prob:
+        column_positions = out.columns.get_indexer(columns)
+        diagnostics = self._diagnostics_enabled()
+        # Positional indexing also works with duplicate caller index labels and
+        # interleaved sequences; no operation crosses sequence boundaries.
+        for positions in out.groupby(self.sequence_col, sort=False).indices.values():
+            if self._rng.random() >= self.prob:
                 continue
-            idx = grp.index
-            vals = grp[self.sensor_cols_].to_numpy(dtype=float)
+            grp = out.iloc[positions]
+            vals = grp[columns].to_numpy(dtype=float)
+            checked_columns = [c for c in self.sensor_cols_ if c in grp] if raw else columns
+            report = self._diagnostic_report(grp, checked_columns, raw) if diagnostics else None
+            if report and report["input_invalid"]:
+                self._raise_invalid(report)
             for aug_name in self.aug_names_:
-                if self._rng.random() > self.per_aug_prob:
+                if self._rng.random() >= self.per_aug_prob:
                     continue
-                fn = _AUGMENTATION_REGISTRY[aug_name]
-                kwargs = self._build_kwargs(aug_name)
-                vals = fn(vals, rng=self._rng, **kwargs)
-            out.loc[idx, self.sensor_cols_] = vals
+                if report is not None:
+                    report["operations"].append({"name": aug_name, "parameters": {}})
+                try:
+                    fn = _AUGMENTATION_REGISTRY[aug_name]
+                    kwargs = self._build_kwargs(aug_name)
+                    if aug_name == "sensor_dropout":
+                        kwargs["sensor_groups"] = _detect_sensor_groups(columns)
+                    if report is not None:
+                        report["operations"][-1]["parameters"] = kwargs
+                    updated = fn(vals, rng=self._rng, **kwargs)
+                    if np.shape(updated) != np.shape(vals):
+                        raise ValueError(f"{aug_name} changed sequence shape {np.shape(vals)} to {np.shape(updated)}")
+                    vals = updated
+                    if report is not None:
+                        checked = grp.copy()
+                        checked[columns] = vals
+                        validity = self._validity(checked, checked_columns, raw)
+                        report["validity"] = validity
+                        if validity["invalid"]:
+                            report["first_invalid_operation"] = aug_name
+                            self._raise_invalid(report)
+                except Exception as exc:
+                    if report is not None:
+                        report["first_invalid_operation"] = report["first_invalid_operation"] or aug_name
+                        report["exception"] = f"{type(exc).__name__}: {exc}"
+                        report["traceback"] = traceback.format_exc(limit=20)
+                        self._save_diagnostic(report)
+                        exc.augmentation_diagnostics = report
+                    exc.failure_stage = "augmentation"
+                    raise
+            out.iloc[positions, column_positions] = vals
+            if report is not None:
+                self._save_diagnostic(report)
         return out
 
     @staticmethod
@@ -4031,13 +4237,12 @@ class SensorAugmentor(BaseEstimator, TransformerMixin):
         return _normalize_crop_frac_range(value)
 
     def _build_kwargs(self, name):
-        crop_range = self._coerce_crop_frac_range(self.crop_frac_range)
         table = {
             "jitter":          {"sigma": self.jitter_sigma},
             "gaussian_noise":  {"std": self.noise_std},
             "scaling":         {"sigma": self.scaling_sigma},
             "time_shift":      {"max_shift_frac": self.time_shift_frac},
-            "crop_resize":     {"crop_frac_range": crop_range},
+            "crop_resize":     {"crop_frac_range": self.crop_frac_range},
             "temporal_mask":   {"mask_frac": self.temporal_mask_frac, "num_masks": self.temporal_num_masks},
             "channel_dropout": {"drop_prob": self.channel_drop_prob},
             "sensor_dropout":  {"sensor_groups": self.sensor_groups_, "drop_prob": self.sensor_drop_prob},

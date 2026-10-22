@@ -11,6 +11,7 @@ from __future__ import annotations
 import gc
 import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import sys
 from time import perf_counter
 
@@ -207,6 +208,47 @@ def _training_info(estimator):
     }
 
 
+def _collect_candidate_failures(search, path, first_candidate, limit=128):
+    """Join bounded worker failure records to exported candidate IDs."""
+    records, total = [], 0
+    if path.exists():
+        with path.open(encoding="utf-8") as stream:
+            for line in stream:
+                total += 1
+                if len(records) < limit:
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    record.pop("params", None)  # Complete candidate settings live in the CSV.
+                    records.append(record)
+    identifiers = {}
+    if records and hasattr(search, "cv_results_"):
+        for index, params in enumerate(search.cv_results_["params"]):
+            candidate = clone(search.estimator).set_params(**params)
+            model = candidate.named_steps["estimator"]
+            identifiers.setdefault(model._candidate_key(), first_candidate + index)
+    for record in records:
+        key = record["candidate_id"]
+        record["candidate_key"] = key
+        record["candidate_id"] = identifiers.get(key)
+    search.candidate_failures_ = records
+    return records, total - len(records)
+
+
+def _clear_temporary_failure_log(search, key):
+    """Keep removed temporary paths out of returned estimators/parameter tables."""
+    search.estimator.set_params(**{key: None})
+    best = getattr(search, "best_estimator_", None)
+    if best is not None:
+        best.set_params(**{key: None})
+    for params in getattr(search, "cv_results_", {}).get("params", []):
+        if key in params:
+            params[key] = None
+    if key in getattr(search, "best_params_", {}):
+        search.best_params_[key] = None
+
+
 def _experiment_rows(search, protocol, holdout_score, refitted, first_candidate):
     """Export one row per candidate, including grid-search parameters and failures."""
     rows = pd.DataFrame(search.cv_results_).copy()
@@ -221,12 +263,38 @@ def _experiment_rows(search, protocol, holdout_score, refitted, first_candidate)
                 if isinstance(value, (dict, list, tuple, np.ndarray)) else value)
     scores = pd.to_numeric(rows.get("mean_test_score", pd.Series(index=rows.index, dtype=float)), errors="coerce")
     rows["mean_test_score"] = scores.where(np.isfinite(scores))
+    # A negative fold is a failure penalty even if other folds make its mean
+    # positive. Keep optimizer inputs intact and expose measured scores separately.
+    valid = np.isfinite(scores) & (scores >= 0)
+    failed_folds = np.zeros(len(rows), dtype=int)
+    for column in rows:
+        if column.startswith("split") and column.endswith("_test_score"):
+            split = pd.to_numeric(rows[column], errors="coerce")
+            failed = ~np.isfinite(split) | (split < 0)
+            valid &= ~failed
+            failed_folds += failed.to_numpy(dtype=int)
+    if "candidate_error" in rows:
+        valid &= rows["candidate_error"].isna()
+    rows["score_status"] = np.where(valid, "valid", "failed")
+    rows["valid_score"] = scores.where(valid)
+    model = getattr(getattr(search, "estimator", None), "named_steps", {}).get("estimator")
+    penalty = getattr(model, "invalid_candidate_score", -1.0)
+    rows["failure_penalty"] = np.where(valid, np.nan, penalty)
+    rows["failed_fold_count"] = failed_folds
     rows["candidate_id"] = np.arange(first_candidate, first_candidate + len(rows))
     rows["validation_mode"] = protocol["validation_mode"]
     rows["group_column"] = protocol["group_column"]
     rows["selected_for_holdout"] = False
     rows["holdout_score"] = np.nan
     rows["refit_error"] = None
+    rows["failure_stage"] = None
+    rows["failure_error"] = None
+    for failure in getattr(search, "candidate_failures_", []):
+        ordinal = failure.get("candidate_id")
+        if ordinal in set(rows["candidate_id"]):
+            index = rows.index[rows["candidate_id"] == ordinal]
+            rows.loc[index, "failure_stage"] = failure.get("stage")
+            rows.loc[index, "failure_error"] = failure.get("error")
     for failure in getattr(search, "refit_errors_", []):
         rows.loc[failure["candidate"], "refit_error"] = failure["error"]
     best_index = getattr(search, "best_index_", None)
@@ -240,9 +308,11 @@ def _save_results(experiments, summaries, *, root, experiment_name, timestamp, t
     """Overwrite the same two result files as each validation protocol completes."""
     rows = (pd.concat(experiments, ignore_index=True, sort=False) if experiments
             else pd.DataFrame(columns=["candidate_id", "validation_mode", "group_column", "mean_test_score", "params"]))
-    rows = rows.sort_values("mean_test_score", ascending=False, kind="stable", na_position="last").reset_index(drop=True)
+    ranking = "valid_score" if "valid_score" in rows else "mean_test_score"
+    rows = rows.sort_values(ranking, ascending=False, kind="stable", na_position="last").reset_index(drop=True)
     rows.insert(0, "rank", np.arange(1, len(rows) + 1))
     leading = [name for name in ("rank", "candidate_id", "validation_mode", "group_column",
+               "score_status", "valid_score", "failure_penalty", "failed_fold_count",
                "mean_test_score", "std_test_score", "mean_train_score", "selected_for_holdout",
                "holdout_score", "refit_error", "params") if name in rows]
     rows = rows[leading + [name for name in rows if name not in leading]]
@@ -253,12 +323,14 @@ def _save_results(experiments, summaries, *, root, experiment_name, timestamp, t
     refitted = [summary for summary in summaries if summary.get("best_candidate_id") is not None]
     best = max(refitted, key=lambda item: item["best_cv_score"], default={})
     candidate_id = best.get("best_candidate_id")
+    valid_rows = rows.loc[rows["score_status"] == "valid"] if "score_status" in rows else rows.iloc[:0]
     summary = {
         "experiment_name": experiment_name, "timestamp": str(timestamp), "target": target_col,
         "status": ("complete" if len(completed) == len(summaries) else "partial" if completed else "failed"),
-        "ranking_metric": "mean_test_score", "ranking_order": "descending",
+        "ranking_metric": ranking, "ranking_order": "descending",
         "experiment_count": len(rows), "best_candidate_id": candidate_id,
-        "top_cv_candidate_id": int(rows.iloc[0]["candidate_id"]) if len(rows) else None,
+        "valid_candidate_count": len(valid_rows), "failed_candidate_count": len(rows) - len(valid_rows),
+        "top_cv_candidate_id": int(valid_rows.iloc[0]["candidate_id"]) if len(valid_rows) else None,
         "best_cv_score": best.get("best_cv_score"), "holdout_score": best.get("holdout_score"),
         "best_params": best.get("best_params", {}), "training_info": best.get("training_info", {}),
         "validation_mode": best.get("validation_mode"), "group_column": best.get("group_column"),
@@ -303,6 +375,7 @@ def run_validation_searches(
         run = {**protocol, "search": None, "experiment_succeeded": False,
                "eval_results": {}, "results_dir": root}
         search = None
+        failure_directory = None
         started = perf_counter()
         print(f"\nValidation protocol: {mode} | group: {column or 'sequence_id'}")
         try:
@@ -321,7 +394,14 @@ def run_validation_searches(
             failure_key = "estimator__candidate_failure_log"
             if failure_key in estimator_params:
                 fixed[failure_key] = None
-                search.estimator.set_params(**{failure_key: None})
+                model = search.estimator.named_steps.get("estimator")
+                if hasattr(model, "_candidate_key"):
+                    # Worker-safe append logs are temporary; retained diagnostics
+                    # join the existing JSON summary so the two-file API remains.
+                    failure_directory = TemporaryDirectory(prefix="cmi_candidate_failures_")
+                    failure_path = Path(failure_directory.name) / "failures.jsonl"
+                    fixed[failure_key] = str(failure_path)
+                search.estimator.set_params(**{failure_key: fixed[failure_key]})
             space_name = "search_spaces" if hasattr(search, "search_spaces") else "param_grid"
             search.set_params(**{space_name: _fixed_protocol_spaces(getattr(search, space_name), fixed)})
             search.candidate_checkpoint_path = None
@@ -374,10 +454,25 @@ def run_validation_searches(
             run["experiment_succeeded"] = False
             summary["error"] = f"{type(exc).__name__}: {exc}"
             print(f"{mode} validation failed: {summary['error']}")
+        if failure_directory is not None:
+            try:
+                records, truncated = _collect_candidate_failures(search, failure_path, candidate_count + 1)
+                summary["candidate_failures"] = records
+                summary["candidate_failure_records_truncated"] = truncated
+            except Exception as reporting_error:
+                summary["candidate_failure_reporting_error"] = f"{type(reporting_error).__name__}: {reporting_error}"
+            finally:
+                try:
+                    _clear_temporary_failure_log(search, failure_key)
+                    failure_directory.cleanup()
+                except Exception as cleanup_error:
+                    summary["candidate_failure_cleanup_error"] = f"{type(cleanup_error).__name__}: {cleanup_error}"
         if search is not None and hasattr(search, "cv_results_"):
             rows = _experiment_rows(search, protocol, summary["holdout_score"],
                                     summary.get("best_candidate_id") is not None, candidate_count + 1)
             experiments.append(rows)
+            summary["valid_candidate_count"] = int((rows["score_status"] == "valid").sum())
+            summary["failed_candidate_count"] = int((rows["score_status"] == "failed").sum())
             candidate_count += len(rows)
         summary["elapsed_seconds"] = perf_counter() - started
         summaries.append(summary)

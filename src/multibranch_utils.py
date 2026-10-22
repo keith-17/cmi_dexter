@@ -8,11 +8,14 @@ optimizer, loss, and scheduler knob exposed for search.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import re
 import time
+import traceback
 import warnings
 from collections import Counter
+from contextlib import contextmanager
 from numbers import Integral, Real
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -1591,8 +1594,56 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         if self.augmentor is None:
             self.augmentor_ = None
             return X
+        self._fit_stage_ = "augmentation"
         self.augmentor_ = clone(self.augmentor)
+        self._configure_augmentation_diagnostics(self.augmentor_, "finetuning")
+        if self._uses_processed_augmentation(self.augmentor_):
+            # Fit records the RNG/column schema; raw orientation and acceleration
+            # reach the cleaner intact. Dropout runs after derived features exist.
+            self.augmentor_.fit(X)
+            self.augmentor_.diagnose_input(X)
+            return X
         return self.augmentor_.fit_transform(X)
+
+    def _uses_processed_augmentation(self, augmentor):
+        return type(getattr(self, "extractor_", None)) is SequenceExtractor and isinstance(augmentor, SensorAugmentor)
+
+    @contextmanager
+    def _training_feature_augmentation(self, augmentor=None):
+        """Install augmentation only during extraction of a training partition."""
+        augmentor = getattr(self, "augmentor_", None) if augmentor is None else augmentor
+        if not self._uses_processed_augmentation(augmentor):
+            yield
+            return
+        missing = object()
+        previous = getattr(self.extractor_, "_training_feature_augmentor", missing)
+        self.extractor_._training_feature_augmentor = augmentor
+        try:
+            yield
+        finally:
+            if previous is missing:
+                del self.extractor_._training_feature_augmentor
+            else:
+                self.extractor_._training_feature_augmentor = previous
+
+    def _candidate_key(self):
+        """Stable identifier for a parameter configuration, including across CV clones."""
+        params = {
+            name: value for name, value in self.get_params(deep=True).items()
+            if name not in {"candidate_failure_log", "invalid_candidate_policy"}
+            and not hasattr(value, "get_params")
+        }
+        encoded = json.dumps(params, default=str, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()[:16]
+
+    def _configure_augmentation_diagnostics(self, augmentor, partition):
+        # Runtime context is deliberately not an sklearn/search parameter.
+        augmentor.diagnostic_context_ = {
+            "candidate_id": self._candidate_key(), "partition": partition,
+            "model_random_state": self.random_state,
+        }
+        # File logging alone must not add per-operation scans to normal searches.
+        augmentor.diagnostics_enabled_ = bool(getattr(augmentor, "diagnostics", False))
 
     def _branch_groups(self, feature_names, separate_derived_imu=False):
         stft_prefixes = [e.feature_prefix for e in getattr(self.extractor_, "stft_extractors", [])]
@@ -1752,27 +1803,56 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
             raise ValueError("invalid_candidate_score must be finite and negative.")
         self.fit_failed_ = False
         self.fit_error_ = None
+        self.fit_failure_ = None
+        self._fit_stage_ = "validation"
         try:
             return self._fit_impl(X, y, **fit_params)
         except Exception as exc:
+            self.fit_error_ = f"{type(exc).__name__}: {exc}"
+            stage = getattr(exc, "failure_stage", getattr(self, "_fit_stage_", "fit"))
+            self._record_candidate_failure(stage, self.fit_error_, exc)
             if self.invalid_candidate_policy == "raise":
                 raise
             self.fit_failed_ = True
-            self.fit_error_ = f"{type(exc).__name__}: {exc}"
             self.history_ = {}
             if hasattr(self, "model_"):
                 del self.model_
             warnings.warn(f"Candidate skipped: {self.fit_error_}", RuntimeWarning)
-            self._record_candidate_failure("fit", self.fit_error_)
             return self
 
-    def _record_candidate_failure(self, stage, error):
+    def _record_candidate_failure(self, stage, error, exception=None):
+        """Keep a bounded diagnostic record without retaining data or exception frames."""
+        formatted = ("".join(traceback.format_exception(type(exception), exception, exception.__traceback__))
+                     if exception is not None else traceback.format_exc())
+        if len(formatted) > 16384:
+            formatted = formatted[:8192] + "\n... traceback truncated ...\n" + formatted[-8192:]
+        diagnostics = getattr(exception, "augmentation_diagnostics", None)
+        if diagnostics is None:
+            reports = {
+                partition: getattr(getattr(self, attribute, None), "diagnostics_", [])
+                for partition, attribute in (("finetuning", "augmentor_"), ("pretraining", "pretraining_augmentor_"))
+            }
+            diagnostics = {partition: report for partition, report in reports.items() if report} or None
+        record = {
+            "candidate_id": self._candidate_key(), "stage": stage, "error": error,
+            "exception_type": type(exception).__name__ if exception is not None else None,
+            "original_exception": (f"{type(exception.__cause__).__name__}: {exception.__cause__}"
+                                   if exception is not None and exception.__cause__ is not None else error),
+            "traceback": formatted, "augmentation_diagnostics": diagnostics,
+            "augmentation_seed": getattr(self.augmentor, "seed", None),
+            "pretraining_augmentation_seed": getattr(getattr(self, "pretraining_augmentor", None), "seed", None),
+            "model_random_state": self.random_state,
+        }
+        self.fit_failure_ = record
         if self.candidate_failure_log is not None:
-            path = Path(self.candidate_failure_log)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps({"stage": stage, "error": error,
-                                         "params": self.get_params(deep=False)}, default=str) + "\n")
+            try:
+                path = Path(self.candidate_failure_log)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps({**record, "params": self.get_params(deep=False)}, default=str) + "\n")
+            except Exception as logging_error:
+                record["logging_error"] = f"{type(logging_error).__name__}: {logging_error}"
+                warnings.warn(f"Candidate failure log could not be written: {logging_error}", RuntimeWarning)
         if self.verbose:
             print(f"Candidate skipped ({stage}): {error}")
 
@@ -1798,6 +1878,11 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         return aligned.to_numpy()
 
     def _extract_training_chunks(self, X_train):
+        with self._training_feature_augmentation():
+            return self._extract_training_chunks_impl(X_train)
+
+    def _extract_training_chunks_impl(self, X_train):
+        self._fit_stage_ = "extraction"
         try:
             # STFT/CWT features summarize each whole sequence; split sequences
             # first, then fit/transform train and validation partitions separately.
@@ -1822,9 +1907,13 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         except InvalidExtractorParams:
             raise
         except Exception as exc:
-            raise InvalidExtractorParams(
+            error = InvalidExtractorParams(
                 f"MultiBranchSequenceClassifier fit failed during extraction: {exc}"
-            ) from exc
+            )
+            for name in ("failure_stage", "augmentation_diagnostics"):
+                if hasattr(exc, name):
+                    setattr(error, name, getattr(exc, name))
+            raise error from exc
 
     def _build_model(self, time_series_shapes, static_shapes, n_classes, sequence_length, **overrides):
         """Build the shared backbone; subclasses may supply stage-specific heads/settings."""
@@ -1946,6 +2035,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         self._validate_extractor()
         self.custom_aux_heads_ = _normalise_aux_heads(self.custom_aux_heads)
 
+        self._fit_stage_ = "partitioning"
         X_train, X_validation = self._split_validation_sequences(X, y)
         validation_data = None
         if X_validation is not None and X_validation.empty:
@@ -1954,6 +2044,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         X_train = self._augment_training_sequences(X_train)
 
         train_chunks = self._extract_training_chunks(X_train)
+        self._fit_stage_ = "extraction"
         validation_chunks = (
             self.extractor_.transform_chunks(X_validation)
             if X_validation is not None else None
@@ -2071,6 +2162,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         if validation_chunks is not None:
             del validation_chunks["X"]
 
+        self._fit_stage_ = "training"
         self.model_ = self._build_model(
             time_series_shapes, static_shapes, len(self.classes_), train_chunks["mask"].shape[1],
         )
@@ -2987,7 +3079,7 @@ def candidate_score(estimator, X, y):
         if model.invalid_candidate_policy == 'raise':
             raise
         model.fit_error_ = f'{type(exc).__name__}: {exc}'
-        model._record_candidate_failure('score', model.fit_error_)
+        model._record_candidate_failure('scoring', model.fit_error_, exc)
         warnings.warn(f'Candidate scoring skipped: {model.fit_error_}', RuntimeWarning)
         return float(model.invalid_candidate_score)
 
@@ -3014,7 +3106,9 @@ def refit_valid_candidate(search, X, y, **fit_params):
         try:
             estimator.fit(X, y, **fit_params)
         except Exception as exc:
-            search.refit_errors_.append({'candidate': int(idx), 'error': f'{type(exc).__name__}: {exc}'})
+            model = estimator.named_steps.get('estimator')
+            search.refit_errors_.append({'candidate': int(idx), 'error': f'{type(exc).__name__}: {exc}',
+                                         'failure': getattr(model, 'fit_failure_', None)})
             continue
         search.best_estimator_ = estimator
         search.best_index_ = int(idx)

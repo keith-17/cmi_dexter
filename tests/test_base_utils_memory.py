@@ -53,7 +53,9 @@ class PreprocessingMemoryTests(unittest.TestCase):
         ).fit_transform(source)
         pd.testing.assert_frame_equal(active[["is_target", "auxiliary_score"]],
                                       source[["is_target", "auxiliary_score"]])
-        self.assertFalse(active["acc_x"].equals(source["acc_x"]))
+        self.assertFalse(active["thm_1"].equals(source["thm_1"]))
+        pd.testing.assert_frame_equal(active[["acc_x", "acc_y", "acc_z", "rot_w", "rot_x", "rot_y", "rot_z"]],
+                                      source[["acc_x", "acc_y", "acc_z", "rot_w", "rot_x", "rot_y", "rot_z"]])
         pd.testing.assert_frame_equal(source, original)
 
     def test_fit_transform_reuses_training_features_and_retains_no_frame_cache(self):

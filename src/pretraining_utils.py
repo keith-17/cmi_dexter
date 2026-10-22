@@ -235,7 +235,22 @@ class MaskedSensorSequence(_DataSequence):
                 corrupted.loc[zero, quaternion] = replacement
         # All derived channels, frequency summaries and global context are now
         # recomputed from this corrupted input, never from the clean recording.
-        extracted = self.owner.extractor_.transform_chunks(corrupted)
+        # Reconstruction targets remain raw and unchanged. Only the features
+        # consumed by source training receive the optional augmentation hook.
+        previous_stage = getattr(self.owner, "_fit_stage_", "training")
+        self.owner._fit_stage_ = "extraction"
+        try:
+            if not self.validation and getattr(self.owner, "pretraining_augmentor_", None) is not None:
+                with self.owner._training_feature_augmentation(self.owner.pretraining_augmentor_):
+                    extracted = self.owner.extractor_.transform_chunks(corrupted)
+            else:
+                extracted = self.owner.extractor_.transform_chunks(corrupted)
+        except Exception as exc:
+            if not hasattr(exc, "failure_stage"):
+                exc.failure_stage = "extraction"
+            raise
+        finally:
+            self.owner._fit_stage_ = previous_stage
         target_frame = frame[[self.sequence_col] + self.columns].copy()
         target_frame.loc[:, self.columns] = np.where(valid, values, 0.0)
         clean = self._raw_chunks(target_frame, self.columns)
@@ -445,6 +460,7 @@ class AdvancedMultiBranchSequenceClassifier(mb.MultiBranchSequenceClassifier):
         return fine, fine_validation
 
     def _extract_training_chunks(self, X_train):
+        self._fit_stage_ = "extraction"
         if self.pretraining_baseline_:
             chunks = super()._extract_training_chunks(X_train)
             self.finetuning_sequence_ids_ = pd.Index(
@@ -452,9 +468,20 @@ class AdvancedMultiBranchSequenceClassifier(mb.MultiBranchSequenceClassifier):
             )
             del self._preprocessing_X
             return chunks
+        # Diagnose source recordings before the shared cleaner can fail on them.
+        self.pretraining_augmentor_ = None
+        if self.pretraining_augmentor is not None and self._uses_processed_augmentation(self.pretraining_augmentor):
+            self._fit_stage_ = "augmentation"
+            self.pretraining_augmentor_ = clone(self.pretraining_augmentor)
+            self._configure_augmentation_diagnostics(self.pretraining_augmentor_, "pretraining")
+            self.pretraining_augmentor_.fit(self._pretraining_X)
+            self.pretraining_augmentor_.diagnose_input(self._pretraining_X)
+            self._validate_ssl_feature_augmentation()
+        self._fit_stage_ = "extraction"
         self.extractor_.fit(self._preprocessing_X)
         del self._preprocessing_X
-        chunks = self.extractor_.transform_chunks(X_train)
+        with self._training_feature_augmentation():
+            chunks = self.extractor_.transform_chunks(X_train)
         seq = self.extractor_.sequence_col
         accepted = pd.Index(chunks["sequence_ids"]).unique()
         self.finetuning_sequence_ids_ = pd.Index(accepted, name=seq)
@@ -467,12 +494,37 @@ class AdvancedMultiBranchSequenceClassifier(mb.MultiBranchSequenceClassifier):
         if self._pretraining_validation_X is not None and self._pretraining_validation_X.empty:
             raise ValueError("Problematic-sequence filtering removed every pretraining validation example.")
         self.pretraining_sequence_ids_ = pd.Index(self._pretraining_X[seq].drop_duplicates(), name=seq)
-        if self.pretraining_augmentor is not None:
+        if self.pretraining_augmentor is not None and self.pretraining_augmentor_ is None:
+            self._fit_stage_ = "augmentation"
             self.pretraining_augmentor_ = clone(self.pretraining_augmentor)
-            self._pretraining_X = self.pretraining_augmentor_.fit_transform(self._pretraining_X)
-        else:
-            self.pretraining_augmentor_ = None
+            self._configure_augmentation_diagnostics(self.pretraining_augmentor_, "pretraining")
+            if self._uses_processed_augmentation(self.pretraining_augmentor_):
+                self.pretraining_augmentor_.fit(self._pretraining_X)
+                self.pretraining_augmentor_.diagnose_input(self._pretraining_X)
+            else:
+                self._pretraining_X = self.pretraining_augmentor_.fit_transform(self._pretraining_X)
+        self._fit_stage_ = "extraction"
         return chunks
+
+    def _validate_ssl_feature_augmentation(self):
+        """Temporal feature reindexing would detach SSL inputs from raw targets."""
+        augmentor = self.pretraining_augmentor_
+        if self.pretraining_mode != "masked_ssl" or augmentor.prob <= 0 or augmentor.per_aug_prob <= 0:
+            return
+        active = []
+        if "time_shift" in augmentor.aug_names_ and augmentor.time_shift_frac > 0:
+            active.append("time_shift")
+        if ("crop_resize" in augmentor.aug_names_
+                and tuple(augmentor._coerce_crop_frac_range(augmentor.crop_frac_range)) != (1.0, 1.0)):
+            active.append("crop_resize")
+        if active:
+            error = mb.InvalidExtractorParams(
+                "Masked SSL pretraining feature augmentation cannot reindex timesteps with "
+                f"{', '.join(active)}; raw reconstruction targets and masks must remain aligned. "
+                "Use zero temporal strengths or omit those source augmentations."
+            )
+            error.failure_stage = "augmentation"
+            raise error
 
     def _pretraining_settings(self):
         settings = {
@@ -500,8 +552,17 @@ class AdvancedMultiBranchSequenceClassifier(mb.MultiBranchSequenceClassifier):
         stage.learning_rate = self._pretraining_settings()["learning_rate"]
         return mb.MultiBranchSequenceClassifier._build_callbacks(stage, has_validation)
 
+    def _extract_pretraining_chunks(self):
+        """Augment source training features after orientation-dependent extraction."""
+        self._fit_stage_ = "extraction"
+        augmentor = getattr(self, "pretraining_augmentor_", None)
+        if augmentor is not None:
+            with self._training_feature_augmentation(augmentor):
+                return self.extractor_.transform_chunks(self._pretraining_X)
+        return self.extractor_.transform_chunks(self._pretraining_X)
+
     def _supervised_pretrain(self, shapes, static, length, settings):
-        chunks = self.extractor_.transform_chunks(self._pretraining_X)
+        chunks = self._extract_pretraining_chunks()
         labels = _sequence_labels(
             self._pretraining_X, self._pretraining_y, chunks["sequence_ids"],
             self.extractor_.sequence_col, self.extractor_.pretraining_label_column,
@@ -509,6 +570,7 @@ class AdvancedMultiBranchSequenceClassifier(mb.MultiBranchSequenceClassifier):
         self.pretraining_label_encoder_ = LabelEncoder().fit(labels)
         if len(self.pretraining_label_encoder_.classes_) < 2:
             raise ValueError("Supervised pretraining needs at least two original gesture classes.")
+        self._fit_stage_ = "training"
         source = self._build_model(shapes, static, len(self.pretraining_label_encoder_.classes_), length, **settings)
         encoded = self.pretraining_label_encoder_.transform(labels)
         if str(settings["loss_name"]).lower() == "cce":
@@ -525,6 +587,7 @@ class AdvancedMultiBranchSequenceClassifier(mb.MultiBranchSequenceClassifier):
             raise ValueError("pretraining_class_weight_mode must be None or 'balanced'.")
         validation = None
         if self._pretraining_validation_X is not None:
+            self._fit_stage_ = "extraction"
             val = self.extractor_.transform_chunks(self._pretraining_validation_X)
             raw = _sequence_labels(
                 self._pretraining_validation_X, self._pretraining_y, val["sequence_ids"],
@@ -540,6 +603,7 @@ class AdvancedMultiBranchSequenceClassifier(mb.MultiBranchSequenceClassifier):
             validation = (self._model_inputs(arrays, val["mask"]), val_y)
             del val["X"]
         before = _weight_snapshot(source)
+        self._fit_stage_ = "training"
         history = source.fit(
             inputs, encoded, sample_weight=sample_weight, validation_data=validation,
             epochs=self.pretraining_epochs, batch_size=self.pretraining_batch_size,
