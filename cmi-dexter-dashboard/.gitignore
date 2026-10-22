@@ -1,0 +1,8 @@
+.venv/
+packages/
+packages-ready/
+__pycache__/
+data/
+builds/
+.streamlit/secrets.toml
+
