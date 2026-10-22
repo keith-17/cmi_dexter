@@ -35,7 +35,7 @@ try:
 except Exception:
     _HDBSCAN_AVAILABLE = False
 
-from base_utils_qwen import (
+from base_utils_sol import (
     SequenceExtractor,
     SignalCleaner,
     MotionFilter,
@@ -43,15 +43,18 @@ from base_utils_qwen import (
     RotationExtractor,
     STFTExtractor,
     CWTExtractor,
+    _one_sided_psd,
+    _stft_frame_coverage,
 )
 
 
 ACC_MODE_OPTS     = ('raw', 'velocity', 'displacement', 'jerk', 'smoothed')
 ROT_MODE_OPTS     = ('quaternion', 'euler', 'delta_euler', 'angular_velocity', 'rot6d')
 TOF_MODE_OPTS     = ('pooled_stats', 'sensor_stats', 'raw', 'pooled')
-THM_MODE_OPTS     = ('centered_diff', 'raw', 'centered', 'diff')
+THM_MODE_OPTS     = ('centered_diff', 'raw', 'centered', 'diff',
+                     'diff_per_second', 'centered_diff_per_second')
 FRAME_STAT_OPTS   = ('mean', 'std', 'min', 'max', 'last', 'first', 'median', 'rms', 'abs_mean')
-SPEC_MODE_OPTS    = ('fft', 'psd', 'spectrogram', 'stft', 'cwt')
+SPEC_MODE_OPTS    = ('welch_psd', 'psd', 'spectrogram', 'stft', 'cwt')
 CLUSTER_REDUCTION = ('pca', 'tsne', 'umap')
 CLUSTER_METHODS   = ('kmeans', 'gmm', 'agg', 'dbscan', 'hdbscan') if _HDBSCAN_AVAILABLE else \
                     ('kmeans', 'gmm', 'agg', 'dbscan')
@@ -100,7 +103,15 @@ class SequenceExplorer:
 
         self.df = df.copy()
         if self.counter_col in self.df.columns:
+            self.df[self.counter_col] = pd.to_numeric(self.df[self.counter_col], errors="coerce")
+            if self.df[self.counter_col].isna().any():
+                raise ValueError(f"{self.counter_col} must contain finite numeric sample indices")
             self.df = self.df.sort_values([sequence_col, counter_col], kind="stable")
+            deltas = self.df.groupby(sequence_col, sort=False)[counter_col].diff()
+            if (deltas.dropna() <= 0).any():
+                raise ValueError(
+                    f"{counter_col} must be strictly increasing within each {sequence_col}"
+                )
 
         # Derive gesture position / action
         if 'gesture_position' not in self.df.columns:
@@ -191,6 +202,7 @@ class SequenceExplorer:
     def _extractor_kwargs(self, vals):
         return dict(
             acc_modes=_norm_modes(vals.get("acc_modes"), "raw"),
+            linear_acc_modes=_norm_modes(vals.get("linear_acc_modes"), ""),
             rotation_modes=_norm_modes(vals.get("rotation_modes"), "quaternion"),
             tof_modes=_norm_modes(vals.get("tof_modes"), "pooled_stats"),
             thm_modes=_norm_modes(vals.get("thm_modes"), "centered_diff"),
@@ -204,6 +216,11 @@ class SequenceExplorer:
             smooth_alpha=float(vals.get("smooth_alpha", 0.0)) or None,
             clip_value=float(vals.get("clip_value", 0.0)) or None,
             interp_mode=vals.get("interp_mode", "linear"),
+            linear_acc_mode=vals.get("linear_acc_mode") or None,
+            use_highpass_fallback=bool(vals.get("use_highpass_fallback", True)),
+            linear_acc_frame=vals.get("linear_acc_frame", "world"),
+            acceleration_units=vals.get("acceleration_units", "m/s^2"),
+            gravity_magnitude=float(vals.get("gravity_magnitude", 9.80665)),
             maxlen=int(vals.get("maxlen", 160)),
             padding_value=float(vals.get("padding_value", 0.0)),
             imu_native_sampling_rate=int(vals.get("imu_native_sampling_rate", self.fs)),
@@ -224,6 +241,7 @@ class SequenceExplorer:
             stft_nperseg=int(vals.get("stft_nperseg", 64)),
             stft_noverlap=int(vals.get("stft_noverlap", 32)),
             stft_use_log_scale=bool(vals.get("stft_use_log_scale", True)),
+            stft_window_seconds=float(vals.get("stft_window_seconds", 0.0)) or None,
             cwt_wavelet=vals.get("cwt_wavelet", "morl"),
             cwt_max_scale=int(vals.get("cwt_max_scale", 100)),
             cwt_n_scales=int(vals.get("cwt_n_scales", 50)),
@@ -287,6 +305,19 @@ class SequenceExplorer:
         p["acc_modes"] = w.SelectMultiple(options=ACC_MODE_OPTS, value=("raw",),
                                           description="acc_modes:", rows=5,
                                           layout=w.Layout(width="260px"))
+        p["linear_acc_modes"] = w.SelectMultiple(
+            options=("raw", "velocity", "displacement", "jerk"), value=(),
+            description="linear_acc_modes:", rows=4,
+            layout=w.Layout(width="260px"))
+        p["linear_acc_mode"] = w.Dropdown(
+            options=("none", "baseline"), value="none", description="gravity removal:")
+        p["linear_acc_frame"] = w.Dropdown(
+            options=("world", "body"), value="world", description="linear frame:")
+        p["acceleration_units"] = w.Dropdown(
+            options=("m/s^2", "g"), value="m/s^2", description="acc units:")
+        p["gravity_magnitude"] = w.FloatText(value=9.80665, description="gravity (m/s²):")
+        p["use_highpass_fallback"] = w.Checkbox(
+            value=True, description="fallback: moving-average high-pass")
         p["rotation_modes"] = w.SelectMultiple(options=ROT_MODE_OPTS, value=("quaternion",),
                                                description="rot_modes:", rows=5,
                                                layout=w.Layout(width="260px"))
@@ -297,7 +328,7 @@ class SequenceExplorer:
                                           description="thm_modes:", rows=4,
                                           layout=w.Layout(width="260px"))
         # Motion filter
-        p["motion_filter_mode"] = w.Dropdown(options=["none", "kalman", "extended_kalman"],
+        p["motion_filter_mode"] = w.Dropdown(options=["none", "kalman"],
                                              value="none", description="motion_filter:")
         p["use_dead_reckoning"] = w.Checkbox(value=False, description="use_dead_reckoning")
         p["dead_reckoning_detrend"] = w.Checkbox(value=False, description="dead_reckoning_detrend")
@@ -354,6 +385,8 @@ class SequenceExplorer:
                                         description="stft_nperseg:")
         p["stft_noverlap"] = w.IntSlider(min=0, max=256, step=8, value=32,
                                          description="stft_noverlap (overlap):")
+        p["stft_window_seconds"] = w.FloatText(
+            value=0.0, description="stft_window_seconds (0=use samples):")
         p["stft_use_log_scale"] = w.Checkbox(value=True, description="stft_log_scale")
         p["cwt_wavelet"] = w.Dropdown(options=['morl', 'mexh', 'gaus1'], value='morl',
                                       description="cwt_wavelet:")
@@ -381,7 +414,7 @@ class SequenceExplorer:
             description="Channel:", layout=w.Layout(width="320px"),
         )
         self.spec_mode_ = w.Dropdown(
-            options=list(SPEC_MODE_OPTS), value="fft", description="Spec Mode:",
+            options=list(SPEC_MODE_OPTS), value="welch_psd", description="Spec Mode:",
         )
         self.spec_detrend_ = w.Checkbox(value=False, description="detrend")
         self.spec_nperseg_ = w.IntSlider(min=16, max=512, step=16, value=128,
@@ -643,25 +676,26 @@ class SequenceExplorer:
 
     # ---------------------------------------------------- internal chains ----
     def _compute_chain(self, g, channel):
-        """raw -> velocity (cumsum x dt) -> displacement -> jerk using the
-        sequence's own dt / counter column."""
+        """Raw-coordinate acceleration integrals for classification/inspection only."""
         y = g[channel].to_numpy(dtype=float)
-        y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+        if not np.isfinite(y).all():
+            raise ValueError("Signal chain requires finite acceleration samples")
         n = len(y)
         if self.counter_col in g.columns and n > 1:
             c = g[self.counter_col].to_numpy(dtype=float)
-            dc = np.diff(c, prepend=c[0])
-            dc[dc <= 0] = 1.0
-            dt_arr = dc / self.fs
+            intervals = np.diff(c) / self.fs
+            if not np.isfinite(intervals).all() or np.any(intervals <= 0):
+                raise ValueError("Sample intervals must be finite and positive")
         else:
-            dt_arr = np.full(n, 1.0 / self.fs)
+            intervals = np.full(max(0, n - 1), 1.0 / self.fs)
 
-        vel = np.cumsum(y * dt_arr)
-        disp = np.cumsum(vel * dt_arr)
+        vel = np.zeros(n, dtype=float)
+        disp = np.zeros(n, dtype=float)
+        jerk = np.zeros(n, dtype=float)
         if n > 1:
-            jerk = np.gradient(y, dt_arr)
-        else:
-            jerk = np.zeros_like(y)
+            vel[1:] = np.cumsum(0.5 * (y[1:] + y[:-1]) * intervals)
+            disp[1:] = np.cumsum(0.5 * (vel[1:] + vel[:-1]) * intervals)
+            jerk[1:] = np.diff(y) / intervals
         return {"raw": y, "velocity": vel, "displacement": disp, "jerk": jerk}
 
     # ------------------------------------------------------ tab: spectrum ---
@@ -677,7 +711,15 @@ class SequenceExplorer:
             return
 
         y = g[channel].to_numpy(dtype=float)
-        y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+        if not np.isfinite(y).all():
+            raise ValueError("Spectrum plots require finite samples")
+        if self.counter_col in g.columns and len(g) > 1:
+            counter = g[self.counter_col].to_numpy(dtype=float)
+            if np.any(np.diff(counter) != 1):
+                raise ValueError(
+                    "Spectral estimates require uniform samples; sequence_counter must "
+                    "increase by one for every row"
+                )
         if detrend:
             y = sp_signal.detrend(y)
 
@@ -695,12 +737,18 @@ class SequenceExplorer:
         stft_noverlap = kwargs['stft_noverlap']
 
         fig, ax = plt.subplots(figsize=(11, 5))
-        t = np.arange(len(y)) / self.fs
+        if self.counter_col in g.columns:
+            t = (
+                g[self.counter_col].to_numpy(dtype=float)
+                - float(g[self.counter_col].iloc[0])
+            ) / self.fs
+        else:
+            t = np.arange(len(y)) / self.fs
 
-        if spec_mode == "fft":
+        if spec_mode in {"fft", "welch_psd"}:
             f, Pxx = sp_signal.welch(y, fs=self.fs, nperseg=min(nperseg, len(y)))
             _plot_psd(ax, f, Pxx, spec_scale)
-            ax.set_title(f"Welch PSD — {channel}")
+            ax.set_title(f"Welch PSD (FFT-based estimate) — {channel}")
         elif spec_mode == "psd":
             f, Pxx = sp_signal.periodogram(y, fs=self.fs)
             _plot_psd(ax, f, Pxx, spec_scale)
@@ -717,32 +765,56 @@ class SequenceExplorer:
                          f"(nperseg={nperseg}, overlap={noverlap})")
             plt.colorbar(ax.collections[0], ax=ax, label="dB")
         elif spec_mode == "stft":
-            f, t_stft, Zxx = sp_signal.stft(y, fs=self.fs,
+            stft_nperseg = max(1, int(stft_nperseg))
+            if len(y) < stft_nperseg:
+                y_stft = np.pad(y, (0, stft_nperseg - len(y)))
+            else:
+                y_stft = y
+            f, t_stft, Zxx = sp_signal.stft(y_stft, fs=self.fs,
                                             nperseg=stft_nperseg,
-                                            noverlap=stft_noverlap)
-            mag = np.abs(Zxx)
-            if kwargs.get('stft_use_log_scale', True):
-                mag = np.log1p(mag)
-            ax.pcolormesh(t_stft, f, mag, shading='gouraud')
+                                            noverlap=max(0, min(int(stft_noverlap), stft_nperseg - 1)),
+                                            scaling="psd", boundary="zeros", padded=True)
+            psd = _one_sided_psd(Zxx, stft_nperseg)
+            coverage = _stft_frame_coverage(
+                t_stft, len(y), self.fs, stft_nperseg, "hann"
+            )
+            psd = np.divide(
+                psd,
+                coverage[None, :],
+                out=np.zeros_like(psd),
+                where=coverage[None, :] > 0,
+            )
+            stft_db = 10.0 * np.log10(np.maximum(psd, np.finfo(float).tiny))
+            ax.pcolormesh(t_stft + t[0], f, stft_db, shading='gouraud')
             ax.set_ylabel("Frequency (Hz)")
             ax.set_xlabel("Time (s)")
-            ax.set_title(f"STFT — {channel} "
+            ax.set_title(f"STFT PSD (dB display; training features are linear PSD) — {channel} "
                          f"(nperseg={stft_nperseg}, overlap={stft_noverlap})")
-            plt.colorbar(ax.collections[0], ax=ax, label="log|X|" if kwargs.get('stft_use_log_scale', True) else "|X|")
+            plt.colorbar(ax.collections[0], ax=ax, label="PSD (dB)")
         elif spec_mode == "cwt":
             if not _PYWT:
                 ax.text(0.5, 0.5, "PyWavelets not installed", ha='center', va='center')
             else:
-                scales = np.logspace(np.log10(1), np.log10(cwt_max_scale), cwt_n_scales)
+                cwt_wavelet_obj = pywt.ContinuousWavelet(cwt_wavelet)
+                min_scale = pywt.central_frequency(cwt_wavelet_obj) / 0.4
+                if cwt_max_scale < min_scale:
+                    raise ValueError(
+                        f"cwt_max_scale must be at least {min_scale:.3g} "
+                        "to keep the highest CWT frequency below 0.4*fs"
+                    )
+                scales = np.geomspace(min_scale, cwt_max_scale, cwt_n_scales)
                 coeffs, freqs = pywt.cwt(y, scales, cwt_wavelet, sampling_period=1.0 / self.fs)
                 mag = np.abs(coeffs)
-                if kwargs.get('cwt_use_log_scale', True):
+                use_log_scale = kwargs.get('cwt_use_log_scale', True)
+                if use_log_scale:
                     mag = np.log1p(mag)
                 ax.pcolormesh(t, freqs, mag, shading='gouraud')
                 ax.set_yscale('log')
+                display_transform = "log1p magnitude" if use_log_scale else "magnitude"
                 ax.set_ylabel("Frequency (Hz)")
                 ax.set_xlabel("Time (s)")
-                ax.set_title(f"CWT — {channel} "
+                ax.set_title(f"CWT {display_transform} display "
+                             f"(training excludes edge-affected coefficients) — {channel} "
                              f"(wavelet={cwt_wavelet}, scales={cwt_n_scales}, "
                              f"max_scale={cwt_max_scale})")
                 plt.colorbar(ax.collections[0], ax=ax, label="log|W|" if kwargs.get('cwt_use_log_scale', True) else "|W|")
@@ -757,32 +829,69 @@ class SequenceExplorer:
             print(f"Sequence {sid} / channel {channel} not available.")
             return
         y = g[channel].to_numpy(dtype=float)
-        y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+        if not np.isfinite(y).all():
+            raise ValueError("STFT/CWT plots require finite samples")
+        if self.counter_col in g.columns and len(g) > 1:
+            counter = g[self.counter_col].to_numpy(dtype=float)
+            if np.any(np.diff(counter) != 1):
+                raise ValueError(
+                    "STFT/CWT plots require uniformly spaced samples; "
+                    "sequence_counter must increase by one"
+                )
         kwargs = self._extractor_kwargs(pvals)
 
         fig, axes = plt.subplots(1, 2, figsize=(15, 5))
-        t = np.arange(len(y)) / self.fs
+        if self.counter_col in g.columns:
+            t = (
+                g[self.counter_col].to_numpy(dtype=float)
+                - float(g[self.counter_col].iloc[0])
+            ) / self.fs
+        else:
+            t = np.arange(len(y)) / self.fs
 
         # ---- left: time-frequency representation ----
         if method.upper() == "STFT":
-            nperseg = max(8, min(int(kwargs['stft_nperseg']), max(8, len(y))))
+            nperseg = max(1, int(kwargs['stft_nperseg']))
             noverlap = max(0, min(int(kwargs['stft_noverlap']), nperseg - 1))
-            f, t_stft, Zxx = sp_signal.stft(y, fs=self.fs, nperseg=nperseg, noverlap=noverlap)
-            mag = np.abs(Zxx)
-            if kwargs.get('stft_use_log_scale', True):
-                mag = np.log1p(mag)
-            axes[0].pcolormesh(t_stft, f, mag, shading='gouraud')
-            axes[0].set_title(f"STFT (nperseg={nperseg}, overlap={noverlap})")
+            y_stft = np.pad(y, (0, nperseg - len(y))) if len(y) < nperseg else y
+            f, t_stft, Zxx = sp_signal.stft(
+                y_stft, fs=self.fs, nperseg=nperseg, noverlap=noverlap,
+                scaling="psd", boundary="zeros", padded=True,
+            )
+            psd = _one_sided_psd(Zxx, nperseg)
+            coverage = _stft_frame_coverage(
+                t_stft, len(y), self.fs, nperseg, "hann"
+            )
+            psd = np.divide(
+                psd,
+                coverage[None, :],
+                out=np.zeros_like(psd),
+                where=coverage[None, :] > 0,
+            )
+            psd_db = 10.0 * np.log10(np.maximum(psd, np.finfo(float).tiny))
+            axes[0].pcolormesh(t_stft + t[0], f, psd_db, shading='gouraud')
+            axes[0].set_title(
+                f"STFT PSD (dB display; training uses linear PSD; "
+                f"nperseg={nperseg}, overlap={noverlap})"
+            )
             axes[0].set_ylabel("Frequency (Hz)")
             axes[0].set_xlabel("Time (s)")
-            plt.colorbar(axes[0].collections[0], ax=axes[0])
+            plt.colorbar(axes[0].collections[0], ax=axes[0], label="PSD (dB)")
         else:
             if not _PYWT:
                 axes[0].text(0.5, 0.5, "PyWavelets not installed",
                              ha='center', va='center')
             else:
-                scales = np.logspace(np.log10(1), np.log10(kwargs['cwt_max_scale']),
-                                     kwargs['cwt_n_scales'])
+                wavelet_obj = pywt.ContinuousWavelet(kwargs['cwt_wavelet'])
+                min_scale = pywt.central_frequency(wavelet_obj) / 0.4
+                if kwargs['cwt_max_scale'] < min_scale:
+                    raise ValueError(
+                        f"cwt_max_scale must be at least {min_scale:.3g} "
+                        "to keep the highest CWT frequency below 0.4*fs"
+                    )
+                scales = np.geomspace(
+                    min_scale, kwargs['cwt_max_scale'], kwargs['cwt_n_scales']
+                )
                 coeffs, freqs = pywt.cwt(y, scales, kwargs['cwt_wavelet'],
                                          sampling_period=1.0 / self.fs)
                 mag = np.abs(coeffs)
@@ -790,7 +899,8 @@ class SequenceExplorer:
                     mag = np.log1p(mag)
                 axes[0].pcolormesh(t, freqs, mag, shading='gouraud')
                 axes[0].set_yscale('log')
-                axes[0].set_title(f"CWT (wavelet={kwargs['cwt_wavelet']}, "
+                axes[0].set_title(f"CWT coefficient log-magnitude display "
+                                  f"(training masks boundaries; wavelet={kwargs['cwt_wavelet']}, "
                                   f"n_scales={kwargs['cwt_n_scales']}, "
                                   f"max_scale={kwargs['cwt_max_scale']})")
                 axes[0].set_ylabel("Frequency (Hz)")

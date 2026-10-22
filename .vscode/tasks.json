@@ -1,0 +1,109 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Kaggle: Sign in",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv-kaggle/Scripts/python.exe",
+      "args": [
+        "${workspaceFolder}/scripts/kaggle_experiment.py",
+        "auth"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Kaggle: Prepare experiment",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv-kaggle/Scripts/python.exe",
+      "args": [
+        "${workspaceFolder}/scripts/kaggle_experiment.py",
+        "prepare"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Kaggle: Push experiment (GPU)",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv-kaggle/Scripts/python.exe",
+      "args": [
+        "${workspaceFolder}/scripts/kaggle_experiment.py",
+        "push"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Kaggle: Check status",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv-kaggle/Scripts/python.exe",
+      "args": [
+        "${workspaceFolder}/scripts/kaggle_experiment.py",
+        "status"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Kaggle: Download results",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv-kaggle/Scripts/python.exe",
+      "args": [
+        "${workspaceFolder}/scripts/kaggle_experiment.py",
+        "download"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Kaggle: Pull remote copy",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv-kaggle/Scripts/python.exe",
+      "args": [
+        "${workspaceFolder}/scripts/kaggle_experiment.py",
+        "pull"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Kaggle: Follow live logs",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv-kaggle/Scripts/python.exe",
+      "args": [
+        "${workspaceFolder}/scripts/kaggle_experiment.py",
+        "logs"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Kaggle: Wait and download results",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv-kaggle/Scripts/python.exe",
+      "args": [
+        "${workspaceFolder}/scripts/kaggle_experiment.py",
+        "wait"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    }
+  ]
+}
