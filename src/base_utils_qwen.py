@@ -21,6 +21,7 @@ This is designed so that:
 
 from __future__ import annotations
 
+import ast
 import json
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
@@ -159,6 +160,50 @@ class HoneycombBase(BaseEstimator, TransformerMixin):
             for m in str(modes_str).split("|")
             if m.strip() and m.strip().lower() != "none"
         ]
+
+
+class ProblematicSequenceFilter(HoneycombBase):
+    """Identify sequences with too many highly-skewed sensor channels.
+
+    The thresholds are estimator parameters on purpose: they can be searched by
+    ``GridSearchCV``/``BayesSearchCV`` without notebook-side preprocessing.
+    """
+
+    def __init__(
+        self,
+        ideal_skew_threshold: float = 1.35,
+        problematic_features_threshold: int = 6,
+        feature_cols: Optional[List[str]] = None,
+        sequence_col: str = "sequence_id",
+    ):
+        self.ideal_skew_threshold = ideal_skew_threshold
+        self.problematic_features_threshold = problematic_features_threshold
+        self.feature_cols = feature_cols
+        self.sequence_col = sequence_col
+
+    def fit(self, X: pd.DataFrame, y=None):
+        if self.sequence_col not in X.columns:
+            raise ValueError(f"ProblematicSequenceFilter requires '{self.sequence_col}'.")
+        default = ["acc_x", "acc_y", "acc_z", "rot_x", "rot_y", "rot_w", "rot_z"]
+        requested = default if self.feature_cols is None else list(self.feature_cols)
+        self.feature_cols_ = [col for col in requested if col in X.columns]
+        if not self.feature_cols_:
+            self.problematic_sequence_ids_ = pd.Index([], name=self.sequence_col)
+            return self
+        skew = X.groupby(self.sequence_col, sort=False)[self.feature_cols_].skew().abs()
+        count = (skew > float(self.ideal_skew_threshold)).sum(axis=1)
+        self.problematic_sequence_ids_ = skew.index[
+            count >= int(self.problematic_features_threshold)
+        ]
+        return self
+
+    def problematic_mask(self, X: pd.DataFrame) -> pd.Series:
+        check_is_fitted(self, ["problematic_sequence_ids_"])
+        return X[self.sequence_col].isin(self.problematic_sequence_ids_)
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Remove only IDs flagged while fitting (never re-evaluates validation data)."""
+        return X.loc[~self.problematic_mask(X)].copy()
 
 
 # ---------------------------------------------------------------------------
@@ -919,6 +964,12 @@ class SequenceExtractor(HoneycombBase):
         cwt_max_scale: int = 128,
         cwt_n_scales: int = 32,
         cwt_use_log_scale: bool = True,
+        stft_configs: Optional[List[Dict[str, Any]]] = None,
+        cwt_configs: Optional[List[Dict[str, Any]]] = None,
+        filter_problematic_sequences: bool = False,
+        ideal_skew_threshold: float = 1.35,
+        problematic_features_threshold: int = 6,
+        problematic_feature_cols: Optional[List[str]] = None,
     ):
         self.acc_modes = acc_modes
         self.rotation_modes = rotation_modes
@@ -963,6 +1014,12 @@ class SequenceExtractor(HoneycombBase):
         self.cwt_max_scale = cwt_max_scale
         self.cwt_n_scales = cwt_n_scales
         self.cwt_use_log_scale = cwt_use_log_scale
+        self.stft_configs = stft_configs
+        self.cwt_configs = cwt_configs
+        self.filter_problematic_sequences = filter_problematic_sequences
+        self.ideal_skew_threshold = ideal_skew_threshold
+        self.problematic_features_threshold = problematic_features_threshold
+        self.problematic_feature_cols = problematic_feature_cols
 
         self.cleaner = SignalCleaner(
             native_sampling_rate=self.imu_native_sampling_rate,
@@ -1006,26 +1063,40 @@ class SequenceExtractor(HoneycombBase):
         )
 
 
-        self.stft_extractor = STFTExtractor(
-            nperseg=self.stft_nperseg,
-            noverlap=self.stft_noverlap,
-            window_type=self.stft_window_type,
-            use_log_scale=self.stft_use_log_scale,
-            sampling_rate=self.imu_native_sampling_rate,
-            sequence_col=self.sequence_col,
-        )
-        
-        self.cwt_extractor = CWTExtractor(
-            wavelet=self.cwt_wavelet,
-            max_scale=self.cwt_max_scale,
-            n_scales=self.cwt_n_scales,
-            use_log_scale=self.cwt_use_log_scale,
-            sampling_rate=self.imu_native_sampling_rate,
-            sequence_col=self.sequence_col,
-        )
+        self._build_time_frequency_extractors()
         
 
     # ----------------------------- helpers -----------------------------
+
+    def _build_time_frequency_extractors(self) -> None:
+        """Build one or many named STFT/CWT extractors from search-safe configs."""
+        stft_defaults = dict(nperseg=self.stft_nperseg, noverlap=self.stft_noverlap,
+            window_type=self.stft_window_type, use_log_scale=self.stft_use_log_scale,
+            sampling_rate=self.imu_native_sampling_rate, sequence_col=self.sequence_col)
+        cwt_defaults = dict(wavelet=self.cwt_wavelet, max_scale=self.cwt_max_scale,
+            n_scales=self.cwt_n_scales, use_log_scale=self.cwt_use_log_scale,
+            sampling_rate=self.imu_native_sampling_rate, sequence_col=self.sequence_col)
+        stft_configs = self.stft_configs or [{}]
+        cwt_configs = self.cwt_configs or [{}]
+        # ``prepare_bayesian_space`` serializes list/dict categories. Accepting
+        # that representation keeps stacked configs usable in BayesSearchCV.
+        if isinstance(stft_configs, str):
+            stft_configs = json.loads(stft_configs)
+        if isinstance(cwt_configs, str):
+            cwt_configs = json.loads(cwt_configs)
+        self.stft_extractors = []
+        self.cwt_extractors = []
+        for i, config in enumerate(stft_configs):
+            config = dict(config)
+            name = config.pop("name", f"stft{i}")
+            self.stft_extractors.append(STFTExtractor(**(stft_defaults | config), feature_prefix=name))
+        for i, config in enumerate(cwt_configs):
+            config = dict(config)
+            name = config.pop("name", f"cwt{i}")
+            self.cwt_extractors.append(CWTExtractor(**(cwt_defaults | config), feature_prefix=name))
+        # Backwards-compatible public handles.
+        self.stft_extractor = self.stft_extractors[0]
+        self.cwt_extractor = self.cwt_extractors[0]
 
     def _non_feature_cols(self) -> List[str]:
         cols = {self.sequence_col, self.counter_col, "dt", "mask"}
@@ -1151,7 +1222,7 @@ class SequenceExtractor(HoneycombBase):
     def _combine_feature_outputs(self, processed: pd.DataFrame, add_context: bool = False) -> pd.DataFrame:
         outs = []
 
-        for est in (self.imu, self.rotation, self.tof, self.thermo, self.stft_extractor, self.cwt_extractor):
+        for est in (self.imu, self.rotation, self.tof, self.thermo, *self.stft_extractors, *self.cwt_extractors):
             out = est.transform(processed)
             if out is not None and not out.empty:
                 outs.append(out)
@@ -1197,6 +1268,12 @@ class SequenceExtractor(HoneycombBase):
         return out
 
     def _preprocess_features(self, X: pd.DataFrame) -> pd.DataFrame:
+        # The fitted list contains training IDs only, so held-out/test sequences
+        # are retained while a training transform remains label-aligned.
+        if self.filter_problematic_sequences:
+            X = self.problematic_filter_.transform(X)
+            if X.empty:
+                raise InvalidExtractorParams("Problematic-sequence filtering removed every input row.")
         cleaned = self.cleaner.transform(X)
         filtered = self.motion_filter.transform(cleaned)
         processed = self._maybe_resample(filtered)
@@ -1285,7 +1362,18 @@ class SequenceExtractor(HoneycombBase):
             sequence_col=self.sequence_col,
         )
 
-        cleaned = self.cleaner.fit_transform(X)
+        self._build_time_frequency_extractors()
+        self.problematic_filter_ = ProblematicSequenceFilter(
+            ideal_skew_threshold=self.ideal_skew_threshold,
+            problematic_features_threshold=self.problematic_features_threshold,
+            feature_cols=self.problematic_feature_cols,
+            sequence_col=self.sequence_col,
+        ).fit(X)
+        X_fit = self.problematic_filter_.transform(X) if self.filter_problematic_sequences else X
+        if X_fit.empty:
+            raise InvalidExtractorParams("Problematic-sequence filtering removed every training row.")
+
+        cleaned = self.cleaner.fit_transform(X_fit)
         filtered = self.motion_filter.fit_transform(cleaned)
         processed = self._maybe_resample(filtered)
 
@@ -1293,8 +1381,8 @@ class SequenceExtractor(HoneycombBase):
         self.rotation.fit(processed)
         self.tof.fit(processed)
         self.thermo.fit(processed)
-        self.stft_extractor.fit(processed)
-        self.cwt_extractor.fit(processed)
+        for extractor in (*self.stft_extractors, *self.cwt_extractors):
+            extractor.fit(processed)
 
         combined = self._combine_feature_outputs(processed, add_context=False)
 
@@ -1722,6 +1810,10 @@ class RandomForestSequenceClassifier(BaseEstimator, ClassifierMixin):
             y_seq = yy.drop_duplicates(seq_col).sort_values(seq_col)
 
             if isinstance(preds, pd.Series):
+                # A training transform may intentionally omit problematic IDs.
+                # Score only the sequence IDs for which the extractor emitted a
+                # prediction; held-out IDs are never in that fitted omission set.
+                y_seq = y_seq[y_seq[seq_col].isin(preds.index)]
                 preds_aligned = preds.reindex(y_seq[seq_col]).to_numpy()
             else:
                 preds_aligned = np.asarray(preds)
@@ -1831,12 +1923,49 @@ def competition_score(
 
 def make_competition_scorer(target_col: str = "bfrb"):
     """
-    Sklearn CV scorer aligned with row-level y and sequence-level predictions.
+    Sklearn CV scorer aligned with sequence-level predictions.
+
+    For bfrb, use the competition score. For non-bfrb tasks such as orientation or
+    gesture_action, fall back to the standard macro-F1 score across the target labels.
     """
 
     seq_col = "sequence_id"
 
     def _score(y_true, y_pred):
+        if target_col == "bfrb":
+            if isinstance(y_true, pd.DataFrame):
+                if seq_col not in y_true.columns:
+                    if y_true.index.name == seq_col:
+                        y_true = y_true.reset_index()
+                    else:
+                        raise ValueError("y_true must contain sequence_id.")
+
+                y_seq = y_true.drop_duplicates(seq_col).sort_values(seq_col)
+
+                if "is_target" in y_seq.columns:
+                    y_true_binary = y_seq["is_target"].astype(int).values
+                else:
+                    y_true_binary = (y_seq[target_col] != "non_bfrb").astype(int)
+
+                y_true_gesture = y_seq[target_col].values
+
+                if isinstance(y_pred, pd.Series) and y_pred.index.name == seq_col:
+                    y_pred = y_pred.reindex(y_seq[seq_col]).to_numpy()
+                else:
+                    y_pred = np.asarray(y_pred)
+
+            else:
+                y_true_gesture = np.asarray(y_true)
+                y_true_binary = (y_true_gesture != "non_bfrb").astype(int)
+                y_pred = np.asarray(y_pred)
+
+            return competition_score(
+                y_true_gesture,
+                y_pred,
+                y_true_binary=y_true_binary,
+                target_only_macro=True,
+            )
+
         if isinstance(y_true, pd.DataFrame):
             if seq_col not in y_true.columns:
                 if y_true.index.name == seq_col:
@@ -1844,34 +1973,19 @@ def make_competition_scorer(target_col: str = "bfrb"):
                 else:
                     raise ValueError("y_true must contain sequence_id.")
 
-            y_seq = (
-                y_true.drop_duplicates(seq_col)
-                .sort_values(seq_col)
-            )
-
-            if "is_target" in y_seq.columns:
-                y_true_binary = y_seq["is_target"].astype(int).values
-            else:
-                y_true_binary = (y_seq[target_col] != "non_bfrb").astype(int)
-
-            y_true_gesture = y_seq[target_col].values
+            y_seq = y_true.drop_duplicates(seq_col).sort_values(seq_col)
+            y_true_vals = y_seq[target_col].astype(str).values
 
             if isinstance(y_pred, pd.Series) and y_pred.index.name == seq_col:
-                y_pred = y_pred.reindex(y_seq[seq_col]).to_numpy()
+                y_pred = y_pred.reindex(y_seq[seq_col]).astype(str).to_numpy()
             else:
-                y_pred = np.asarray(y_pred)
+                y_pred = np.asarray(y_pred, dtype=str)
 
-        else:
-            y_true_gesture = np.asarray(y_true)
-            y_true_binary = (y_true_gesture != "non_bfrb").astype(int)
-            y_pred = np.asarray(y_pred)
+            return f1_score(y_true_vals, y_pred, average="macro", zero_division=0)
 
-        return competition_score(
-            y_true_gesture,
-            y_pred,
-            y_true_binary=y_true_binary,
-            target_only_macro=True,
-        )
+        y_true_vals = np.asarray(y_true, dtype=str)
+        y_pred = np.asarray(y_pred, dtype=str)
+        return f1_score(y_true_vals, y_pred, average="macro", zero_division=0)
 
     return make_scorer(_score)
 
@@ -1888,11 +2002,9 @@ def evaluate_holdout(
     """
     Final holdout evaluation.
 
-    Returns dict with:
-    - binary_f1
-    - gesture_f1
-    - competition_score
-    - results_df
+    For the bfrb task, keep the competition score used in the Kaggle challenge.
+    For all other tasks such as orientation and gesture_action, use the standard
+    macro-F1 score across the target labels.
     """
 
     seq_col = "sequence_id"
@@ -1916,67 +2028,98 @@ def evaluate_holdout(
     else:
         y_pred = np.asarray(y_pred)
 
-    if "is_target" in y_test_seq.columns:
-        y_true_binary = y_test_seq["is_target"].astype(int).values
-    else:
-        y_true_binary = (y_test_seq[target_col] != "non_bfrb").astype(int)
+    if target_col == "bfrb":
+        if "is_target" in y_test_seq.columns:
+            y_true_binary = y_test_seq["is_target"].astype(int).values
+        else:
+            y_true_binary = (y_test_seq[target_col] != "non_bfrb").astype(int)
 
-    y_pred_binary = (y_pred != "non_bfrb").astype(int)
+        y_pred_binary = (y_pred != "non_bfrb").astype(int)
 
-    binary_f1 = f1_score(
-        y_true_binary,
-        y_pred_binary,
-        zero_division=0,
-    )
+        binary_f1 = f1_score(y_true_binary, y_pred_binary, zero_division=0)
 
-    target_mask = y_true_binary == 1
+        target_mask = y_true_binary == 1
 
-    if target_mask.sum() > 0:
-        gesture_f1 = f1_score(
-            y_test_seq.loc[target_mask, target_col].values,
-            y_pred[target_mask],
-            average="macro",
-            zero_division=0,
+        if target_mask.sum() > 0:
+            gesture_f1 = f1_score(
+                y_test_seq.loc[target_mask, target_col].values,
+                y_pred[target_mask],
+                average="macro",
+                zero_division=0,
+            )
+        else:
+            gesture_f1 = 0.0
+
+        comp_score = (binary_f1 + gesture_f1) / 2.0
+        metric_name = "competition_score"
+        metric_value = comp_score
+        summary_text = "COMPETITION SCORE"
+        summary_prefix = "Binary F1 (non_bfrb vs bfrb)"
+
+        if verbose:
+            print("\n" + "=" * 60)
+            print("FINAL EVALUATION")
+            print("=" * 60)
+            print(f"{summary_prefix}: {binary_f1:.4f}")
+            print(f"BFRB Gesture Macro F1: {gesture_f1:.4f}")
+            print(f"{summary_text}: {metric_value:.4f}")
+
+            if target_mask.sum() > 0:
+                print("\n" + "-" * 40)
+                print("BFRB Gesture Classification Report")
+                print("-" * 40)
+                print(
+                    classification_report(
+                        y_test_seq.loc[target_mask, target_col].values,
+                        y_pred[target_mask],
+                        zero_division=0,
+                    )
+                )
+
+        results_df = pd.DataFrame(
+            {
+                "sequence_id": y_test_seq[seq_col].values,
+                "is_target_true": y_true_binary,
+                "is_target_pred": y_pred_binary,
+                f"{target_col}_true": y_test_seq[target_col].values,
+                f"{target_col}_pred": y_pred,
+            }
         )
-    else:
-        gesture_f1 = 0.0
 
-    comp_score = (binary_f1 + gesture_f1) / 2.0
+        return {
+            "binary_f1": binary_f1,
+            "gesture_f1": gesture_f1,
+            "competition_score": comp_score,
+            "results_df": results_df,
+        }
+
+    y_true_values = y_test_seq[target_col].astype(str).values
+    y_pred_values = np.asarray(y_pred, dtype=str)
+
+    macro_f1 = f1_score(y_true_values, y_pred_values, average="macro", zero_division=0)
 
     if verbose:
         print("\n" + "=" * 60)
         print("FINAL EVALUATION")
         print("=" * 60)
-        print(f"Binary F1 (non_bfrb vs bfrb): {binary_f1:.4f}")
-        print(f"BFRB Gesture Macro F1: {gesture_f1:.4f}")
-        print(f"COMPETITION SCORE: {comp_score:.4f}")
-
-        if target_mask.sum() > 0:
-            print("\n" + "-" * 40)
-            print("BFRB Gesture Classification Report")
-            print("-" * 40)
-            print(
-                classification_report(
-                    y_test_seq.loc[target_mask, target_col].values,
-                    y_pred[target_mask],
-                    zero_division=0,
-                )
-            )
+        print(f"Target: {target_col}")
+        print(f"Macro F1: {macro_f1:.4f}")
+        print("\n" + "-" * 40)
+        print("Classification Report")
+        print("-" * 40)
+        print(classification_report(y_true_values, y_pred_values, zero_division=0))
 
     results_df = pd.DataFrame(
         {
             "sequence_id": y_test_seq[seq_col].values,
-            "is_target_true": y_true_binary,
-            "is_target_pred": y_pred_binary,
-            f"{target_col}_true": y_test_seq[target_col].values,
-            f"{target_col}_pred": y_pred,
+            f"{target_col}_true": y_true_values,
+            f"{target_col}_pred": y_pred_values,
         }
     )
 
     return {
-        "binary_f1": binary_f1,
-        "gesture_f1": gesture_f1,
-        "competition_score": comp_score,
+        "macro_f1": macro_f1,
+        "competition_score": macro_f1,
         "results_df": results_df,
     }
 
@@ -2064,6 +2207,8 @@ class STFTExtractor(HoneycombBase):
         frequency_bands: Optional[Dict[str, Tuple[float, float]]] = None,
         sampling_rate: int = 20,
         sequence_col: str = "sequence_id",
+        feature_prefix: str = "stft0",
+        signal_columns: Optional[List[str]] = None,
     ):
         self.acc_modes = acc_modes
         self.nperseg = nperseg
@@ -2080,14 +2225,20 @@ class STFTExtractor(HoneycombBase):
         }
         self.sampling_rate = sampling_rate
         self.sequence_col = sequence_col
+        self.feature_prefix = feature_prefix
+        self.signal_columns = signal_columns
 
     def fit(self, X: pd.DataFrame, y=None):
-        self.acc_cols_ = [
+        candidates = [
             c for c in X.columns 
             if c.startswith("acc_") and not c.endswith(("_vel", "_disp", "_jerk", "_mag", "_dr_vel", "_dr_pos"))
         ]
+        self.acc_cols_ = candidates if self.signal_columns is None else [c for c in self.signal_columns if c in X.columns]
+        self.nperseg = int(self.nperseg) if self.nperseg is not None else 32
         if self.noverlap is None:
-            self.noverlap = self.nperseg // 2
+            self.noverlap = max(0, self.nperseg // 2)
+        else:
+            self.noverlap = int(self.noverlap)
         return self
 
     def _compute_stft_features(self, signal: np.ndarray) -> Dict[str, np.ndarray]:
@@ -2097,9 +2248,16 @@ class STFTExtractor(HoneycombBase):
 
         signal = np.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0)
 
-        if len(signal) < self.nperseg:
+        nperseg = int(self.nperseg)
+        if nperseg <= 0:
+            nperseg = min(len(signal), 32) or 1
+        if len(signal) < nperseg:
             # Pad signal if too short
-            signal = np.pad(signal, (0, self.nperseg - len(signal)), mode='constant')
+            signal = np.pad(signal, (0, nperseg - len(signal)), mode='constant')
+
+        noverlap = int(self.noverlap) if self.noverlap is not None else max(0, nperseg // 2)
+        if noverlap >= nperseg:
+            noverlap = max(0, nperseg // 2)
 
         scipy_scaling = self.scaling.lower()
         if scipy_scaling == 'density':
@@ -2112,8 +2270,8 @@ class STFTExtractor(HoneycombBase):
             signal,
             fs=self.sampling_rate,
             window=self.window_type,
-            nperseg=self.nperseg,
-            noverlap=self.noverlap,
+            nperseg=nperseg,
+            noverlap=noverlap,
             nfft=None,
             detrend=self.detrend,
             return_onesided=True,
@@ -2220,10 +2378,10 @@ class STFTExtractor(HoneycombBase):
             
             for feat_name, values in feat_dict.items():
                 seq_to_val = dict(zip(unique_seqs, values))
-                df[f"{col}_{feat_name}"] = [seq_to_val[sid] for sid in seq_ids]
+                df[f"{col}_{self.feature_prefix}_{feat_name}"] = [seq_to_val[sid] for sid in seq_ids]
             
             # Add column-specific features to parts
-            feat_cols = [f"{col}_{k}" for k in feat_dict.keys()]
+            feat_cols = [f"{col}_{self.feature_prefix}_{k}" for k in feat_dict.keys()]
             parts.append(df[feat_cols])
         
         if not parts:
@@ -2252,6 +2410,8 @@ class CWTExtractor(HoneycombBase):
         use_log_scale: bool = True,
         sampling_rate: int = 20,
         sequence_col: str = "sequence_id",
+        feature_prefix: str = "cwt0",
+        signal_columns: Optional[List[str]] = None,
     ):
         self.acc_modes = acc_modes
         self.wavelet = wavelet
@@ -2261,12 +2421,15 @@ class CWTExtractor(HoneycombBase):
         self.use_log_scale = use_log_scale
         self.sampling_rate = sampling_rate
         self.sequence_col = sequence_col
+        self.feature_prefix = feature_prefix
+        self.signal_columns = signal_columns
 
     def fit(self, X: pd.DataFrame, y=None):
-        self.acc_cols_ = [
+        candidates = [
             c for c in X.columns 
             if c.startswith("acc_") and not c.endswith(("_vel", "_disp", "_jerk", "_mag", "_dr_vel", "_dr_pos"))
         ]
+        self.acc_cols_ = candidates if self.signal_columns is None else [c for c in self.signal_columns if c in X.columns]
         
         # Generate scales if not provided
         if self.widths is None:
@@ -2429,12 +2592,389 @@ class CWTExtractor(HoneycombBase):
             
             for feat_name, values in feat_dict.items():
                 seq_to_val = dict(zip(unique_seqs, values))
-                df[f"{col}_{feat_name}"] = [seq_to_val[sid] for sid in seq_ids]
+                df[f"{col}_{self.feature_prefix}_{feat_name}"] = [seq_to_val[sid] for sid in seq_ids]
             
-            feat_cols = [f"{col}_{k}" for k in feat_dict.keys()]
+            feat_cols = [f"{col}_{self.feature_prefix}_{k}" for k in feat_dict.keys()]
             parts.append(df[feat_cols])
         
         if not parts:
             return pd.DataFrame(index=df.index)
         
         return pd.concat(parts, axis=1)
+
+
+# ============================================================
+#  DATA AUGMENTATION FOR SENSOR TIME-SERIES
+#  Append this block to the end of base_utils_qwen.py
+# ============================================================
+
+from scipy.interpolate import CubicSpline
+from sklearn.base import BaseEstimator, TransformerMixin
+
+# ------------------------------------------------------------------ #
+#  Low-level augmentation functions (operate on np.ndarray (T, C))   #
+# ------------------------------------------------------------------ #
+
+def augment_jitter(
+    x: np.ndarray,
+    sigma: float = 0.03,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Add small per-sample uniform-ish jitter (Gaussian with tiny σ)."""
+    rng = rng or np.random.default_rng()
+    return x + rng.normal(loc=0.0, scale=sigma, size=x.shape)
+
+
+def augment_gaussian_noise(
+    x: np.ndarray,
+    std: float = 0.05,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Add Gaussian noise scaled relative to per-channel std."""
+    rng = rng or np.random.default_rng()
+    ch_std = np.nanstd(x, axis=0, keepdims=True)
+    ch_std = np.where(ch_std == 0, 1.0, ch_std)
+    return x + rng.normal(loc=0.0, scale=std * ch_std, size=x.shape)
+
+
+def augment_scaling(
+    x: np.ndarray,
+    sigma: float = 0.1,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Multiply entire sequence by a random scalar ~ N(1, σ)."""
+    rng = rng or np.random.default_rng()
+    factor = rng.normal(loc=1.0, scale=sigma)
+    return x * factor
+
+
+def augment_time_shift(
+    x: np.ndarray,
+    max_shift_frac: float = 0.1,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Shift sequence left/right, padding edges with boundary values."""
+    rng = rng or np.random.default_rng()
+    T = x.shape[0]
+    max_shift = max(1, int(T * max_shift_frac))
+    shift = rng.integers(-max_shift, max_shift + 1)
+    if shift == 0:
+        return x.copy()
+    out = np.empty_like(x)
+    if shift > 0:
+        out[:shift] = x[0]
+        out[shift:] = x[:-shift]
+    else:
+        out[shift:] = x[-1]
+        out[:shift] = x[-shift:]
+    return out
+
+
+def _normalize_crop_frac_range(value: tuple[float, float] | list[float] | str | np.ndarray | None) -> tuple[float, float]:
+    if value is None:
+        return (0.5, 0.9)
+    if isinstance(value, str):
+        try:
+            parsed = ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            parsed = value.strip("()[]")
+            parts = [p.strip() for p in parsed.split(",") if p.strip()]
+            if len(parts) != 2:
+                raise ValueError(f"Invalid crop_frac_range value: {value!r}")
+            parsed = tuple(float(p) for p in parts)
+        if isinstance(parsed, (tuple, list, np.ndarray)) and len(parsed) == 2:
+            return (float(parsed[0]), float(parsed[1]))
+        raise ValueError(f"Invalid crop_frac_range value: {value!r}")
+    if isinstance(value, np.ndarray):
+        arr = value.tolist()
+        if len(arr) == 2:
+            return (float(arr[0]), float(arr[1]))
+        raise ValueError(f"Invalid crop_frac_range value: {value!r}")
+    if isinstance(value, (tuple, list)) and len(value) == 2:
+        return (float(value[0]), float(value[1]))
+    raise ValueError(f"Invalid crop_frac_range value: {value!r}")
+
+
+def augment_crop_resize(
+    x: np.ndarray,
+    crop_frac_range: tuple[float, float] = (0.5, 0.9),
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Crop a random contiguous sub-sequence then resize back to T."""
+    rng = rng or np.random.default_rng()
+    crop_frac_range = _normalize_crop_frac_range(crop_frac_range)
+    x = np.asarray(x, dtype=float)
+    squeeze = False
+    if x.ndim == 1:
+        x = x[:, None]
+        squeeze = True
+    elif x.ndim > 2:
+        x = x.reshape(x.shape[0], -1)
+
+    T, C = x.shape
+    lo, hi = crop_frac_range
+    crop_frac = rng.uniform(lo, hi)
+    crop_len = max(2, int(T * crop_frac))
+    crop_len = min(crop_len, T)
+    start = rng.integers(0, T - crop_len + 1)
+    cropped = x[start : start + crop_len]
+
+    old_idx = np.linspace(0, 1, crop_len)
+    new_idx = np.linspace(0, 1, T)
+    out = np.empty_like(x)
+    for c in range(C):
+        out[:, c] = np.interp(new_idx, old_idx, cropped[:, c])
+
+    return out[:, 0] if squeeze else out
+
+
+def augment_temporal_mask(
+    x: np.ndarray,
+    mask_frac: float = 0.1,
+    num_masks: int = 1,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Zero-out random contiguous temporal segments."""
+    rng = rng or np.random.default_rng()
+    T = x.shape[0]
+    mask_len = max(1, int(T * mask_frac))
+    out = x.copy()
+    for _ in range(num_masks):
+        start = rng.integers(0, max(1, T - mask_len))
+        out[start : start + mask_len] = 0.0
+    return out
+
+
+def augment_channel_dropout(
+    x: np.ndarray,
+    drop_prob: float = 0.1,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Zero-out individual channels with probability drop_prob."""
+    rng = rng or np.random.default_rng()
+    C = x.shape[1]
+    mask = rng.random(C) >= drop_prob          # True = keep
+    return x * mask[np.newaxis, :]
+
+
+def augment_sensor_dropout(
+    x: np.ndarray,
+    sensor_groups: dict[str, list[int]],
+    drop_prob: float = 0.3,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Zero-out entire sensor groups (acc / rot / tof / thm)."""
+    rng = rng or np.random.default_rng()
+    out = x.copy()
+    for _name, col_idx in sensor_groups.items():
+        if not col_idx:
+            continue
+        if rng.random() < drop_prob:
+            out[:, col_idx] = 0.0
+    return out
+
+
+def augment_magnitude_warp(
+    x: np.ndarray,
+    sigma: float = 0.2,
+    num_knots: int = 4,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Multiply signal by a smooth random curve (cubic spline through
+    random control points centred at 1.0)."""
+    rng = rng or np.random.default_rng()
+    T, C = x.shape
+    num_knots = max(2, min(num_knots, T))
+    knot_x = np.linspace(0, T - 1, num_knots)
+    knot_y = rng.normal(loc=1.0, scale=sigma, size=(num_knots, C))
+    cs = CubicSpline(knot_x, knot_y, extrapolate=True)
+    warp = cs(np.arange(T))
+    return x * warp
+
+
+# ------------------------------------------------------------------ #
+#  Registry mapping names → functions                                 #
+# ------------------------------------------------------------------ #
+
+_AUGMENTATION_REGISTRY: dict[str, callable] = {
+    "jitter":            augment_jitter,
+    "gaussian_noise":    augment_gaussian_noise,
+    "scaling":           augment_scaling,
+    "time_shift":        augment_time_shift,
+    "crop_resize":       augment_crop_resize,
+    "temporal_mask":     augment_temporal_mask,
+    "channel_dropout":   augment_channel_dropout,
+    "sensor_dropout":    augment_sensor_dropout,
+    "magnitude_warp":    augment_magnitude_warp,
+}
+
+ALL_AUGMENTATION_NAMES = tuple(_AUGMENTATION_REGISTRY.keys())
+
+# ------------------------------------------------------------------ #
+#  Default sensor-group column prefixes                               #
+# ------------------------------------------------------------------ #
+
+_SENSOR_PREFIXES: dict[str, tuple[str, ...]] = {
+    "acc":  ("acc_",),
+    "rot":  ("rot_",),
+    "tof":  ("tof_", "depth_"),
+    "thm":  ("thm_", "thermal_", "temp_"),
+}
+
+
+def _detect_sensor_groups(
+    columns: list[str],
+) -> dict[str, list[int]]:
+    """Map sensor name → list of integer column indices."""
+    groups: dict[str, list[int]] = {}
+    for sensor, prefixes in _SENSOR_PREFIXES.items():
+        idx = [
+            i for i, c in enumerate(columns)
+            if any(c.startswith(p) for p in prefixes)
+        ]
+        groups[sensor] = idx
+    return groups
+
+
+# ------------------------------------------------------------------ #
+#  Orchestrator class                                                 #
+# ------------------------------------------------------------------ #
+
+class SensorAugmentor(BaseEstimator, TransformerMixin):
+    """Per-sequence sensor augmentation for DataFrames.
+
+    Parameters
+    ----------
+    augmentations : list[str] | None
+        Subset of ALL_AUGMENTATION_NAMES.  ``None`` → use all.
+    prob : float
+        Per-sequence probability that *any* augmentation fires.
+    per_aug_prob : float
+        Conditional probability that each individual augmentation
+        is applied when the sequence is selected.
+    jitter_sigma, noise_std, scaling_sigma, … : float
+        Strength knobs forwarded to each augmentation function.
+    sequence_col, counter_col : str
+        Column names that identify sequences.
+    seed : int | None
+        Reproducibility seed.
+    """
+
+    def __init__(
+        self,
+        augmentations: list[str] | None = None,
+        prob: float = 0.5,
+        per_aug_prob: float = 0.5,
+        # --- strength knobs ---
+        jitter_sigma: float = 0.03,
+        noise_std: float = 0.05,
+        scaling_sigma: float = 0.1,
+        time_shift_frac: float = 0.1,
+        crop_frac_range: tuple[float, float] | str = (0.5, 0.9),
+        temporal_mask_frac: float = 0.1,
+        temporal_num_masks: int = 1,
+        channel_drop_prob: float = 0.1,
+        sensor_drop_prob: float = 0.3,
+        warp_sigma: float = 0.2,
+        warp_num_knots: int = 4,
+        # --- structural ---
+        sequence_col: str = "sequence_id",
+        counter_col: str = "sequence_counter",
+        seed: int | None = 42,
+    ):
+        self.augmentations = augmentations
+        self.prob = prob
+        self.per_aug_prob = per_aug_prob
+        self.jitter_sigma = jitter_sigma
+        self.noise_std = noise_std
+        self.scaling_sigma = scaling_sigma
+        self.time_shift_frac = time_shift_frac
+        self.crop_frac_range = crop_frac_range
+        self.temporal_mask_frac = temporal_mask_frac
+        self.temporal_num_masks = temporal_num_masks
+        self.channel_drop_prob = channel_drop_prob
+        self.sensor_drop_prob = sensor_drop_prob
+        self.warp_sigma = warp_sigma
+        self.warp_num_knots = warp_num_knots
+        self.sequence_col = sequence_col
+        self.counter_col = counter_col
+        self.seed = seed
+
+    # ---- sklearn interface ---------------------------------------- #
+
+    def fit(self, X, y=None):
+        self._rng = np.random.default_rng(self.seed)
+        self.aug_names_ = list(
+            self.augmentations
+            if self.augmentations is not None
+            else ALL_AUGMENTATION_NAMES
+        )
+        # Identify numeric sensor columns (everything that is not
+        # sequence_id, sequence_counter, or a known metadata col)
+        skip = {self.sequence_col, self.counter_col}
+        self.sensor_cols_ = [
+            c for c in X.columns
+            if c not in skip and np.issubdtype(X[c].dtype, np.number)
+        ]
+        self.sensor_groups_ = _detect_sensor_groups(self.sensor_cols_)
+        return self
+
+    def transform(self, X, y=None):
+        from sklearn.utils.validation import check_is_fitted
+        check_is_fitted(self, "sensor_cols_")
+
+        out = X.copy()
+        grouped = out.groupby(self.sequence_col, sort=False)
+
+        for seq_id, grp in grouped:
+            if self._rng.random() > self.prob:
+                continue  # skip this sequence entirely
+
+            idx = grp.index
+            vals = grp[self.sensor_cols_].to_numpy(dtype=float)
+
+            for aug_name in self.aug_names_:
+                if self._rng.random() > self.per_aug_prob:
+                    continue  # skip this particular augmentation
+
+                fn = _AUGMENTATION_REGISTRY[aug_name]
+                kwargs = self._build_kwargs(aug_name)
+                vals = fn(vals, rng=self._rng, **kwargs)
+
+            out.loc[idx, self.sensor_cols_] = vals
+
+        return out
+
+    # ---- helpers -------------------------------------------------- #
+
+    @staticmethod
+    def _coerce_crop_frac_range(value: tuple[float, float] | list[float] | str | np.ndarray | None) -> tuple[float, float]:
+        return _normalize_crop_frac_range(value)
+
+    def _build_kwargs(self, name: str) -> dict:
+        """Map augmentation name → its specific keyword arguments."""
+        crop_range = self._coerce_crop_frac_range(self.crop_frac_range)
+        table = {
+            "jitter":          {"sigma": self.jitter_sigma},
+            "gaussian_noise":  {"std": self.noise_std},
+            "scaling":         {"sigma": self.scaling_sigma},
+            "time_shift":      {"max_shift_frac": self.time_shift_frac},
+            "crop_resize":     {"crop_frac_range": crop_range},
+            "temporal_mask":   {
+                "mask_frac": self.temporal_mask_frac,
+                "num_masks": self.temporal_num_masks,
+            },
+            "channel_dropout": {"drop_prob": self.channel_drop_prob},
+            "sensor_dropout":  {
+                "sensor_groups": self.sensor_groups_,
+                "drop_prob": self.sensor_drop_prob,
+            },
+            "magnitude_warp":  {
+                "sigma": self.warp_sigma,
+                "num_knots": self.warp_num_knots,
+            },
+        }
+        return table.get(name, {})
+
+    def get_feature_names_out(self, input_features=None):
+        return np.array(self.sensor_cols_)
