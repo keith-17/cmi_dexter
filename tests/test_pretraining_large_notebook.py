@@ -168,8 +168,9 @@ class LargePretrainingNotebookTests(unittest.TestCase):
                     self.assertEqual(namespace["GRID_PARAM_SPACE"][key], choices, key)
                     if namespace["SKOPT_AVAILABLE"]:
                         actual = namespace["BAYESIAN_PARAM_SPACE"][key]
+                        bayesian_choices = namespace.get("BAYESIAN_AUGMENTATION_PARAM_SPACE", {}).get(key, choices)
                         self.assertEqual([decoded_choice(value) for value in actual.categories],
-                                         [decoded_choice(value) for value in choices], key)
+                                         [decoded_choice(value) for value in bayesian_choices], key)
                 for key, choices in declared_evolutionary.items():
                     self.assert_same_evolutionary_values(
                         namespace["EVOLUTIONARY_PARAM_SPACE"][key], choices)
