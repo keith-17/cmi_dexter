@@ -1,8 +1,9 @@
 """Editable stage choices survive notebook assembly and reach real selectors."""
-import ast
 from contextlib import redirect_stdout
+from copy import deepcopy
 from io import StringIO
 from tempfile import TemporaryDirectory
+from textwrap import indent
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -43,15 +44,25 @@ STAGE_DEFAULTS = {
 
 
 def insert_after_assignment(source, name, extra):
-    tree = ast.parse(source)
-    assignments = [node for node in tree.body if isinstance(node, ast.Assign)
-                   and any(isinstance(target, ast.Name) and target.id == name
-                           for target in node.targets)]
+    assignments = large.literal_assignments(source, name)
     if len(assignments) != 1:
         raise AssertionError(f"Expected one editable {name} assignment")
     lines = source.splitlines(keepends=True)
-    lines.insert(assignments[0].end_lineno, "\n" + extra + "\n")
+    insertion = indent(extra.strip("\n") + "\n", " " * assignments[0].col_offset)
+    lines.insert(assignments[0].end_lineno, "\n" + insertion)
     return "".join(lines)
+
+
+def update_stage_choices(source, choices):
+    if large.literal_assignments(source, "PRETRAINING_PARAM_SPACE"):
+        return insert_after_assignment(source, "PRETRAINING_PARAM_SPACE",
+                                       "PRETRAINING_PARAM_SPACE.update(" + repr(choices) + ")")
+    for name in ("GRID_PARAM_SPACE", "BAYESIAN_PARAM_SPACE", "EVOLUTIONARY_PARAM_SPACE"):
+        if large.literal_assignments(source, name):
+            values = ("{" + ", ".join(f"{key!r}: ECat({value!r})" for key, value in choices.items()) + "}"
+                      if name == "EVOLUTIONARY_PARAM_SPACE" else repr(choices))
+            source = insert_after_assignment(source, name, f"{name}.update({values})")
+    return source
 
 
 def decoded(value):
@@ -82,10 +93,11 @@ class StageSearchParameterTests(unittest.TestCase):
         for variant in ("model1", "model2"):
             with self.subTest(variant=variant), TemporaryDirectory() as directory:
                 namespace = self.namespace(variant, directory)
-                stage = namespace["PRETRAINING_PARAM_SPACE"]
                 for key, choices in STAGE_DEFAULTS.items():
-                    self.assertIn(key, stage)
-                    self.assertEqual(stage[key], choices)
+                    if variant == "model1" and key == EXTRACTOR + "pretraining_source":
+                        choices = ["baseline"]
+                    if "PRETRAINING_PARAM_SPACE" in namespace:
+                        self.assertEqual(namespace["PRETRAINING_PARAM_SPACE"][key], choices)
                     self.assert_compiled_choices(namespace, key, choices)
                 actual = clone(namespace["pipeline"])
                 for key, choices in STAGE_DEFAULTS.items():
@@ -103,10 +115,7 @@ class StageSearchParameterTests(unittest.TestCase):
         }
 
         def edits(index, source):
-            if index == 14:
-                return insert_after_assignment(source, "PRETRAINING_PARAM_SPACE",
-                                               "PRETRAINING_PARAM_SPACE.update(" + repr(choices) + ")")
-            return source
+            return update_stage_choices(source, choices)
 
         for variant in ("model1", "model2"):
             with self.subTest(variant=variant), TemporaryDirectory() as directory:
@@ -165,7 +174,7 @@ class StageSearchParameterTests(unittest.TestCase):
 
     def test_evolutionary_integer_float_ranges_survive_final_compilation(self):
         def edits(index, source):
-            if index == 14:
+            if large.literal_assignments(source, "EVOLUTIONARY_PARAM_SPACE"):
                 return insert_after_assignment(source, "EVOLUTIONARY_PARAM_SPACE", """
 EVOLUTIONARY_PARAM_SPACE.update({
     'estimator__pretraining_epochs': EInt(3, 12),
@@ -177,6 +186,7 @@ EVOLUTIONARY_PARAM_SPACE.update({
 
         for variant in ("model1", "model2"):
             with self.subTest(variant=variant), TemporaryDirectory() as directory:
+                baseline = self.namespace(variant, directory)
                 namespace = self.namespace(variant, directory, edits)
                 for name in ("EVOLUTIONARY_PARAM_SPACE", "EVOLUTIONARY_SEARCH_SPACE"):
                     space = namespace[name]
@@ -188,7 +198,7 @@ EVOLUTIONARY_PARAM_SPACE.update({
                                       space[EXTRACTOR + "pretraining_sample_fraction"].high), (0.25, 1.0))
                 self.assertEqual(namespace["GRID_PARAM_SPACE"][PREFIX + "pretraining_epochs"], [30])
                 self.assertEqual(namespace["GRID_PARAM_SPACE"][PREFIX + "learning_rate"],
-                                 [1e-5, 5e-5, 1e-4])
+                                 baseline["GRID_PARAM_SPACE"][PREFIX + "learning_rate"])
 
     def test_finetuning_domain_and_filters_reach_the_actual_selector(self):
         frame = recordings()
@@ -214,38 +224,42 @@ EVOLUTIONARY_PARAM_SPACE.update({
 
     def test_primary_training_candidates_take_precedence_over_stage_defaults(self):
         def edits(index, source):
-            if index != 14:
-                return source
-            source = insert_after_assignment(source, "GRID_PARAM_SPACE", """
+            if large.literal_assignments(source, "GRID_PARAM_SPACE"):
+                source = insert_after_assignment(source, "GRID_PARAM_SPACE", """
 GRID_PARAM_SPACE.update({
     'estimator__epochs': [7, 21],
     'estimator__learning_rate': [2e-5, 3e-4],
 })
 """)
-            source = insert_after_assignment(source, "EVOLUTIONARY_PARAM_SPACE", """
+            if large.literal_assignments(source, "EVOLUTIONARY_PARAM_SPACE"):
+                source = insert_after_assignment(source, "EVOLUTIONARY_PARAM_SPACE", """
 EVOLUTIONARY_PARAM_SPACE.update({
     'estimator__epochs': EInt(4, 15),
     'estimator__learning_rate': EFloat(1e-6, 1e-3, distribution='log-uniform'),
 })
 """)
-            return insert_after_assignment(source, "PRETRAINING_PARAM_SPACE", """
+            if large.literal_assignments(source, "PRETRAINING_PARAM_SPACE"):
+                source = insert_after_assignment(source, "PRETRAINING_PARAM_SPACE", """
 PRETRAINING_PARAM_SPACE.update({
     'estimator__epochs': [999],
     'estimator__learning_rate': [0.9],
 })
 """)
+            return source
 
         for variant in ("model1", "model2"):
             with self.subTest(variant=variant), TemporaryDirectory() as directory:
+                baseline = self.namespace(variant, directory)
                 namespace = self.namespace(variant, directory, edits)
                 grid = namespace["GRID_PARAM_SPACE"]
                 self.assertEqual(grid[PREFIX + "epochs"], [7, 21])
                 self.assertEqual(grid[PREFIX + "learning_rate"], [2e-5, 3e-4])
                 if namespace["SKOPT_AVAILABLE"]:
                     bayesian = namespace["BAYESIAN_PARAM_SPACE"]
-                    self.assertEqual(list(bayesian[PREFIX + "epochs"].categories), [7, 21])
-                    self.assertEqual(list(bayesian[PREFIX + "learning_rate"].categories),
-                                     [2e-5, 3e-4])
+                    for suffix, model2_choices in (("epochs", [7, 21]), ("learning_rate", [2e-5, 3e-4])):
+                        expected = (model2_choices if variant == "model2" else
+                                    baseline["BAYESIAN_PARAM_SPACE"][PREFIX + suffix])
+                        self.harness.assert_same_bayesian_values(bayesian[PREFIX + suffix], expected)
                 for name in ("EVOLUTIONARY_PARAM_SPACE", "EVOLUTIONARY_SEARCH_SPACE"):
                     space = namespace[name]
                     self.assertEqual((space[PREFIX + "epochs"].low,
@@ -254,6 +268,62 @@ PRETRAINING_PARAM_SPACE.update({
                                       space[PREFIX + "learning_rate"].high), (1e-6, 1e-3))
                 self.assertEqual(namespace["BEST_PARAMS"][PREFIX + "epochs"], 7)
                 self.assertEqual(namespace["BEST_PARAMS"][PREFIX + "learning_rate"], 2e-5)
+
+    def test_model1_search_cells_keep_edits_and_nested_choices_independent(self):
+        names = ("GRID_PARAM_SPACE", "BAYESIAN_PARAM_SPACE", "EVOLUTIONARY_PARAM_SPACE")
+        key = PREFIX + "pretraining_epochs"
+        with TemporaryDirectory() as directory:
+            baseline = self.namespace("model1", directory)
+            expected = {
+                "GRID_PARAM_SPACE": baseline["GRID_PARAM_SPACE"][key],
+                "BAYESIAN_PARAM_SPACE": list(getattr(baseline["BAYESIAN_PARAM_SPACE"][key],
+                                                    "categories", baseline["BAYESIAN_PARAM_SPACE"][key])),
+                "EVOLUTIONARY_PARAM_SPACE": list(baseline["EVOLUTIONARY_SEARCH_SPACE"][key].choices),
+            }
+            for edited_name in names:
+                def edits(index, source):
+                    if index == 3:
+                        mode = {"GRID_PARAM_SPACE": "grid", "BAYESIAN_PARAM_SPACE": "bayes",
+                                "EVOLUTIONARY_PARAM_SPACE": "evo"}[edited_name]
+                        return source + f"\nsearch_mode = {mode!r}\n"
+                    if large.literal_assignments(source, edited_name):
+                        value = "ECat([7, 13])" if edited_name == "EVOLUTIONARY_PARAM_SPACE" else "[7, 13]"
+                        return insert_after_assignment(source, edited_name,
+                                                       f"{edited_name}[{key!r}] = {value}")
+                    return source
+
+                with self.subTest(space=edited_name):
+                    namespace = self.namespace("model1", directory, edits)
+                    selected_name = ("EVOLUTIONARY_SEARCH_SPACE" if edited_name == "EVOLUTIONARY_PARAM_SPACE"
+                                     else edited_name)
+                    self.assertIs(namespace["param_space"], namespace[selected_name])
+                    for name in names:
+                        value = namespace[name][key]
+                        choices = list(getattr(value, "categories", value))
+                        self.assertEqual(choices, [7, 13] if name == edited_name else expected[name])
+
+            def capture_choices(index, source):
+                for name in names:
+                    if large.literal_assignments(source, name):
+                        source = insert_after_assignment(source, name, f"_editable_{name} = {name}")
+                return source
+
+            namespace = self.namespace("model1", directory, capture_choices)
+            nested_key = PREFIX + "branch_filters"
+            grid = namespace["_editable_GRID_PARAM_SPACE"][nested_key][0]
+            bayesian = namespace["_editable_BAYESIAN_PARAM_SPACE"][nested_key].categories[0]
+            evolutionary = namespace["_editable_EVOLUTIONARY_PARAM_SPACE"][nested_key].choices[0]
+            self.assertIsInstance(grid, dict)
+            self.assertIsInstance(bayesian, str)
+            self.assertEqual(decoded(bayesian), grid)
+            originals = [deepcopy(value) for value in (grid, bayesian, evolutionary)]
+            self.assertIsNot(grid, evolutionary)
+            grid["acc"] = 987
+            self.assertEqual(namespace["_editable_BAYESIAN_PARAM_SPACE"][nested_key].categories[0], originals[1])
+            self.assertEqual(evolutionary, originals[2])
+            evolutionary["acc"] = 654
+            self.assertEqual(grid["acc"], 987)
+            self.assertEqual(namespace["_editable_BAYESIAN_PARAM_SPACE"][nested_key].categories[0], originals[1])
 
     def test_searched_epochs_and_separate_learning_rates_reach_training_calls(self):
         frame = recordings()
