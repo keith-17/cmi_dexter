@@ -1395,6 +1395,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         invalid_candidate_policy: str = "raise",
         invalid_candidate_score: float = -1.0,
         candidate_failure_log=None,
+        restore_best_weights: bool = True,
     ):
         self.primary_target = primary_target
         self.extractor = extractor
@@ -1430,6 +1431,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         self.batch_size = batch_size
         self.validation_split = validation_split
         self.early_stopping_patience = early_stopping_patience
+        self.restore_best_weights = restore_best_weights
         self.class_weight_mode = class_weight_mode
         self.verbose = verbose
         self.random_state = random_state
@@ -1770,7 +1772,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
             cb.append(callbacks.EarlyStopping(
                 monitor="val_loss" if has_validation_data else "loss",
                 patience=self.early_stopping_patience,
-                restore_best_weights=True,
+                restore_best_weights=self.restore_best_weights,
             ))
         if self.use_lr_scheduler:
             if str(self.lr_scheduler_type).lower() == "plateau" and has_validation_data:
