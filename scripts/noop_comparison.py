@@ -59,116 +59,99 @@ def source_cells(nb):
     return ["".join(c["source"]) if isinstance(c["source"], list) else c["source"] for c in nb["cells"]]
 
 
-def prepare(run_id, *, docker_image, enhanced_options):
-    assert branch() == "multibranch/v2/develop", "Use the new multibranch/v2/develop branch"
-    root = build_root(run_id)
-    reference, expected = read(REFERENCE / "reference_params.json"), read(REFERENCE / "expected_split.json")
-    assert len(reference) == 215 and reference["estimator__epochs"] == 2000
-    assert reference["estimator__augmentor__prob"] == 0
-    assert reference["estimator__early_stopping_patience"] == 0
-    assert reference["estimator__restore_best_weights"] is False
-    assert expected["target_holdout_sequences"] == 2539
+def notebook_literals(notebook):
+    values = {}
+    for cell in notebook["cells"]:
+        if cell["cell_type"] != "code":
+            continue
+        for node in ast.parse("".join(cell["source"])).body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                try:
+                    value = ast.literal_eval(node.value)
+                except (ValueError, TypeError):
+                    continue
+                values[node.targets[0].id] = value
+    return values
+
+
+def prepare(run_id, *, docker_image, enhanced_options=None):
+    """Package the actual notebook through the existing GPU workflow."""
+    import nbformat
+    import kaggle_experiment as workflow
+    assert branch() == "multibranch/v2/develop"
+    notebook_path = ROOT / "notebooks/multibranch_pretraining.ipynb"
+    original = read(notebook_path)
+    controls = notebook_literals(original)
+    reference = read(REFERENCE / "reference_params.json")
+    best = controls["BEST_PARAMS"]
+    assert all(best[key] == value for key, value in reference.items())
+    assert controls["single_noop_experiment"] is True
+    assert controls["search_mode"] == "best params"
+    for family in ("motion_stats", "periodicity", "spectral_stats", "quality"):
+        assert best["estimator__extractor__noop__" + family] is None
+    requested = {key.removeprefix("estimator__extractor__noop__"): value
+                 for key, value in controls["NOOP_EXPERIMENT_PARAMS"].items()}
+    if enhanced_options is not None:
+        assert requested == enhanced_options, "Use the visible notebook preset."
     sources = sorted((ROOT / "src").glob("*.py"))
-    assert {"noop_sequence_extractor.py", "noop_importance.py"} <= {p.name for p in sources}
-    sys.path.insert(0, str(ROOT / "src"))
-    from noop_sequence_extractor import NoopOptions
-    from multibranch_utils import candidate_error
-    from sklearn.base import clone
-    import noop_runtime
-    source_hashes = {p.name: sha(p) for p in sources}
-    runtime_hashes = {name: sha(ROOT / "scripts" / name)
-                      for name in ("noop_runtime.py", "plot_noop_comparison.py")}
-    report = {"passed": False, "branch": branch(), "reference_parameter_count": len(reference),
-              "source_sha256": source_hashes, "variants": {}}
+    source_hashes = {path.name: sha(path) for path in sources}
+    root = build_root(run_id)
+    report = {"passed": False, "notebook": str(notebook_path), "variants": {}}
     for variant in VARIANTS:
         target = root / variant
-        assert not (target / "submission_attempt.json").exists(), "Preserve an already-attempted source package"
+        assert not (target / "submission_attempt.json").exists()
         target.mkdir(parents=True, exist_ok=True)
-        noop = NoopOptions(**(enhanced_options if variant == "enhanced" else {}))
-        noop.validate(float(reference["estimator__extractor__imu_native_sampling_rate"]))
-        noop_params = noop.get_params(deep=False)
-        config = dict(variant=variant, epochs=2000, noop_options=noop_params,
-            comparison="Frozen Candidate21; only optional NOOP inputs and their required static branch differ",
-            seed=42, feature_importance_domain="internal validation only", feature_importance_repeats=3,
-            holdout_scope="Target-only, sequence-disjoint; binary F1 is not detection evidence",
-            sampling_rate_note="Uses original Candidate21 configured100Hz unchanged; acquisition cadence not re-measured")
-        pipeline = noop_runtime.make_pipeline(config, reference)
-        error = candidate_error({}, base_params=pipeline.get_params(deep=True))
-        assert error is None, error
-        copied = clone(pipeline)
-        assert copied.get_params()["estimator__extractor__noop"].get_params() == noop_params
-        for key, value in reference.items(): assert copied.get_params()[key] == value, key
-        # Numerical/no-fit checks precede submission; fitted CPU tests are separately required.
-        for p in sources: ast.parse(p.read_text(encoding="utf-8"), filename=str(p))
-        provenance = dict(created_at_utc=datetime.now(timezone.utc).isoformat(),
-            source_sha256=source_hashes, runtime_sha256=runtime_hashes, git_branch=branch(),
-            git_commit=subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT,
-                capture_output=True, check=True, text=True).stdout.strip(),
-            reference_candidate=21, reference_params_sha256=sha(REFERENCE / "reference_params.json"),
-            expected_split_sha256=sha(REFERENCE / "expected_split.json"),
-            no_search=True, fits=1, epochs=2000, final_weight_holdout_evaluations=1,
-            old_parameter_changes={}, noop_options=noop_params)
-        files = {"src/" + p.name: p.read_bytes() for p in sources}
-        files.update({"noop_runtime.py": (ROOT / "scripts/noop_runtime.py").read_bytes(),
-                      "plot_noop_comparison.py": (ROOT / "scripts/plot_noop_comparison.py").read_bytes()})
-        for name, value in {"config": config, "reference_params": reference,
-                            "expected_split": expected, "provenance": provenance}.items():
-            files["assets/" + name + ".json"] = json.dumps(value, indent=2, default=str).encode()
-            write(target / ("assets/" + name + ".json"), value)
-        archive_bytes = io.BytesIO()
-        with zipfile.ZipFile(archive_bytes, "w", zipfile.ZIP_DEFLATED) as archive:
-            for name, data in sorted(files.items()): archive.writestr(name, data)
-        payload = base64.b64encode(archive_bytes.getvalue()).decode("ascii")
-        bootstrap = ("import base64, io, sys, zipfile\nfrom pathlib import Path\n"
-            f"with zipfile.ZipFile(io.BytesIO(base64.b64decode({payload!r}))) as z:\n"
-            "    z.extractall(Path.cwd())\n"
-            "sys.path.insert(0, str(Path.cwd() / 'src'))\n")
-        def cell(kind, text, ident):
-            result = dict(cell_type=kind, id=ident, metadata={}, source=text.splitlines(True))
-            if kind == "code": result.update(execution_count=None, outputs=[])
-            return result
-        notebook = dict(nbformat=4, nbformat_minor=5,
-            metadata={"kernelspec": {"display_name": "Python3", "language": "python", "name": "python3"}},
-            cells=[cell("markdown", f"# CMI NOOP v2 - {variant}\n"
-                "Candidate21 fixed2000epochs; identical original data/split/settings.\n"
-                "Final weights evaluated once. Importance uses internal validation only.\n", "intro"),
-                cell("code", bootstrap, "source-snapshot"),
-                cell("code", "import noop_runtime\nnoop_runtime.run()\n", "fixed-fit"),
-                cell("code", "from IPython.display import Image, display\n"
-                     "display(Image(filename='experiment_results/accuracy_loss.png'))\n", "curves"),
-                cell("markdown", "## Feature importance\nPermutation importance of the trained model on internal validation; not attention weights.\n", "importance-title"),
-                cell("code", "from pathlib import Path\n"
-                     "for path in sorted(Path('experiment_results').glob('validation_permutation*.png')):\n"
-                     "    display(Image(filename=str(path)))\n", "importance-plot")])
-        for c in notebook["cells"]:
-            if c["cell_type"] == "code": ast.parse("".join(c["source"]))
-        try:
-            import nbformat
-            nbformat.validate(nbformat.from_dict(notebook))
-        except ImportError:
-            raise RuntimeError("nbformat is required for submission preflight")
-        submission = target / "submission"
-        submission.mkdir(exist_ok=True)
-        notebook_path = submission / f"noop_{variant}.ipynb"
-        write(notebook_path, notebook)
-        slug = f"cmi-noop-v2-{variant}-{run_id}"
+        slug = f"cmi-noop-{variant}-{run_id}"
         metadata = dict(id="keithmarange/" + slug, title=slug,
-            code_file=notebook_path.name, language="python", kernel_type="notebook",
+            code_file="multibranch_pretraining.ipynb", language="python", kernel_type="notebook",
             is_private=True, enable_gpu=True, enable_tpu=False, enable_internet=False,
             machine_shape="NvidiaTeslaT4", docker_image=docker_image,
             dataset_sources=[], competition_sources=["cmi-detect-behavior-with-sensor-data"],
             kernel_sources=[], model_sources=[], keywords=["gpu"])
-        write(submission / "kernel-metadata.json", metadata)
-        manifest = dict(kernel=metadata["id"], notebook_sha256=sha(notebook_path),
-            metadata_sha256=sha(submission / "kernel-metadata.json"), source_sha256=source_hashes,
-            runtime_sha256=runtime_hashes,
-            payload_sha256=hashlib.sha256(archive_bytes.getvalue()).hexdigest())
+        metadata_path = target / "configuration/kernel-metadata.json"
+        write(metadata_path, metadata)
+        old_build, old_metadata = workflow.BUILD, workflow.METADATA
+        try:
+            workflow.BUILD, workflow.METADATA = target / "submission", metadata_path
+            workflow.prepare(notebook_name="multibranch_pretraining.ipynb", use_attached_source=False)
+        finally:
+            workflow.BUILD, workflow.METADATA = old_build, old_metadata
+        path = target / "submission" / metadata["code_file"]
+        packaged = read(path)
+        assert source_cells(packaged)[1:] == source_cells(original)
+        changed_cells = []
+        if variant == "enhanced":
+            for index, cell in enumerate(packaged["cells"]):
+                if cell["cell_type"] != "code":
+                    continue
+                source, count = re.subn(r"^search_mode = 'best params'", "search_mode = 'grid'",
+                                       "".join(cell["source"]), flags=re.MULTILINE)
+                if count:
+                    assert count == 1
+                    cell["source"] = source.splitlines(True)
+                    changed_cells.append(index)
+            assert len(changed_cells) == 1
+        assert notebook_literals(packaged)["BEST_PARAMS"] == best
+        for cell in packaged["cells"]:
+            if cell["cell_type"] == "code":
+                ast.parse("".join(cell["source"]))
+        nbformat.validate(nbformat.from_dict(packaged))
+        write(path, packaged)
+        config = dict(variant=variant, search_mode="best params" if variant == "baseline" else "grid",
+                      candidates=1, epochs=best["estimator__epochs"], native_cv_and_refit=True,
+                      reference=best, noop_options={} if variant == "baseline" else requested)
+        write(target / "assets/config.json", config)
+        manifest = dict(kernel=metadata["id"], notebook_sha256=sha(path),
+            metadata_sha256=sha(target / "submission/kernel-metadata.json"),
+            source_sha256=source_hashes, runtime_sha256={},
+            original_notebook_sha256=sha(notebook_path), changed_notebook_cells=changed_cells,
+            original_notebook="notebooks/multibranch_pretraining.ipynb", native_search_flow=True)
         write(target / "build_manifest.json", manifest)
-        report["variants"][variant] = dict(kernel=metadata["id"], clone_preserved=True,
-            all_original_parameters_preserved=True, noop_options=noop_params)
+        report["variants"][variant] = config
     report["passed"] = True
     write(root / "validation_report.json", report)
-    print(json.dumps(report, indent=2), flush=True)
+    print(json.dumps({"passed": True, "directory": str(root), "native_notebook": str(notebook_path),
+                      "variants": {key: value["search_mode"] for key, value in report["variants"].items()}}, indent=2))
     return root
 
 
@@ -192,6 +175,7 @@ def submit(run_id, variant):
         assert sha(ROOT / "src" / name) == digest, "Source changed after packaging: " + name
     for name, digest in manifest["runtime_sha256"].items():
         assert sha(ROOT / "scripts" / name) == digest, "Runtime changed after packaging: " + name
+    assert sha(ROOT / manifest["original_notebook"]) == manifest["original_notebook_sha256"], "Notebook changed after packaging"
     assert metadata["enable_gpu"] and metadata["is_private"]
     api = api_client()
     existing = api.kernels_list(user="keithmarange", search=metadata["title"], page_size=100)
@@ -245,19 +229,51 @@ def collect(api, run_id, variant):
     destination = results_root(run_id) / variant / "downloaded"
     destination.mkdir(parents=True, exist_ok=True)
     api.kernels_output(kernel, path=str(destination), file_pattern=r"(?:.*\.(?:csv|json|txt|log|png))$", quiet=True)
-    if status["status"] != "COMPLETE":
-        raise RuntimeError(f"{kernel}: {status}; failure artifacts saved under {destination}")
-    output = destination / "experiment_results"
-    state, history, metrics = read(output / "execution_state.json"), read(output / "history.json"), read(output / "holdout_metrics.json")
-    assert state["status"] == "COMPLETE" and state["fit_count"] == state["holdout_evaluation_count"] == 1
-    assert state["final_weight_evaluation_used"] and len(history["loss"]) == 2000
-    assert metrics["exclusions"]["evaluated_sequences"] == 2539
-    assert any(output.glob("validation_permutation*.csv")), "Feature importance output missing"
+    assert status["status"] == "COMPLETE", status
+    summaries = list(destination.rglob("*_summary.json"))
+    assert len(summaries) == 1, summaries
+    summary = read(summaries[0])
+    assert summary["status"] == "complete", summary
+    assert summary["experiment_count"] == summary["valid_candidate_count"] == 1
+    assert summary["failed_candidate_count"] == 0
+    assert len(summary["protocols"]) == 1
+    config = read(target / "assets/config.json")
+    params = summary["best_params"]
+    expected = dict(config["reference"])
+    expected.update({"estimator__extractor__noop__" + key: value for key, value in config["noop_options"].items()})
+    for key, value in expected.items():
+        assert params[key] == value, key
+    history = summary["training_info"]["history"]["finetuning"]
+    assert len(history["loss"]) == 2000
+    assert list(destination.rglob("*internal_permutation.csv")), "Importance output missing"
+    write(results_root(run_id) / variant / "history.json", history)
     write(results_root(run_id) / variant / "completed_results.json", dict(
-        verified=True, kernel=kernel, epochs=2000, metrics=metrics,
-        validation_importance=True, source_verified=True))
-    print("VERIFIED_COMPLETE " + variant + " " + json.dumps(metrics), flush=True)
-    return state
+        verified=True, kernel=kernel, native_notebook=True, epochs=2000,
+        cv_score=summary["best_cv_score"], holdout_metrics=summary["holdout_metrics"],
+        feature_importance=True, source_verified=True))
+    print("VERIFIED_COMPLETE " + variant + " " + json.dumps(summary["holdout_metrics"]), flush=True)
+    return summary
+
+
+def parse_native_training_log(text, variant):
+    """Observe existing Keras verbose=2 output without changing model callbacks."""
+    rows, fit, previous_epoch, pending = [], 0, 0, None
+    for line in text.splitlines():
+        epoch = re.search(r"\bEpoch\s+(\d+)/(\d+)", line)
+        if epoch:
+            number = int(epoch.group(1))
+            if fit == 0 or number <= previous_epoch:
+                fit += 1
+            previous_epoch, pending = number, (fit, number)
+            continue
+        if pending is None:
+            continue
+        metrics = {key: float(value) for key, value in re.findall(
+            r"\b([a-z][a-z0-9_]*):\s*([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)", line)}
+        if "loss" in metrics and any(key.endswith("accuracy") for key in metrics):
+            rows.append(dict(variant=variant, fit=pending[0], epoch=pending[1], **metrics))
+            pending = None
+    return rows
 
 
 def watch(run_id, seconds):
@@ -269,14 +285,27 @@ def watch(run_id, seconds):
     statuses = {}
     def stream(variant, kernel):
         failures = 0
+        seen_events, emitted = set(), set()
+        native_log = ""
         while not stop_streams.is_set():
             try:
                 for event in api.kernels_logs_stream(kernel):
-                    events.put((variant, str(event.get("data", ""))))
+                    event_key = hashlib.sha256(json.dumps(event, sort_keys=True).encode()).hexdigest()
+                    if event_key in seen_events:
+                        continue
+                    seen_events.add(event_key)
+                    content = str(event.get("data", ""))
+                    events.put((variant, content))
+                    native_log += content
+                    for row in parse_native_training_log(native_log, variant):
+                        key = (row["fit"], row["epoch"])
+                        if key not in emitted:
+                            emitted.add(key)
+                            events.put((variant, "\nNOOP_EPOCH " + json.dumps(row) + "\n"))
                     if stop_streams.is_set():
                         return
                 failures = 0
-                if statuses.get(variant, {}).get("status") in {"COMPLETE", "ERROR", "CANCELLED"}:
+                if statuses.get(variant, {}).get("status") in {"COMPLETE", "ERROR", "CANCELLED", "CANCEL_ACKNOWLEDGED"}:
                     return
                 # A queued kernel can return an empty persisted log before its
                 # live stream exists. Reconnect without resubmitting training.
@@ -293,7 +322,7 @@ def watch(run_id, seconds):
         p = results_root(run_id) / v / "epoch_telemetry.jsonl"
         if p.exists():
             for line in p.read_text().splitlines():
-                row = json.loads(line); epochs[v][int(row["epoch"])] = row
+                row = json.loads(line); epochs[v][(int(row.get("fit", 1)), int(row["epoch"]))] = row
     start, last_status = time.monotonic(), 0.
     complete, failures = set(), {}
     while time.monotonic() - start < seconds:
@@ -306,7 +335,7 @@ def watch(run_id, seconds):
             for match in re.finditer(r"NOOP_EPOCH (\{[^\r\n]*\})", buffers[variant]):
                 try: row = json.loads(match.group(1))
                 except ValueError: continue
-                number = int(row["epoch"])
+                number = (int(row.get("fit", 1)), int(row["epoch"]))
                 if number not in epochs[variant]:
                     epochs[variant][number] = row
                     with (dest / "epoch_telemetry.jsonl").open("a", encoding="utf-8") as handle:
@@ -322,7 +351,7 @@ def watch(run_id, seconds):
                 write(targets[variant] / "latest_status.json", status)
                 latest = epochs[variant].get(max(epochs[variant], default=0), {})
                 print("PROGRESS " + json.dumps(dict(variant=variant, status=status, latest=latest)), flush=True)
-                if status["status"] in {"COMPLETE", "ERROR", "CANCELLED"}:
+                if status["status"] in {"COMPLETE", "ERROR", "CANCELLED", "CANCEL_ACKNOWLEDGED"}:
                     try:
                         collect(api, run_id, variant)
                     except Exception as error:
@@ -341,7 +370,7 @@ def watch(run_id, seconds):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("prepare", "submit", "watch", "collect", "verify"))
-    parser.add_argument("--run-id", default="20261102")
+    parser.add_argument("--run-id", default="20261102-notebook")
     parser.add_argument("--variant", choices=VARIANTS)
     parser.add_argument("--seconds", type=int, default=3600)
     parser.add_argument("--docker-image")

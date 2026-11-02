@@ -19,8 +19,16 @@ from scripts.create_large_pretraining_notebooks import build_notebook
 from scripts.pretraining_search_configuration import configure_result_outputs
 
 
-def source(notebook, index):
-    return ''.join(notebook['cells'][index]['source'])
+def selected_cell(notebook, marker):
+    cells = [cell for cell in notebook['cells'] if cell['cell_type'] == 'code'
+             and marker in ''.join(cell['source'])]
+    if len(cells) != 1:
+        raise AssertionError(f'Expected one cell containing {marker!r}, found {len(cells)}')
+    return cells[0]
+
+
+def source(notebook, marker):
+    return ''.join(selected_cell(notebook, marker)['source'])
 
 
 class PretrainingNotebookOutputTests(unittest.TestCase):
@@ -53,14 +61,14 @@ class PretrainingNotebookOutputTests(unittest.TestCase):
                 self.assertEqual(len(runners), 1)
                 self.assertNotIn('quick_save', {keyword.arg for keyword in runners[0].keywords})
 
-    def test_final_cell_reports_only_the_two_saved_artifacts(self):
+    def test_reporting_cell_reports_only_the_two_search_artifacts(self):
         for name, notebook in self.notebooks.items():
             with self.subTest(notebook=name):
                 output = StringIO()
                 paths = {'experiments_path': Path('run/experiment_experiments.csv'),
                          'summary_path': Path('run/experiment_summary.json')}
                 with redirect_stdout(output):
-                    exec(compile(source(notebook, 24), name, 'exec'),
+                    exec(compile(source(notebook, "print('Experiments CSV:'"), name, 'exec'),
                          {'validation_runs': paths})
                 self.assertEqual(output.getvalue().splitlines(), [
                     f"Experiments CSV: {paths['experiments_path']}",
@@ -77,7 +85,7 @@ class PretrainingNotebookOutputTests(unittest.TestCase):
         })
         for name, notebook in self.notebooks.items():
             with self.subTest(notebook=name), TemporaryDirectory() as directory:
-                statements = ast.parse(source(notebook, 7)).body
+                statements = ast.parse(source(notebook, 'quaternion_cols =')).body
                 start = next(index for index, node in enumerate(statements)
                              if isinstance(node, ast.Assign)
                              and any(isinstance(target, ast.Name) and target.id == 'quaternion_cols'
@@ -95,20 +103,25 @@ class PretrainingNotebookOutputTests(unittest.TestCase):
                 self.assertEqual(list(Path(directory).iterdir()), [])
 
     def test_focused_cleanup_preserves_editable_choices_logs_and_figures(self):
-        notebook = deepcopy(self.notebooks['multibranch_pretraining.ipynb'])
-        original_choices = deepcopy(notebook['cells'][14])
+        # This legacy generator transformation is applied to its generated
+        # template; active notebooks may have additional experiment cells.
+        notebook = deepcopy(self.notebooks['generated-model-1'])
+        choices = selected_cell(notebook, 'GRID_PARAM_SPACE =')
+        training = selected_cell(notebook, 'validation_runs = run_validation_searches(')
+        analysis = selected_cell(notebook, 'best_estimator.get_history_dict()')
+        original_choices = deepcopy(choices)
         logs = [{'output_type': 'stream', 'name': 'stdout', 'text': ['Epoch 1/10\n']}]
         figure = {'output_type': 'display_data', 'data': {'image/png': 'stored figure'},
                   'metadata': {}}
-        notebook['cells'][17]['outputs'] = deepcopy(logs)
-        notebook['cells'][20]['outputs'] = [deepcopy(figure), {
+        training['outputs'] = deepcopy(logs)
+        analysis['outputs'] = [deepcopy(figure), {
             'output_type': 'stream', 'name': 'stdout',
             'text': ['Saved curves to old/path.png\n', 'Epochs run: 10\n'],
         }]
         configure_result_outputs(notebook)
-        self.assertEqual(notebook['cells'][14], original_choices)
-        self.assertEqual(notebook['cells'][17]['outputs'], logs)
-        self.assertEqual(notebook['cells'][20]['outputs'], [figure, {
+        self.assertEqual(choices, original_choices)
+        self.assertEqual(training['outputs'], logs)
+        self.assertEqual(analysis['outputs'], [figure, {
             'output_type': 'stream', 'name': 'stdout', 'text': ['Epochs run: 10\n'],
         }])
 

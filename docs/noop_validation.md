@@ -47,20 +47,27 @@ process PATH: without it, an independent `scipy.linalg.lstsq` call aborted
 before Python could raise an exception. Setting the correct process PATH
 resolved that environment issue; no numerical algorithm was changed for it.
 
-## Matched-run checks
+## Corrected notebook runs
 
-The preparation script validates both option sets, estimator compatibility,
-sklearn cloning, all 215 saved settings, source syntax and notebook format.
-Submissions retain the frozen split, pinned Kaggle image and T4 machine shape.
-Remote source is compared against the submitted notebook version.
+The active notebook is `notebooks/multibranch_pretraining.ipynb`. V2 is only the
+branch name. The initial wrapper runs were superseded and cancellation was
+acknowledged; their receipts remain an audit trail, not comparison results.
 
-Each runtime permits exactly one 2,000-epoch fit, keeps final weights, evaluates
-the holdout once, and calculates permutation importance only on the fitted
-internal-validation domain. It records source hashes, full epoch telemetry,
-phase completion and final-weight checks. The monitor does not submit or retry
-experiments, and a failure in one variant does not stop observing the other.
+The original notebook now contains the complete discussed BEST_PARAMS baseline,
+optional NOOP controls in all three searches, a one-candidate NOOP Grid preset,
+and the final internal-validation importance section. The corrected native
+NOOP checks discovered 48 tests: 43 passed and 5 actual neural tests skipped in
+the lightweight runtime. The working TensorFlow checks above verify those
+neural paths separately. Updated legacy notebook tests select cells by meaning
+rather than obsolete cell numbers.
 
-These are sequence-disjoint comparisons, not evidence of performance on unseen
-participants. The enhanced run also has an extra trainable branch, so its
-score difference measures the combined change rather than an isolated feature's
-causal effect.
+The experiment packager reuses scripts/kaggle_experiment.py and preserves actual
+notebook cells, adding only its existing source bootstrap. Baseline uses best
+params; enhanced changes only search_mode to grid, enabling the visible single
+candidate preset. Both retain native CV/refit/holdout evaluation. Live epoch
+observations distinguish CV from refit and never mix their histories.
+
+Source hashes, private T4 configuration and notebook versions are verified
+through the Kaggle API. Collection checks the native one-candidate CSV/summary,
+final 2,000-epoch refit and saved permutation importance. No monitor resubmits
+training.

@@ -7,19 +7,26 @@ from pathlib import Path
 
 def telemetry_history(path):
     rows = {}
+    latest_fit = 0
     path = Path(path)
     if not path.exists(): return {}
     for line in path.read_text(encoding="utf-8").splitlines():
         try:
             row = json.loads(line)
+            fit = int(row.get("fit", 1))
+            if fit > latest_fit:
+                rows, latest_fit = {}, fit
+            if fit != latest_fit:
+                continue
             rows[int(row["epoch"])] = row
         except (ValueError, KeyError, TypeError):
             continue
-    keys = sorted(set().union(*(set(r) for r in rows.values())) - {"epoch", "variant", "duration_seconds"})
+    keys = sorted(set().union(*(set(r) for r in rows.values())) - {"epoch", "variant", "duration_seconds", "fit"})
     if not rows:
         return {}
     history = {k: [rows[n].get(k, float("nan")) for n in sorted(rows)] for k in keys}
     history["epoch"] = sorted(rows)
+    history["fit"] = [latest_fit] * len(rows)
     return history
 
 
@@ -73,9 +80,12 @@ if __name__ == "__main__":
     histories = {}
     for variant in ("baseline", "enhanced"):
         folder = args.directory / variant
-        history_path = folder / "downloaded/experiment_results/history.json"
+        history_path = folder / "history.json"
         history = (json.loads(history_path.read_text()) if history_path.exists()
                    else telemetry_history(folder / "epoch_telemetry.jsonl"))
-        if history: histories[variant] = history
+        if history:
+            phase = f" fit {history['fit'][-1]}" if history.get("fit") else " refit"
+            histories[variant + phase] = history
     if histories:
-        print(save_comparison_curves(histories, args.directory / "accuracy_loss_comparison.png"))
+        print(save_comparison_curves(histories, args.directory / "accuracy_loss_comparison.png",
+              title="Notebook baseline and NOOP: current fits (1 = CV, 2 = refit)"))

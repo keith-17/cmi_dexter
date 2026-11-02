@@ -5,6 +5,7 @@ from datetime import datetime
 from io import StringIO
 import json
 import os
+import re
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
@@ -39,11 +40,16 @@ import base_utils as data_utils
 import multibranch_utils as mb
 import pretraining_utils as pretraining
 import pretraining_search
+from noop_sequence_extractor import NoopOptions, NoopSequenceExtractor
 
 
 def decoded_choice(value):
     value = mb._json_maybe(value)
-    return list(value) if isinstance(value, tuple) else value
+    if isinstance(value, (list, tuple)):
+        return [decoded_choice(item) for item in value]
+    if isinstance(value, dict):
+        return {key: decoded_choice(item) for key, item in value.items()}
+    return value
 
 
 def literal_assignments(source, name):
@@ -88,9 +94,6 @@ class LargePretrainingNotebookTests(unittest.TestCase):
         }
         cls.original = json.loads((ROOT / "notebooks/multibranch_v1.ipynb").read_text(encoding="utf-8"))
 
-    def source(self, variant, index):
-        return "".join(self.notebooks[variant]["cells"][index]["source"])
-
     def namespace(self, variant, directory, validation_mode=None, source_edits=None):
         namespace = {
             "workspace_root": directory, "Path": Path, "datetime": datetime,
@@ -99,6 +102,7 @@ class LargePretrainingNotebookTests(unittest.TestCase):
             "data_utils": data_utils,
             "EInt": data_utils.EInt, "EFloat": data_utils.EFloat,
             "SequenceExtractor": data_utils.SequenceExtractor,
+            "NoopSequenceExtractor": NoopSequenceExtractor, "NoopOptions": NoopOptions,
             "SensorAugmentor": data_utils.SensorAugmentor,
             "pretraining_keras": pretraining, "multibranch_keras": mb,
             "pretraining_search": pretraining_search,
@@ -106,9 +110,12 @@ class LargePretrainingNotebookTests(unittest.TestCase):
             "Categorical": Categorical, "Integer": Integer, "Real": Real,
         }
         with redirect_stdout(StringIO()):
-            indices = (3, 4, 11, 13, 14, 15) if variant == "model1" else (3, 4, 11, 14)
-            for index in indices:
-                source = self.source(variant, index)
+            markers = ("experiment_name =", "BEST_PARAMS =", "pipeline = Pipeline(",
+                       "GRID_PARAM_SPACE =", "BAYESIAN_PARAM_SPACE =", "EVOLUTIONARY_PARAM_SPACE =")
+            for index, cell in enumerate(self.notebooks[variant]["cells"]):
+                source = "".join(cell["source"])
+                if cell["cell_type"] != "code" or not any(marker in source for marker in markers):
+                    continue
                 if validation_mode is not None:
                     tree = ast.parse(source)
                     for node in tree.body:
@@ -127,12 +134,19 @@ class LargePretrainingNotebookTests(unittest.TestCase):
 
     def test_preserves_layout_without_notebook_functions_or_false_curve_save_claims(self):
         for variant, notebook in self.notebooks.items():
-            self.assertEqual(len(notebook["cells"]), 26)
-            expected_types = [cell["cell_type"] for cell in self.original["cells"]]
+            self.assertEqual(notebook["cells"][0]["cell_type"], "markdown")
+            sources = ["".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code"]
+            for marker in ("pipeline = Pipeline(", "GRID_PARAM_SPACE =", "EVOLUTIONARY_PARAM_SPACE =",
+                           "validation_runs = run_validation_searches(", "print('Experiments CSV:'"):
+                count = (sum(len(literal_assignments(source, "GRID_PARAM_SPACE")) for source in sources)
+                         if marker == "GRID_PARAM_SPACE =" else
+                         sum(bool(re.search('^' + re.escape(marker), source, re.MULTILINE)) for source in sources))
+                self.assertEqual(count, 1, (variant, marker))
             if variant == "model1":
-                expected_types[12:14] = ["markdown", "code"]
-            self.assertEqual([cell["cell_type"] for cell in notebook["cells"]],
-                             expected_types)
+                self.assertEqual(sum("NOOP_IMPORTANCE_REPEATS =" in source for source in sources), 1)
+            else:
+                self.assertEqual([cell["cell_type"] for cell in notebook["cells"]],
+                                 [cell["cell_type"] for cell in self.original["cells"]])
             for index, cell in enumerate(notebook["cells"]):
                 if cell["cell_type"] == "code":
                     tree = ast.parse("".join(cell["source"]))
@@ -147,7 +161,18 @@ class LargePretrainingNotebookTests(unittest.TestCase):
                        if cell["cell_type"] == "code"
                        for node in literal_assignments("".join(cell["source"]), name)]
         self.assertEqual(len(assignments), 1, name)
-        return eval(compile(ast.Expression(assignments[0].value), "declared-space", "eval"), namespace)
+        declared = eval(compile(ast.Expression(assignments[0].value), "declared-space", "eval"), namespace)
+        # Optional features are declared in explicit update dictionaries after
+        # the inherited ranges, without replacing those ranges or cell order.
+        for cell in self.notebooks[variant]["cells"]:
+            if cell["cell_type"] != "code":
+                continue
+            for node in ast.walk(ast.parse("".join(cell["source"]))):
+                if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "update" and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == name and node.args and isinstance(node.args[0], ast.Dict)):
+                    declared.update(eval(compile(ast.Expression(node.args[0]), "declared-space-update", "eval"), namespace))
+        return declared
 
     def assert_same_evolutionary_values(self, actual, expected):
         self.assertEqual(type(actual), type(expected))
@@ -186,9 +211,18 @@ class LargePretrainingNotebookTests(unittest.TestCase):
                 grid = namespace["GRID_PARAM_SPACE"]
                 estimator = clone(namespace["pipeline"]).set_params(
                     **namespace["BEST_PARAMS"]).named_steps["estimator"]
-                self.assertEqual(estimator.epochs, grid["estimator__epochs"][0])
-                self.assertEqual(estimator.pretraining_epochs, grid["estimator__pretraining_epochs"][0])
-                self.assertEqual(estimator.temporal_architecture, grid["estimator__temporal_architecture"][0])
+                if variant == "model1":
+                    reference = json.loads((ROOT / "experiments/noop_candidate21/reference_params.json").read_text())
+                    actual = {key: value for key, value in namespace["BEST_PARAMS"].items()
+                              if not key.startswith("estimator__extractor__noop__")}
+                    self.assertEqual(len(reference), 215)
+                    self.assertEqual(actual, reference)
+                    self.assertEqual(estimator.epochs, 2000)
+                    self.assertFalse(estimator.restore_best_weights)
+                else:
+                    self.assertEqual(estimator.epochs, grid["estimator__epochs"][0])
+                    self.assertEqual(estimator.pretraining_epochs, grid["estimator__pretraining_epochs"][0])
+                    self.assertEqual(estimator.temporal_architecture, grid["estimator__temporal_architecture"][0])
 
     def test_primary_grid_candidates_and_evolutionary_ranges_survive_compilation(self):
         for variant in self.notebooks:
@@ -214,39 +248,41 @@ class LargePretrainingNotebookTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             namespace = self.namespace("model1", directory)
         space = namespace["BAYESIAN_PARAM_SPACE"]
-        integer_bounds = {
-            "augmentor__warp_num_knots": (2, 8),
-            "augmentor__temporal_num_masks": (0, 7),
-            "extractor__chunk_window_size": (250, 300),
-            "branch_dense_units": (512, 1024), "dense_units": (400, 1024),
-        }
-        for name, bounds in integer_bounds.items():
+        declared = self.declared_space("model1", "BAYESIAN_PARAM_SPACE", namespace)
+        for name in ("augmentor__warp_num_knots", "augmentor__temporal_num_masks",
+                     "extractor__chunk_window_size", "branch_dense_units", "dense_units"):
             dimension = space["estimator__" + name]
-            self.assertIsInstance(dimension, Integer, name)
-            self.assertEqual((dimension.low, dimension.high), bounds, name)
+            expected = declared["estimator__" + name]
+            self.assertIsInstance(dimension, type(expected), name)
+            if isinstance(expected, Integer):
+                self.assertEqual((dimension.low, dimension.high), (expected.low, expected.high), name)
+            else:
+                self.assertEqual(list(dimension.categories), list(expected.categories), name)
         for name in ("conv_dropout", "dropout", "learning_rate"):
             dimension = space["estimator__" + name]
-            self.assertIsInstance(dimension, Real, name)
-            bounds = (3e-5, 1e-4) if name == "learning_rate" else (0.1, 0.5)
-            self.assertEqual((dimension.low, dimension.high), bounds, name)
-            self.assertEqual(dimension.prior, "log-uniform" if name == "learning_rate" else "uniform")
+            expected = declared["estimator__" + name]
+            self.assertIsInstance(dimension, type(expected), name)
+            if isinstance(expected, Real):
+                self.assertEqual((dimension.low, dimension.high), (expected.low, expected.high), name)
+                self.assertEqual(dimension.prior, expected.prior)
+            else:
+                self.assertEqual(list(dimension.categories), list(expected.categories), name)
         for name in ("sensor_drop_prob", "channel_drop_prob", "noise_std", "jitter_sigma",
                      "scaling_sigma", "warp_sigma", "time_shift_frac", "temporal_mask_frac"):
             dimension = space["estimator__augmentor__" + name]
             self.assertIsInstance(dimension, Categorical, name)
-            self.assertIn(0.0, dimension.categories, name)
-        for name, choices in {
-            "batch_size": [128, 256], "pretraining_epochs": [30],
-            "augmentor__augmentations": [None], "pretraining_shuffle": [True],
-            "pretraining_mode": ["supervised"],
-        }.items():
+            expected = declared["estimator__augmentor__" + name]
+            self.assertEqual(list(dimension.categories), list(expected.categories), name)
+        for name in ("batch_size", "pretraining_epochs", "augmentor__augmentations",
+                     "pretraining_shuffle", "pretraining_mode"):
             self.assertIsInstance(space["estimator__" + name], Categorical, name)
-            self.assertEqual(list(space["estimator__" + name].categories), choices, name)
+            expected = declared["estimator__" + name]
+            self.assertEqual(list(space["estimator__" + name].categories), list(expected.categories), name)
 
     def test_model1_grid_and_evolutionary_setup_do_not_require_skopt(self):
         for mode, name in (("grid", "GRID_PARAM_SPACE"), ("evo", "EVOLUTIONARY_SEARCH_SPACE")):
             def disable_skopt(index, source):
-                if index == 3:
+                if "experiment_name =" in source:
                     return source + ("\nSKOPT_AVAILABLE = False\nCategorical = Integer = Real = None\n"
                                      f"search_mode = {mode!r}\n")
                 return source
@@ -273,7 +309,8 @@ class LargePretrainingNotebookTests(unittest.TestCase):
 
         with TemporaryDirectory() as directory:
             namespace = self.namespace("model1", directory)
-            self.assertEqual(len(namespace["BAYESIAN_PARAM_SPACE"]), 213)
+            self.assertEqual(set(namespace["BAYESIAN_PARAM_SPACE"]),
+                             set(self.declared_space("model1", "BAYESIAN_PARAM_SPACE", namespace)))
             search = mb.HierarchicalBayesSearchCV(
                 estimator=namespace["pipeline"], search_spaces=namespace["BAYESIAN_PARAM_SPACE"],
                 n_iter=2, cv=GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=42),
@@ -303,10 +340,14 @@ class LargePretrainingNotebookTests(unittest.TestCase):
                     self.assertEqual(set(namespace[name]), set(declared) | stage_keys)
                 self.assertNotIn("estimator__candidate_failure_log", namespace["GRID_PARAM_SPACE"])
                 key = "estimator__extractor__pretraining_source"
-                sources = (["baseline"] if variant == "model1" else
-                           namespace["PRETRAINING_PARAM_SPACE"][key])
+                sources = (self.declared_space(variant, "GRID_PARAM_SPACE", namespace)[key]
+                           if variant == "model1" else namespace["PRETRAINING_PARAM_SPACE"][key])
+                self.assertIn("baseline", sources)
                 self.assertEqual(namespace["GRID_PARAM_SPACE"][key], sources)
-                self.assertEqual(list(namespace["EVOLUTIONARY_PARAM_SPACE"][key].choices), sources)
+                declared_evo = self.declared_space(variant, "EVOLUTIONARY_PARAM_SPACE", namespace)
+                expected_evo = declared_evo[key] if key in declared_evo else namespace["PRETRAINING_PARAM_SPACE"][key]
+                choices = expected_evo.choices if hasattr(expected_evo, "choices") else expected_evo
+                self.assertEqual(list(namespace["EVOLUTIONARY_PARAM_SPACE"][key].choices), list(choices))
 
     def test_configuration_has_no_reference_overrides_or_file_writes(self):
         def capture_params(index, source):

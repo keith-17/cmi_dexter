@@ -1,0 +1,20 @@
+{
+  "baseline": {
+    "kernel": "keithmarange/cmi-noop-v2-baseline-20261102",
+    "status": {
+      "status": "CANCEL_ACKNOWLEDGED",
+      "failureMessage": null
+    },
+    "superseded": true,
+    "reason": "User required actual multibranch_pretraining notebook and native best-params/grid flow; wrapper runs discarded."
+  },
+  "enhanced": {
+    "kernel": "keithmarange/cmi-noop-v2-enhanced-20261102",
+    "status": {
+      "status": "CANCEL_ACKNOWLEDGED",
+      "failureMessage": null
+    },
+    "superseded": true,
+    "reason": "User required actual multibranch_pretraining notebook and native best-params/grid flow; wrapper runs discarded."
+  }
+}

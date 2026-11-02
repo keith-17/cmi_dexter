@@ -1,9 +1,9 @@
 # Optional NOOP-inspired motion summaries
 
-`notebooks/multibranch_v2.ipynb` extends the current
-`notebooks/multibranch_pretraining.ipynb`. All existing non-NOOP Grid, Bayesian
-and Evolutionary entries retain their original ranges. The original notebooks
-are unchanged. The new extractor produces chunk-local static features in a
+`notebooks/multibranch_pretraining.ipynb` is updated in place on the
+`multibranch/v2/develop` branch; V2 names the branch, not a new notebook.
+All existing non-NOOP Grid, Bayesian and Evolutionary entries retain their
+original ranges. The new extractor produces chunk-local static features in a
 separate `noop` model branch; it does not append constant copies to every
 timestep or replace acceleration, rotation, ToF, temperature, STFT or CWT inputs.
 
@@ -39,10 +39,14 @@ The search prefix is `estimator__extractor__noop__`. The extractor exposes
 `noop__` defaults through `get_params(deep=True)` even when `noop=None`;
 `set_params(noop__motion_stats="axis_rms")` lazily creates a `NoopOptions`
 object. Shallow parameters retain `noop=None` for exact off-state cloning.
-Setting all four method fields to `None` disables all calculations. `BEST_PARAMS` takes the
-first Grid choices, which are `None` for all four method fields. Conditional
+Setting all four method fields to `None` disables all calculations. The notebook's
+explicit `BEST_PARAMS` contains the 215 winning Candidate 21 values from
+`experiments/noop_candidate21/reference_params.json`, plus canonical NOOP defaults
+with all four methods `None`. This baseline uses 2,000 epochs, no early stopping,
+and final epoch weights. Later search-space cells do not overwrite these values
+with the first Grid choices. Conditional
 candidate signatures ignore numeric controls that cannot affect the selected
-methods, and the V2 Grid path deduplicates those effective candidates.
+methods, and the notebook's Grid path deduplicates those effective candidates.
 
 | Option | Choices | Default |
 |---|---|---|
@@ -163,13 +167,26 @@ during prediction leaves those inputs intact.
 
 ## Matched experiments
 
+The existing notebook now defaults to `search_mode = 'best params'` for the
+winning 2,000-epoch baseline, with all NOOP methods off. For the next run, change
+only `search_mode` to `'grid'` and retain `single_noop_experiment = True`.
+`NOOP_EXPERIMENT_PARAMS` visibly contains the 13 settings from
+`experiments/noop_candidate21/enhanced_options.json`. This control constructs
+exactly one Grid parameter candidate from the same full `BEST_PARAMS`, changing
+only those NOOP settings. The native workflow still performs CV evaluation and
+its final refit, so one parameter candidate does not mean one neural fit.
+
+Set `single_noop_experiment = False` to use the ordinary declared Grid ranges.
+The preserved ranges are restored when switching this control; Bayesian and
+Evolutionary ranges are unaffected by the matched-run shortcut.
+
 For a baseline/NOOP comparison, keep split manifests, seeds, preprocessing,
 augmentation, architecture, optimizer, epochs and checkpoint policy identical.
 Use the exact-off extractor for baseline, then change only NOOP method choices.
 Log the effective parameters and feature names, including support columns.
-Do not tune features against the final holdout. A 2,000-epoch matched run is a
-separate explicit experiment setting; the inherited notebook search ranges are
-preserved rather than silently rewritten.
+Do not tune features against the final holdout. The explicit baseline
+`BEST_PARAMS` now carries the discussed 2,000-epoch winning configuration;
+non-NOOP search ranges remain independently editable and preserved.
 
 The focused tests check optional notebook wiring and unchanged inherited ranges,
 whole-sequence donors, padding preservation, internal-partition guards,
