@@ -36,7 +36,9 @@ the same lightweight interpreter. Its broad suite already reports 2 failures
 and 29 errors: stale expectations about older notebook cells and unavailable
 local TensorFlow functionality. Logs are
 `kaggle_build/noop_preflight/original_full_unittest.log` and
-`kaggle_build/noop_preflight/full_unittest.log`. These results are not described
+`kaggle_build/noop_preflight/full_unittest_final.log`. The final modified suite
+ran 405 tests; the original ran 357. Their failing test names are identical:
+there are no additional failures or errors. These results are not described
 as a passing full suite. Actual neural checks use the separate working
 TensorFlow environment.
 

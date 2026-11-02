@@ -1,0 +1,183 @@
+{
+  "branch": "multibranch/v2/develop",
+  "source_commit": "fb37eee",
+  "run_id": "20261102",
+  "runs": {
+    "baseline": {
+      "receipt": {
+        "ref": "/code/keithmarange/cmi-noop-v2-baseline-20261102",
+        "url": "https://www.kaggle.com/code/keithmarange/cmi-noop-v2-baseline-20261102",
+        "versionNumber": 1,
+        "error": null,
+        "invalidTags": [],
+        "invalidDatasetSources": [],
+        "invalidCompetitionSources": [],
+        "invalidKernelSources": [],
+        "invalidModelSources": [],
+        "kernelId": 142204219,
+        "submitted_at_utc": "2026-11-02T01:41:32.540719+00:00",
+        "push_request_count": 1,
+        "submitted_notebook_sha256": "d19e888ee74452fbb205bf5d66dbb2428066c43470f0469f4fad185720a413f3"
+      },
+      "remote_verification": {
+        "kernel": "keithmarange/cmi-noop-v2-baseline-20261102",
+        "source_equal": true,
+        "version": 1,
+        "gpu": true,
+        "private": true,
+        "machine_shape": "NvidiaTeslaT4"
+      },
+      "build_manifest": {
+        "kernel": "keithmarange/cmi-noop-v2-baseline-20261102",
+        "notebook_sha256": "d19e888ee74452fbb205bf5d66dbb2428066c43470f0469f4fad185720a413f3",
+        "metadata_sha256": "f913d5cd05053d0c95e7e1b7e9f880457ba48dee1948e91e20cdc845d6c86390",
+        "source_sha256": {
+          "__init__.py": "28a15331bfacc4acabddf344ebd3925195f112841157dd39c65d6bf7e1e99e23",
+          "base_utils.py": "e931e90961763e049eee5cf4e964d0c45817d7f479916653ce4ba87c1e6bbdf7",
+          "multibranch_utils.py": "aa0199077b847451d4c2512d002055c8e540a04a99ff34771c3b783bee9c20ee",
+          "noop_importance.py": "9efd5812f31d2bdcda1ce17c4e273ee73709f2c8ea3c4a5bddf0cdf4230f88ce",
+          "noop_sequence_extractor.py": "bb7c2518b5440432d395caf54d6fb2a3f1fed659aa90d0c8ca5b14ad6e4b8928",
+          "pretraining_search.py": "02ac4604f16b580a13ea757227c34d088e7195e4de0ac360d30bdae79b4422ca",
+          "pretraining_utils.py": "390b9e03d1b998d33f48ab65e2e5ca9ef9fea9c8e244792700902af756e34814",
+          "sequence_explorer_utils.py": "10fada34743093e8b9eb4a9c81cf5eb874b57afd96782c69e5c3c19ae472b535"
+        },
+        "runtime_sha256": {
+          "noop_runtime.py": "5fb7c977fa286b4163bbaec400b6ee49e28bd92f7cc111f45b3e3f6e6b8d0884",
+          "plot_noop_comparison.py": "0e0b62b45336cd02dbdb94bfbb0201b19896d3b796e22cc4115f3a05e75ac575"
+        },
+        "payload_sha256": "a6220d455c20c23ca246a955dfd3a7ab17bc570a150742e7c852e83ce6bca583"
+      },
+      "config": {
+        "variant": "baseline",
+        "epochs": 2000,
+        "noop_options": {
+          "acf_harmonic_tolerance": 0.1,
+          "band": [
+            0.5,
+            8.0
+          ],
+          "bands": [
+            [
+              0.5,
+              2.0
+            ],
+            [
+              2.0,
+              4.0
+            ],
+            [
+              4.0,
+              8.0
+            ]
+          ],
+          "detrend": "constant",
+          "max_gap_samples": 0,
+          "min_cycles": 2.0,
+          "min_samples": 16,
+          "motion_stats": null,
+          "periodicity": null,
+          "quality": null,
+          "signal": "raw",
+          "spectral_neighbourhood_hz": 0.5,
+          "spectral_stats": null
+        },
+        "comparison": "Frozen Candidate21; only optional NOOP inputs and their required static branch differ",
+        "seed": 42,
+        "feature_importance_domain": "internal validation only",
+        "feature_importance_repeats": 3,
+        "holdout_scope": "Target-only, sequence-disjoint; binary F1 is not detection evidence",
+        "sampling_rate_note": "Uses original Candidate21 configured100Hz unchanged; acquisition cadence not re-measured"
+      }
+    },
+    "enhanced": {
+      "receipt": {
+        "ref": "/code/keithmarange/cmi-noop-v2-enhanced-20261102",
+        "url": "https://www.kaggle.com/code/keithmarange/cmi-noop-v2-enhanced-20261102",
+        "versionNumber": 1,
+        "error": null,
+        "invalidTags": [],
+        "invalidDatasetSources": [],
+        "invalidCompetitionSources": [],
+        "invalidKernelSources": [],
+        "invalidModelSources": [],
+        "kernelId": 142204234,
+        "submitted_at_utc": "2026-11-02T01:41:39.570192+00:00",
+        "push_request_count": 1,
+        "submitted_notebook_sha256": "7a35a78df20b472592398d3f2938bb8b8eb9ae7537b0c8f0a5c40cd0255117e3"
+      },
+      "remote_verification": {
+        "kernel": "keithmarange/cmi-noop-v2-enhanced-20261102",
+        "source_equal": true,
+        "version": 1,
+        "gpu": true,
+        "private": true,
+        "machine_shape": "NvidiaTeslaT4"
+      },
+      "build_manifest": {
+        "kernel": "keithmarange/cmi-noop-v2-enhanced-20261102",
+        "notebook_sha256": "7a35a78df20b472592398d3f2938bb8b8eb9ae7537b0c8f0a5c40cd0255117e3",
+        "metadata_sha256": "c2fdaf49d48fb5f7bfa0f58f5ea2becc943e95a35fcef0718e0940fa8d96c847",
+        "source_sha256": {
+          "__init__.py": "28a15331bfacc4acabddf344ebd3925195f112841157dd39c65d6bf7e1e99e23",
+          "base_utils.py": "e931e90961763e049eee5cf4e964d0c45817d7f479916653ce4ba87c1e6bbdf7",
+          "multibranch_utils.py": "aa0199077b847451d4c2512d002055c8e540a04a99ff34771c3b783bee9c20ee",
+          "noop_importance.py": "9efd5812f31d2bdcda1ce17c4e273ee73709f2c8ea3c4a5bddf0cdf4230f88ce",
+          "noop_sequence_extractor.py": "bb7c2518b5440432d395caf54d6fb2a3f1fed659aa90d0c8ca5b14ad6e4b8928",
+          "pretraining_search.py": "02ac4604f16b580a13ea757227c34d088e7195e4de0ac360d30bdae79b4422ca",
+          "pretraining_utils.py": "390b9e03d1b998d33f48ab65e2e5ca9ef9fea9c8e244792700902af756e34814",
+          "sequence_explorer_utils.py": "10fada34743093e8b9eb4a9c81cf5eb874b57afd96782c69e5c3c19ae472b535"
+        },
+        "runtime_sha256": {
+          "noop_runtime.py": "5fb7c977fa286b4163bbaec400b6ee49e28bd92f7cc111f45b3e3f6e6b8d0884",
+          "plot_noop_comparison.py": "0e0b62b45336cd02dbdb94bfbb0201b19896d3b796e22cc4115f3a05e75ac575"
+        },
+        "payload_sha256": "b154117491c9c279ca8f87ae9ee57cc7a841db683a9fa5783567dd146ccfe3d1"
+      },
+      "config": {
+        "variant": "enhanced",
+        "epochs": 2000,
+        "noop_options": {
+          "acf_harmonic_tolerance": 0.15,
+          "band": [
+            0.5,
+            15.0
+          ],
+          "bands": [
+            [
+              0.5,
+              2.0
+            ],
+            [
+              2.0,
+              4.0
+            ],
+            [
+              4.0,
+              8.0
+            ],
+            [
+              8.0,
+              15.0
+            ]
+          ],
+          "detrend": "linear",
+          "max_gap_samples": 2,
+          "min_cycles": 2.0,
+          "min_samples": 16,
+          "motion_stats": "acc_ac_rms|axis_rms|jerk_rms|rotation_mean|rotation_rms",
+          "periodicity": "acf_harmonic_checked",
+          "quality": "features",
+          "signal": "linear",
+          "spectral_neighbourhood_hz": 0.75,
+          "spectral_stats": "all"
+        },
+        "comparison": "Frozen Candidate21; only optional NOOP inputs and their required static branch differ",
+        "seed": 42,
+        "feature_importance_domain": "internal validation only",
+        "feature_importance_repeats": 3,
+        "holdout_scope": "Target-only, sequence-disjoint; binary F1 is not detection evidence",
+        "sampling_rate_note": "Uses original Candidate21 configured100Hz unchanged; acquisition cadence not re-measured"
+      }
+    }
+  }
+}
