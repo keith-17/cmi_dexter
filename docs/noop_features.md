@@ -113,7 +113,7 @@ whose labels are outside the trained final-task classes. It does not use the fin
 proxy, inspect attention weights, or refit the neural network.
 
 ```python
-from noop_importance import compute_permutation_importance
+from multibranch_utils import compute_permutation_importance
 
 importance = compute_permutation_importance(
     fitted_pipeline, X_internal, y_internal,
@@ -165,20 +165,11 @@ The returned DataFrame's `attrs` contains scope, baseline, coverage and saved
 paths. Original input arrays and fitted weights are never mutated; an exception
 during prediction leaves those inputs intact.
 
-## Matched experiments
+## Search configuration
 
-The existing notebook now defaults to `search_mode = 'best params'` for the
-winning 2,000-epoch baseline, with all NOOP methods off. For the next run, change
-only `search_mode` to `'grid'` and retain `single_noop_experiment = True`.
-`NOOP_EXPERIMENT_PARAMS` visibly contains the 13 settings from
-`experiments/noop_candidate21/enhanced_options.json`. This control constructs
-exactly one Grid parameter candidate from the same full `BEST_PARAMS`, changing
-only those NOOP settings. The native workflow still performs CV evaluation and
-its final refit, so one parameter candidate does not mean one neural fit.
-
-Set `single_noop_experiment = False` to use the ordinary declared Grid ranges.
-The preserved ranges are restored when switching this control; Bayesian and
-Evolutionary ranges are unaffected by the matched-run shortcut.
+Choose `search_mode = 'grid'`, `'bayes'`, or `'evo'` to use the corresponding
+editable search space. The Grid, Bayesian and Evolutionary declarations remain
+independent. `search_mode = 'best params'` evaluates the saved `BEST_PARAMS`.
 
 For a baseline/NOOP comparison, keep split manifests, seeds, preprocessing,
 augmentation, architecture, optimizer, epochs and checkpoint policy identical.
@@ -188,7 +179,7 @@ Do not tune features against the final holdout. The explicit baseline
 `BEST_PARAMS` now carries the discussed 2,000-epoch winning configuration;
 non-NOOP search ranges remain independently editable and preserved.
 
-The focused tests check optional notebook wiring and unchanged inherited ranges,
+The focused tests check optional notebook wiring and preservation of editable search declarations,
 whole-sequence donors, padding preservation, internal-partition guards,
 single-extraction behavior, per-column perturbation, input restoration on
 failure, zero importance for an input-independent predictor, and CSV/JSON/plot

@@ -3,6 +3,7 @@ import ast
 from contextlib import redirect_stdout
 from datetime import datetime
 from io import StringIO
+from itertools import combinations
 import json
 import os
 import re
@@ -25,7 +26,7 @@ _conda_dll_handle = (os.add_dll_directory(str(_conda_dll_directory))
 import numpy as np
 import pandas as pd
 from sklearn.base import clone
-from sklearn.model_selection import GroupKFold, GroupShuffleSplit
+from sklearn.model_selection import GridSearchCV, GroupKFold, GroupShuffleSplit, ParameterGrid
 from sklearn.pipeline import Pipeline
 
 try:
@@ -249,35 +250,55 @@ class LargePretrainingNotebookTests(unittest.TestCase):
             namespace = self.namespace("model1", directory)
         space = namespace["BAYESIAN_PARAM_SPACE"]
         declared = self.declared_space("model1", "BAYESIAN_PARAM_SPACE", namespace)
-        for name in ("augmentor__warp_num_knots", "augmentor__temporal_num_masks",
-                     "extractor__chunk_window_size", "branch_dense_units", "dense_units"):
-            dimension = space["estimator__" + name]
-            expected = declared["estimator__" + name]
-            self.assertIsInstance(dimension, type(expected), name)
-            if isinstance(expected, Integer):
-                self.assertEqual((dimension.low, dimension.high), (expected.low, expected.high), name)
-            else:
-                self.assertEqual(list(dimension.categories), list(expected.categories), name)
-        for name in ("conv_dropout", "dropout", "learning_rate"):
-            dimension = space["estimator__" + name]
-            expected = declared["estimator__" + name]
-            self.assertIsInstance(dimension, type(expected), name)
-            if isinstance(expected, Real):
-                self.assertEqual((dimension.low, dimension.high), (expected.low, expected.high), name)
-                self.assertEqual(dimension.prior, expected.prior)
-            else:
-                self.assertEqual(list(dimension.categories), list(expected.categories), name)
-        for name in ("sensor_drop_prob", "channel_drop_prob", "noise_std", "jitter_sigma",
-                     "scaling_sigma", "warp_sigma", "time_shift_frac", "temporal_mask_frac"):
-            dimension = space["estimator__augmentor__" + name]
-            self.assertIsInstance(dimension, Categorical, name)
-            expected = declared["estimator__augmentor__" + name]
-            self.assertEqual(list(dimension.categories), list(expected.categories), name)
-        for name in ("batch_size", "pretraining_epochs", "augmentor__augmentations",
-                     "pretraining_shuffle", "pretraining_mode"):
-            self.assertIsInstance(space["estimator__" + name], Categorical, name)
-            expected = declared["estimator__" + name]
-            self.assertEqual(list(space["estimator__" + name].categories), list(expected.categories), name)
+        # Editable amplitudes may be categorical or continuous. Compilation must
+        # preserve the current declaration, including its numeric type and prior.
+        self.assertTrue(any(isinstance(value, Integer) for value in declared.values()))
+        self.assertTrue(any(isinstance(value, Real) for value in declared.values()))
+        self.assertTrue(any(isinstance(value, Categorical) for value in declared.values()))
+        for name, expected in declared.items():
+            with self.subTest(parameter=name):
+                self.assert_same_bayesian_values(space[name], expected)
+                if isinstance(expected, Integer):
+                    self.assertTrue(all(isinstance(value, (int, np.integer))
+                                        for value in space[name].rvs(2, random_state=42)))
+                elif isinstance(expected, Real):
+                    self.assertTrue(all(isinstance(value, (float, np.floating))
+                                        for value in space[name].rvs(2, random_state=42)))
+
+    @unittest.skipIf(Integer is None, "scikit-optimize unavailable")
+    def test_model1_noop_categories_and_numeric_boundaries_are_valid(self):
+        with TemporaryDirectory() as directory:
+            namespace = self.namespace("model1", directory)
+        prefix = "estimator__extractor__noop__"
+        options = NoopOptions(motion_stats="full", periodicity="acf_harmonic_checked",
+                              spectral_stats="all", quality="features")
+        motion_atoms, spectral_atoms = options.mode_names()
+        for name in ("GRID_PARAM_SPACE", "BAYESIAN_PARAM_SPACE"):
+            space = namespace[name]
+            self.assertEqual({key[len(prefix):] for key in space if key.startswith(prefix)},
+                             set(options.get_params(deep=False)), name)
+            rates = []
+            for modality in ("imu", "rot"):
+                dimension = space[f"estimator__extractor__{modality}_native_sampling_rate"]
+                rates.extend(dimension.categories if hasattr(dimension, "categories") else dimension)
+            sampling_rate = min(rates)
+            for field in options.get_params(deep=False):
+                dimension = space[prefix + field]
+                values = (list(dimension.categories) if hasattr(dimension, "categories") else
+                          [dimension.low, dimension.high] if hasattr(dimension, "low") else dimension)
+                if field in ("motion_stats", "periodicity", "spectral_stats", "quality"):
+                    self.assertIn(None, values, (name, field))
+                for value in values:
+                    with self.subTest(space=name, field=field, value=value):
+                        clone(options).set_params(**{field: value}).validate(sampling_rate)
+                if field in ("motion_stats", "spectral_stats"):
+                    atoms = motion_atoms if field == "motion_stats" else spectral_atoms
+                    expected = {frozenset(subset) for size in range(len(atoms) + 1)
+                                for subset in combinations(sorted(atoms), size)}
+                    index = 0 if field == "motion_stats" else 1
+                    actual = {frozenset(clone(options).set_params(**{field: value}).mode_names()[index])
+                              for value in values}
+                    self.assertEqual(actual, expected, (name, field))
 
     def test_model1_grid_and_evolutionary_setup_do_not_require_skopt(self):
         for mode, name in (("grid", "GRID_PARAM_SPACE"), ("evo", "EVOLUTIONARY_SEARCH_SPACE")):
@@ -324,7 +345,72 @@ class LargePretrainingNotebookTests(unittest.TestCase):
         self.assertEqual(len(search.cv_results_["params"]), 2)
         self.assertEqual(len(fitted), 2)
         self.assertTrue(np.all(np.isfinite(search.cv_results_["mean_test_score"])))
-        self.assertTrue(all(250 <= window <= 300 and 3e-5 <= rate <= 1e-4 for window, rate in fitted))
+        for window, rate in fitted:
+            self.assertIn(window, namespace["BAYESIAN_PARAM_SPACE"]["estimator__extractor__chunk_window_size"])
+            self.assertIn(rate, namespace["BAYESIAN_PARAM_SPACE"]["estimator__learning_rate"])
+
+    def test_model1_grid_branch_fits_combinations_of_declared_choices(self):
+        frame = full_modality_recordings()
+        labels = frame[["sequence_id", "subject", "is_target", "gesture", "bfrb"]]
+        fitted = []
+
+        def select_grid(index, source):
+            return source + "\nsearch_mode = 'grid'\n" if "experiment_name =" in source else source
+
+        def fit(estimator, X, y, **kwargs):
+            estimator.extractor_ = clone(estimator.extractor)
+            estimator._validate_extractor()
+            fitted.append((estimator.learning_rate, estimator.dense_units))
+            return estimator
+
+        def score(estimator, X, y, sample_weight=None):
+            return 0.5 + float(estimator.learning_rate) / 1e-3
+
+        with TemporaryDirectory() as directory:
+            namespace = self.namespace("model1", directory, source_edits=select_grid)
+            self.assertIs(namespace["param_space"], namespace["GRID_PARAM_SPACE"])
+            declared = self.declared_space("model1", "GRID_PARAM_SPACE", namespace)
+            self.assertEqual(namespace["param_space"], declared)
+            # Bound the test before the notebook's deduplication step. The full
+            # expanded Cartesian Grid must never be enumerated by a unit test.
+            bounded = {key: [values[0]] for key, values in declared.items()}
+            for key in ("estimator__learning_rate", "estimator__dense_units"):
+                bounded[key] = list(dict.fromkeys([declared[key][0], declared[key][-1]]))
+            namespace.update(
+                param_space=bounded, GRID_PARAM_SPACE=bounded, GridSearchCV=GridSearchCV,
+                deduplicate_param_grid=mb.deduplicate_param_grid,
+                candidate_score=mb.candidate_score, n_jobs=1, verbose=0, error_score="raise",
+                cv_object=GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=42),
+            )
+            source = next("".join(cell["source"]) for cell in self.notebooks["model1"]["cells"]
+                          if cell["cell_type"] == "code" and
+                          "validation_runs = run_validation_searches(" in "".join(cell["source"]))
+            selection = ast.parse(source).body[0]
+            with redirect_stdout(StringIO()):
+                exec(compile(ast.Module(body=[selection], type_ignores=[]), "grid-branch", "exec"), namespace)
+            search = namespace["search"]
+            self.assertIsInstance(search, GridSearchCV)
+            expected = list(ParameterGrid(bounded))
+            actual = list(ParameterGrid(search.param_grid))
+            self.assertEqual([decoded_choice(value) for value in actual],
+                             [decoded_choice(value) for value in expected])
+            with patch.object(pretraining.AdvancedMultiBranchSequenceClassifier, "_fit_impl", fit), \
+                    patch.object(pretraining.AdvancedMultiBranchSequenceClassifier, "score", score), \
+                    redirect_stdout(StringIO()):
+                search.fit(frame, labels, groups=frame.subject)
+        self.assertEqual(len(search.cv_results_["params"]), len(expected))
+        self.assertCountEqual(fitted, [(candidate["estimator__learning_rate"],
+                                       candidate["estimator__dense_units"]) for candidate in expected])
+        self.assertTrue(np.isfinite(search.cv_results_["mean_test_score"]).all())
+
+    def test_model1_has_no_hidden_fixed_grid_experiment_or_anchor_controls(self):
+        banned = {"single_noop_experiment", "NOOP_EXPERIMENT_PARAMS", "DECLARED_GRID_PARAM_SPACE",
+                  "grid_anchors", "grid_unique_candidates"}
+        for index, cell in enumerate(self.notebooks["model1"]["cells"]):
+            if cell["cell_type"] == "code":
+                names = {node.id for node in ast.walk(ast.parse("".join(cell["source"])))
+                         if isinstance(node, ast.Name)}
+                self.assertFalse(names & banned, (index, names & banned))
 
     def test_searches_contain_only_declared_choices_and_stage_defaults(self):
         for variant in self.notebooks:

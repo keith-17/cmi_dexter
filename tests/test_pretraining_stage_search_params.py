@@ -297,7 +297,7 @@ PRETRAINING_PARAM_SPACE.update({
                     if index == 3:
                         mode = {"GRID_PARAM_SPACE": "grid", "BAYESIAN_PARAM_SPACE": "bayes",
                                 "EVOLUTIONARY_PARAM_SPACE": "evo"}[edited_name]
-                        return source + f"\nsearch_mode = {mode!r}\nsingle_noop_experiment = False\n"
+                        return source + f"\nsearch_mode = {mode!r}\n"
                     if large.literal_assignments(source, edited_name):
                         value = "ECat([7, 13])" if edited_name == "EVOLUTIONARY_PARAM_SPACE" else "[7, 13]"
                         return insert_after_assignment(source, edited_name,

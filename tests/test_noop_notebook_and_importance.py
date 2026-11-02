@@ -9,17 +9,15 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import sys
-import subprocess
 import unittest
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import ParameterGrid
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from noop_importance import compute_permutation_importance, _donor_rows, _sequence_layout
+from multibranch_utils import compute_permutation_importance, _donor_rows, _sequence_layout
 
 
 class _CachedExtractor:
@@ -161,12 +159,6 @@ class PermutationImportanceTests(unittest.TestCase):
 class NoopNotebookTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        # Compare preserved non-NOOP search ranges against the committed source,
-        # rather than reading the same now-edited notebook twice.
-        committed = subprocess.check_output(
-            ["git", "show", "HEAD:notebooks/multibranch_pretraining.ipynb"], cwd=ROOT,
-        ).decode("utf-8")
-        cls.source_nb = json.loads(committed)
         cls.notebook = json.loads((ROOT / "notebooks/multibranch_pretraining.ipynb").read_text(encoding="utf-8"))
 
     @staticmethod
@@ -180,29 +172,26 @@ class NoopNotebookTests(unittest.TestCase):
                 self.assertIsNone(cell["execution_count"])
                 self.assertEqual(cell["outputs"], [])
 
-    def test_noop_options_are_exposed_in_each_space_without_changing_existing_ranges(self):
-        expected_keys = {"motion_stats", "periodicity", "spectral_stats", "quality", "signal", "band", "bands",
-                         "min_cycles", "min_samples", "max_gap_samples", "acf_harmonic_tolerance",
-                         "spectral_neighbourhood_hz", "detrend"}
-        for index, name in ((14, "GRID_PARAM_SPACE"), (16, "BAYESIAN_PARAM_SPACE"), (18, "EVOLUTIONARY_PARAM_SPACE")):
+    def test_noop_options_are_exposed_in_each_editable_search_space(self):
+        from noop_sequence_extractor import NoopOptions
+        from test_pretraining_large_notebook import LargePretrainingNotebookTests
+
+        loader = LargePretrainingNotebookTests()
+        loader.notebooks = {"model1": self.notebook}
+        with TemporaryDirectory() as directory:
+            namespace = loader.namespace("model1", directory)
+        prefix = "estimator__extractor__noop__"
+        expected_keys = set(NoopOptions().get_params(deep=False))
+        for name in ("GRID_PARAM_SPACE", "BAYESIAN_PARAM_SPACE", "EVOLUTIONARY_PARAM_SPACE"):
             with self.subTest(space=name):
-                old_tree = ast.parse(self.source(self.source_nb, index))
-                new_tree = ast.parse(self.source(self.notebook, index))
-                old_assign = next(node for node in ast.walk(old_tree) if isinstance(node, ast.Assign)
-                                  and any(isinstance(t, ast.Name) and t.id == name for t in node.targets))
-                new_assign = next(node for node in ast.walk(new_tree) if isinstance(node, ast.Assign)
-                                  and any(isinstance(t, ast.Name) and t.id == name for t in node.targets))
-                self.assertEqual(ast.dump(old_assign.value), ast.dump(new_assign.value))
-                update = next(node for node in ast.walk(new_tree) if isinstance(node, ast.Call)
-                              and isinstance(node.func, ast.Attribute) and node.func.attr == "update"
-                              and isinstance(node.func.value, ast.Name) and node.func.value.id == name)
-                keys = [ast.literal_eval(key) for key in update.args[0].keys]
-                self.assertEqual({key.removeprefix("estimator__extractor__noop__") for key in keys}, expected_keys)
-                values = dict(zip(keys, update.args[0].values))
+                space = namespace[name]
+                self.assertEqual({key[len(prefix):] for key in space if key.startswith(prefix)},
+                                 expected_keys)
                 for mode in ("motion_stats", "periodicity", "spectral_stats", "quality"):
-                    value = values["estimator__extractor__noop__" + mode]
-                    options = value if isinstance(value, ast.List) else value.args[0]
-                    self.assertIsNone(ast.literal_eval(options.elts[0]))
+                    dimension = space[prefix + mode]
+                    choices = (dimension.categories if hasattr(dimension, "categories") else
+                               dimension.choices if hasattr(dimension, "choices") else dimension)
+                    self.assertIn(None, choices, (name, mode))
 
     def test_extractors_and_grid_deduplication_are_connected(self):
         setup = self.source(self.notebook, 12)
@@ -231,40 +220,30 @@ class NoopNotebookTests(unittest.TestCase):
                              for node in ast.walk(space_tree)))
         self.assertFalse((ROOT / "notebooks/multibranch_v2.ipynb").exists())
 
-    def test_baseline_first_and_exactly_one_matched_noop_grid_candidate(self):
-        controls_tree = ast.parse(self.source(self.notebook, 3))
-        control_assignments = {}
-        for node in controls_tree.body:
-            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-                if (node.targets[0].id in {"search_mode", "single_noop_experiment", "NOOP_EXPERIMENT_PARAMS"}
-                        and node.targets[0].id not in control_assignments):
-                    control_assignments[node.targets[0].id] = ast.literal_eval(node.value)
-        self.assertEqual(control_assignments["search_mode"], "best params")
-        self.assertTrue(control_assignments["single_noop_experiment"])
-        expected_noop = json.loads((ROOT / "experiments/noop_candidate21/enhanced_options.json").read_text(encoding="utf-8"))
-        self.assertEqual(control_assignments["NOOP_EXPERIMENT_PARAMS"],
-                         {"estimator__extractor__noop__" + key: value for key, value in expected_noop.items()})
-        best_tree = ast.parse(self.source(self.notebook, 5))
-        best = ast.literal_eval(next(node.value for node in best_tree.body if isinstance(node, ast.Assign)
-                                    and any(isinstance(t, ast.Name) and t.id == "BEST_PARAMS" for t in node.targets)))
-        space_tree = ast.parse(self.source(self.notebook, 18))
-        preset = next(node for node in space_tree.body if isinstance(node, ast.If)
-                      and "single_noop_experiment" in ast.unparse(node.test))
-        declared = {"ordinary_parameter": [1, 2, 3]}
-        namespace = {"search_mode": "grid", "single_noop_experiment": True,
-                     "BEST_PARAMS": deepcopy(best), "GRID_PARAM_SPACE": deepcopy(declared),
-                     "NOOP_EXPERIMENT_PARAMS": control_assignments["NOOP_EXPERIMENT_PARAMS"]}
-        exec(compile(ast.Module(body=[preset], type_ignores=[]), "matched_grid", "exec"), namespace)
-        candidates = list(ParameterGrid(namespace["GRID_PARAM_SPACE"]))
-        self.assertEqual(len(candidates), 1)
-        for key, value in best.items():
-            if not key.startswith("estimator__extractor__noop__"):
-                self.assertEqual(candidates[0][key], value)
-        self.assertEqual({key: value for key, value in candidates[0].items() if key.startswith("estimator__extractor__noop__")},
-                         control_assignments["NOOP_EXPERIMENT_PARAMS"])
-        namespace.update(single_noop_experiment=False, GRID_PARAM_SPACE=deepcopy(declared))
-        exec(compile(ast.Module(body=[preset], type_ignores=[]), "ordinary_grid", "exec"), namespace)
-        self.assertEqual(namespace["GRID_PARAM_SPACE"], declared)
+    def test_search_mode_selects_declared_spaces_without_fixed_experiment_overrides(self):
+        tree = ast.parse(self.source(self.notebook, 18))
+        selection = next(node for node in tree.body if isinstance(node, ast.If)
+                         and ast.unparse(node.test) == "search_mode == 'bayes'")
+        spaces = {"GRID_PARAM_SPACE": object(), "BAYESIAN_PARAM_SPACE": object(),
+                  "EVOLUTIONARY_SEARCH_SPACE": object()}
+        for mode, expected in (("grid", "GRID_PARAM_SPACE"), ("bayes", "BAYESIAN_PARAM_SPACE"),
+                               ("evo", "EVOLUTIONARY_SEARCH_SPACE")):
+            namespace = dict(spaces, search_mode=mode)
+            exec(compile(ast.Module(body=[selection], type_ignores=[]), "space-selection", "exec"), namespace)
+            self.assertIs(namespace["param_space"], spaces[expected])
+
+    def test_importance_is_provided_by_the_shared_multibranch_utilities(self):
+        from multibranch_utils import save_permutation_importance
+
+        self.assertEqual(compute_permutation_importance.__module__, "multibranch_utils")
+        self.assertEqual(save_permutation_importance.__module__, "multibranch_utils")
+        self.assertFalse((ROOT / "src/noop_importance.py").exists())
+        imports = [node for node in ast.walk(ast.parse(self.source(self.notebook, 2)))
+                   if isinstance(node, ast.ImportFrom)]
+        self.assertTrue(any(node.module == "multibranch_utils" and
+                            any(name.name == "compute_permutation_importance" for name in node.names)
+                            for node in imports))
+        self.assertFalse(any(node.module == "noop_importance" for node in imports))
 
     def test_importance_uses_internal_train_partition_not_final_holdout(self):
         source = self.source(self.notebook, len(self.notebook["cells"]) - 1)
