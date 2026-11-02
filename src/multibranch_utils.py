@@ -72,9 +72,9 @@ except Exception:
     TENSORFLOW_AVAILABLE = False
 
 
-BRANCH_ORDER = ["acc", "derived_imu", "rotation", "tof", "thermo", "stft", "cwt"]
+BRANCH_ORDER = ["acc", "derived_imu", "rotation", "tof", "thermo", "stft", "cwt", "noop"]
 TIME_SERIES_BRANCHES = {"acc", "derived_imu", "rotation", "tof", "thermo"}
-STATIC_BRANCHES = {"stft", "cwt"}
+STATIC_BRANCHES = {"stft", "cwt", "noop"}
 
 DEFAULT_BRANCH_FILTERS = {"acc": 64, "rotation": 64, "tof": 32, "thermo": 32, "stft": 32, "cwt": 32}
 DEFAULT_BRANCH_KERNEL_SIZES = {"acc": 5, "rotation": 5, "tof": 3, "thermo": 3, "stft": 3, "cwt": 3}
@@ -1608,7 +1608,19 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         return self.augmentor_.fit_transform(X)
 
     def _uses_processed_augmentation(self, augmentor):
-        return type(getattr(self, "extractor_", None)) is SequenceExtractor and isinstance(augmentor, SensorAugmentor)
+        if not isinstance(augmentor, SensorAugmentor):
+            return False
+        extractor = getattr(self, "extractor_", None)
+        if type(extractor) is not SequenceExtractor:
+            # This child explicitly preserves the native augmentation hook;
+            # unrelated custom extractors keep their existing raw-input path.
+            if __package__:
+                from .noop_sequence_extractor import NoopSequenceExtractor
+            else:
+                from noop_sequence_extractor import NoopSequenceExtractor
+            if not isinstance(extractor, NoopSequenceExtractor):
+                return False
+        return True
 
     @contextmanager
     def _training_feature_augmentation(self, augmentor=None):
@@ -1676,6 +1688,29 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
                 branch_arrays[name] = block.sum(axis=1) / static_counts
             else:
                 branch_arrays[name] = block
+        return branch_arrays
+
+    def _branches_from_chunks(self, chunks):
+        """Route legacy channels and optional aligned per-window NOOP features.
+
+        The static NOOP matrix has its own feature axis. It must never be
+        indexed using ``branch_groups_``, whose indices refer only to ``X``.
+        This is also the shared input path for pretraining and importance.
+        """
+        branch_arrays = self._split_branches(chunks["X"], chunks["mask"], self.branch_groups_)
+        names = list(chunks.get("noop_feature_names", []))
+        expected = list(getattr(self, "noop_feature_names_", []))
+        if names != expected:
+            raise InvalidExtractorParams("NOOP feature schema differs from the fitted model.")
+        extra = chunks.get("noop_features")
+        if extra is not None:
+            extra = np.asarray(extra, dtype=np.float32)
+            if extra.ndim != 2 or extra.shape != (len(chunks["mask"]), len(names)):
+                raise InvalidExtractorParams("NOOP features must have shape (chunks, feature names).")
+            if names:
+                branch_arrays["noop"] = extra
+        elif expected:
+            raise InvalidExtractorParams("The fitted model requires NOOP features for every chunk.")
         return branch_arrays
 
     def _model_inputs(self, branch_arrays, mask):
@@ -1763,7 +1798,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
             raise
         except Exception as exc:
             raise InvalidExtractorParams(f"MultiBranchSequenceClassifier transform failed: {exc}") from exc
-        branch_arrays = self._split_branches(chunks["X"], chunks["mask"], self.branch_groups_)
+        branch_arrays = self._branches_from_chunks(chunks)
         return branch_arrays, chunks["sequence_ids"]
 
     def _build_callbacks(self, has_validation_data: bool = False):
@@ -2053,6 +2088,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         )
 
         self.feature_names_ = list(train_chunks["feature_names"])
+        self.noop_feature_names_ = list(train_chunks.get("noop_feature_names", []))
         self.branch_groups_ = self._branch_groups(
             self.feature_names_,
             separate_derived_imu=(
@@ -2063,10 +2099,10 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
                 or bool(self.custom_aux_heads_)
             ),
         )
-        if not self.branch_groups_:
+        if not self.branch_groups_ and not self.noop_feature_names_:
             raise InvalidExtractorParams("No modality branches could be built from the extracted features.")
 
-        branch_arrays = self._split_branches(train_chunks["X"], train_chunks["mask"], self.branch_groups_)
+        branch_arrays = self._branches_from_chunks(train_chunks)
         if not all(np.isfinite(arr).all() for arr in branch_arrays.values()):
             raise InvalidExtractorParams("Feature extraction produced non-finite branch values.")
 
@@ -2097,9 +2133,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
             overlap = train_chunk_ids.unique().intersection(validation_chunk_ids.unique())
             if not overlap.empty:
                 raise AssertionError(f"Sequence leakage between train and validation chunks: {overlap.tolist()}")
-            validation_arrays = self._split_branches(
-                validation_chunks["X"], validation_chunks["mask"], self.branch_groups_
-            )
+            validation_arrays = self._branches_from_chunks(validation_chunks)
             validation_inputs = self._model_inputs(validation_arrays, validation_chunks["mask"])
             validation_y = self._align_y(validation_chunks["sequence_ids"], y)
             try:
@@ -2193,9 +2227,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
     def predict_proba(self, X):
         check_is_fitted(self, ["model_", "le_", "input_order_"])
         chunks = self.extractor_.transform_chunks(X)
-        branch_arrays = self._split_branches(
-            chunks["X"], chunks["mask"], self.branch_groups_
-        )
+        branch_arrays = self._branches_from_chunks(chunks)
         sequence_ids = chunks["sequence_ids"]
         model_inputs = self._model_inputs(branch_arrays, chunks["mask"])
         # Advanced feature indexing gives each branch its own array; the
@@ -2256,13 +2288,21 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         else: print("Model is not fitted yet.")
     def branch_summary(self):
         check_is_fitted(self, ["feature_names_", "branch_groups_"])
-        return describe_branches(self.feature_names_, self.branch_groups_)
+        summary = describe_branches(self.feature_names_, self.branch_groups_)
+        names = getattr(self, "noop_feature_names_", [])
+        if names:
+            summary = pd.concat([summary, pd.DataFrame([{
+                "branch": "noop", "n_features": len(names), "kind": "static (per-window)",
+                "example_columns": ", ".join(names[:3]) + (", ..." if len(names) > 3 else ""),
+            }])], ignore_index=True)
+        return summary
 
 
 """Architecture validation and parameter-preserving search helpers.
 
 Validation checks the selected model path without changing candidate settings.
-Search caches use complete requested parameter mappings.
+Search results retain complete requested mappings; cache identities ignore
+proven inactive NOOP controls only.
 """
 
 ARCHITECTURES = {"bigru_attention", "phase_attention", "cnn_attention_pool", "bert"}
@@ -2307,6 +2347,8 @@ _EXTRA_CONTROLLERS = (
     "extractor__use_acc_magnitude", "extractor__linear_acc_modes", "extractor__use_linear_acc_magnitude",
     "extractor__use_dead_reckoning", "extractor__max_windows_per_sequence",
     "extractor__sequence_crop_mode", "extractor__maxlen", "extractor__use_chunk_stride_ratio",
+    "extractor__noop", "extractor__noop__motion_stats", "extractor__noop__periodicity",
+    "extractor__noop__spectral_stats", "extractor__noop__quality", "extractor__noop__signal",
 )
 
 
@@ -2319,6 +2361,13 @@ def _name(key):
 def _merged(params, base_params):
     merged = dict(_DEFAULTS)
     for settings in (base_params or {}, params or {}):
+        if any(_name(key) == "extractor" for key in settings):
+            # sklearn replaces the object before applying this mapping's
+            # explicit nested overrides. Stale defaults from the previous
+            # extractor must not disable a newly selected child's features.
+            merged = {key: value for key, value in merged.items() if not key.startswith("extractor__")}
+        elif any(_name(key) == "extractor__noop" for key in settings):
+            merged = {key: value for key, value in merged.items() if not key.startswith("extractor__noop__")}
         for key, value in settings.items():
             merged[_name(key)] = value
     return merged
@@ -2334,10 +2383,90 @@ def _extractor_settings(settings):
         result = extractor.get_params(deep=True)
     else:
         result = vars(extractor).copy()
+    if "extractor__noop" in settings:
+        # Replacing nested options discards the previous object's deep values;
+        # only explicit overrides from this effective mapping may restore them.
+        result = {key: value for key, value in result.items() if not key.startswith("noop__")}
     for key, value in settings.items():
         if key.startswith("extractor__"):
             result[key[len("extractor__"):]] = value
     return result
+
+
+def _noop_search_helpers():
+    if __package__:
+        from .noop_sequence_extractor import inactive_noop_parameters, validate_noop_settings
+    else:
+        from noop_sequence_extractor import inactive_noop_parameters, validate_noop_settings
+    return inactive_noop_parameters, validate_noop_settings
+
+
+def effective_candidate_signature(params, base_params=None):
+    """Stable search identity, ignoring only proven inactive NOOP controls.
+
+    Candidate dictionaries themselves are never changed: the first requested
+    representative retains its complete values in fits and result tables.
+    Existing non-NOOP parameter identities retain their historical behavior.
+    """
+    extractor = _extractor_settings(_merged(params, base_params))
+    if "noop" not in extractor and not any(key.startswith("noop__") for key in extractor):
+        return json.dumps(params, sort_keys=True, default=str)
+    inactive, _ = _noop_search_helpers()
+    unused = inactive(extractor)
+
+    def options_value(value):
+        if hasattr(value, "get_params"):
+            options = value.get_params(deep=False)
+        elif isinstance(value, dict):
+            options = value
+        else:
+            return value
+        return {key: item for key, item in options.items() if f"noop__{key}" not in unused}
+
+    signature = {}
+    for key, value in params.items():
+        name = _name(key)
+        if name.startswith("extractor__") and name[len("extractor__"):] in unused:
+            continue
+        if name == "extractor" and hasattr(value, "get_params"):
+            shallow = value.get_params(deep=False)
+            if "noop" in shallow:
+                shallow = dict(shallow)
+                shallow["noop"] = options_value(shallow["noop"])
+                value = {"class": f"{type(value).__module__}.{type(value).__qualname__}", "params": shallow}
+        elif name == "extractor__noop":
+            value = options_value(value)
+        signature[key] = value
+    return json.dumps(signature, sort_keys=True, default=str)
+
+
+def deduplicate_param_grid(param_grid, base_params=None):
+    """Expand only the optional NOOP axes, keeping other grid ranges lazy.
+
+    Each output subgrid retains the original non-NOOP ranges. NOOP choices are
+    singleton ranges with the first complete representative's inactive values.
+    Whole-extractor replacement grids are conservatively left unchanged: their
+    choices may change NOOP defaults and cannot be judged from one base model.
+    Overlap between separate subgrids is not inferred.
+    """
+    from sklearn.model_selection import ParameterGrid
+    grids = []
+    # Constructing ParameterGrid validates the declarations without iterating
+    # their Cartesian product (the existing model grid may be enormous).
+    for original in ParameterGrid(param_grid).param_grid:
+        noop = {key: values for key, values in original.items()
+                if _name(key) == "extractor__noop" or _name(key).startswith("extractor__noop__")}
+        if not noop or any(_name(key) == "extractor" for key in original):
+            grids.append(dict(original))
+            continue
+        remaining = {key: values for key, values in original.items() if key not in noop}
+        seen = set()
+        for candidate in ParameterGrid(noop):
+            signature = effective_candidate_signature(candidate, base_params)
+            if signature not in seen:
+                seen.add(signature)
+                grids.append({**remaining, **{key: [value] for key, value in candidate.items()}})
+    return grids
 
 
 def _modes(value):
@@ -2420,6 +2549,9 @@ def _candidate_error(params, base_params, y, phase_labels_available, label_cache
         heads = []
     temporal = _is_temporal(merged)
     extractor = _extractor_settings(merged)
+    if "noop" in extractor or any(key.startswith("noop__") for key in extractor):
+        _, validate_noop_settings = _noop_search_helpers()
+        validate_noop_settings(extractor)
     # These names control validation only. Never pass a filtered mapping to fit.
     validation_names = set(settings)
     if architecture != "bert":
@@ -2666,6 +2798,12 @@ class _CandidateRules:
         """Copy the complete requested candidate without changing keys or values."""
         return dict(params)
 
+    def _canonical_key(self, params):
+        base = getattr(self, "_base_params_", None)
+        if base is None:
+            base = self.estimator.get_params(deep=True)
+        return effective_candidate_signature(params, base)
+
     def _candidate_error(self, params):
         base_params = getattr(self, '_base_params_', None)
         if base_params is None:
@@ -2685,7 +2823,7 @@ class _CandidateRules:
 
 
 class HierarchicalGASearchCV(_CandidateRules, GASearchCV):
-    """Evolve every declared gene, with bounded retries for exact duplicates."""
+    """Evolve declared genes, reusing configurations with inactive NOOP differences."""
     _controller_order = (
         'temporal_architecture', 'use_bigru', 'use_orientation_aux_head',
         'use_phase_aux_head', 'custom_aux_heads', 'extractor',
@@ -2952,7 +3090,7 @@ if BayesSearchCV is not None:
                         pending.append((point, self._penalty()))
                         state['synthetic_count'] += 1
                     return None
-                key = GASearchCV._canonical_key(self, active)
+                key = self._canonical_key(active)
                 if key in self._effective_score_cache_:
                     self.reused_candidate_count_ += 1
                     self.duplicate_proposal_count_ += 1

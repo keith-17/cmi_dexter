@@ -174,6 +174,16 @@ class MaskedSensorSequence(_DataSequence):
         extractor = copy.copy(self.owner.extractor_)
         extractor.feature_names_in_ = list(columns)
         extractor.padding_value = 0.0
+        if getattr(extractor, "noop", None) is not None:
+            if __package__:
+                from .noop_sequence_extractor import NoopSequenceExtractor
+            else:
+                from noop_sequence_extractor import NoopSequenceExtractor
+            if isinstance(extractor, NoopSequenceExtractor):
+                # Raw geometry, targets and loss masks are not model features.
+                # Keep their parent crop/window layout without requiring a
+                # sensor source view or attaching optional summary features.
+                extractor.noop = None
         return extractor._chunks_from_features(frame.copy())
 
     def _set_order(self):
@@ -274,7 +284,7 @@ class MaskedSensorSequence(_DataSequence):
         # Store target values and independent reconstruction weights together;
         # the loss normalises each channel by its actual valid hidden count.
         packed = np.concatenate([np.where(weight > 0, target, 0.0), weight], axis=-1).astype(np.float32)
-        branch = self.owner._split_branches(extracted["X"], extracted["mask"], self.owner.branch_groups_)
+        branch = self.owner._branches_from_chunks(extracted)
         inputs = self.owner._model_inputs(branch, extracted["mask"])
         result = (inputs, packed)
         self._cache[seq_id] = result
@@ -575,7 +585,7 @@ class AdvancedMultiBranchSequenceClassifier(mb.MultiBranchSequenceClassifier):
         encoded = self.pretraining_label_encoder_.transform(labels)
         if str(settings["loss_name"]).lower() == "cce":
             encoded = mb.tf.keras.utils.to_categorical(encoded, len(self.pretraining_label_encoder_.classes_))
-        branch = self._split_branches(chunks["X"], chunks["mask"], self.branch_groups_)
+        branch = self._branches_from_chunks(chunks)
         inputs = self._model_inputs(branch, chunks["mask"])
         del chunks["X"]
         sample_weight = None
@@ -599,7 +609,7 @@ class AdvancedMultiBranchSequenceClassifier(mb.MultiBranchSequenceClassifier):
                 raise ValueError("Pretraining validation contains a class absent from source training.") from exc
             if str(settings["loss_name"]).lower() == "cce":
                 val_y = mb.tf.keras.utils.to_categorical(val_y, len(self.pretraining_label_encoder_.classes_))
-            arrays = self._split_branches(val["X"], val["mask"], self.branch_groups_)
+            arrays = self._branches_from_chunks(val)
             validation = (self._model_inputs(arrays, val["mask"]), val_y)
             del val["X"]
         before = _weight_snapshot(source)

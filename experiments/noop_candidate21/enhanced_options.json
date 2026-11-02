@@ -1,0 +1,15 @@
+{
+  "motion_stats": "acc_ac_rms|axis_rms|jerk_rms|rotation_mean|rotation_rms",
+  "periodicity": "acf_harmonic_checked",
+  "spectral_stats": "all",
+  "quality": "features",
+  "signal": "linear",
+  "band": [0.5, 15.0],
+  "bands": [[0.5, 2.0], [2.0, 4.0], [4.0, 8.0], [8.0, 15.0]],
+  "min_cycles": 2.0,
+  "min_samples": 16,
+  "max_gap_samples": 2,
+  "acf_harmonic_tolerance": 0.15,
+  "spectral_neighbourhood_hz": 0.75,
+  "detrend": "linear"
+}

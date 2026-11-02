@@ -2880,6 +2880,14 @@ def inactive_sequence_parameters(params, *, for_frame_output=None):
             inactive.add("stft_nperseg")
         if kind == "cwt" and configs and all(config.get("widths") is not None for config in configs):
             inactive |= {"cwt_n_scales", "cwt_min_scale"}
+    if "noop" in settings or any(key.startswith("noop__") for key in settings):
+        # Child-specific defaults stay in the opt-in extractor, rather than
+        # being inferred from or added to SequenceExtractor's constructor.
+        if __package__:
+            from .noop_sequence_extractor import inactive_noop_parameters
+        else:
+            from noop_sequence_extractor import inactive_noop_parameters
+        inactive |= inactive_noop_parameters(settings)
     return inactive
 
 
@@ -2899,6 +2907,12 @@ def sequence_feature_families(params):
         configs = _spectral_configs(settings, kind)
         if configs is None or any(config.get("signal_columns") != [] for config in configs):
             families.add(kind)
+    noop = settings.get("noop")
+    noop_settings = noop.get_params() if hasattr(noop, "get_params") else dict(noop or {})
+    noop_settings.update({key[6:]: value for key, value in settings.items() if key.startswith("noop__")})
+    if (any(noop_settings.get(key) is not None for key in ("motion_stats", "periodicity", "spectral_stats"))
+            or noop_settings.get("quality") == "features"):
+        families.add("noop")
     return families
 
 
