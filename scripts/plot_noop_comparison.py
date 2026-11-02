@@ -50,8 +50,10 @@ def save_comparison_curves(histories, path, title="Candidate21 baseline and NOOP
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.6), constrained_layout=True)
-    colors = ["#2265a5", "#c06a24", "#2e8053"]
-    for i, (name, history) in enumerate(histories.items()):
+    for name, history in histories.items():
+        is_noop = "enhanced" in name.lower() or "noop" in name.lower()
+        color = "#d000d8" if is_noop else "#111111"
+        marker = "D" if is_noop else "o"
         for ax, kind in zip(axes, ("accuracy", "loss")):
             for validation in (False, True):
                 values = metric(history, kind, validation)
@@ -59,14 +61,18 @@ def save_comparison_curves(histories, path, title="Candidate21 baseline and NOOP
                     epoch_numbers = history.get("epoch", range(1, len(values)+1))
                     if len(epoch_numbers) != len(values):
                         raise ValueError("Epoch numbers and observed metrics must align.")
-                    ax.plot(epoch_numbers, values, color=colors[i % len(colors)],
-                            linestyle="--" if validation else "-", linewidth=1,
+                    ax.plot(epoch_numbers, values, color=color,
+                            linestyle="--" if validation else "-",
+                            linewidth=2.0 if validation else 1.5,
+                            alpha=1.0 if validation else .7,
+                            marker=marker, markevery=max(1, len(values)//14), markersize=4,
+                            markerfacecolor="white", markeredgewidth=1.2,
                             label=name + (" validation" if validation else " training"))
             ax.set(xlabel="Epoch", ylabel="Accuracy" if kind == "accuracy" else "Loss")
             ax.grid(alpha=.2)
             if kind == "accuracy": ax.yaxis.set_major_formatter(PercentFormatter(1))
-            if ax.lines: ax.legend(fontsize=8)
-    fig.suptitle(title + "\nObserved epochs only; dashed lines show internal validation")
+            if ax.lines: ax.legend(fontsize=9)
+    fig.suptitle(title + "\nBlack = baseline; magenta = NOOP. Solid = training; dashed = internal validation.")
     fig.savefig(path, dpi=170, facecolor="white")
     plt.close(fig)
     return str(path.resolve())
@@ -84,8 +90,10 @@ if __name__ == "__main__":
         history = (json.loads(history_path.read_text()) if history_path.exists()
                    else telemetry_history(folder / "epoch_telemetry.jsonl"))
         if history:
-            phase = f" fit {history['fit'][-1]}" if history.get("fit") else " refit"
-            histories[variant + phase] = history
+            fit = history['fit'][-1] if history.get("fit") else 2
+            phase = "CV" if fit == 1 else "refit"
+            name = "Baseline" if variant == "baseline" else "NOOP"
+            histories[f"{name} ({phase})"] = history
     if histories:
         print(save_comparison_curves(histories, args.directory / "accuracy_loss_comparison.png",
-              title="Notebook baseline and NOOP: current fits (1 = CV, 2 = refit)"))
+              title="Notebook baseline and NOOP: observed training progress"))
