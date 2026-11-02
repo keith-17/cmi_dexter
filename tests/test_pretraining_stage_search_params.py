@@ -95,7 +95,16 @@ class StageSearchParameterTests(unittest.TestCase):
                 namespace = self.namespace(variant, directory)
                 for key, choices in STAGE_DEFAULTS.items():
                     if variant == "model1" and key == EXTRACTOR + "pretraining_source":
-                        choices = ["baseline"]
+                        for name in ("GRID_PARAM_SPACE", "BAYESIAN_PARAM_SPACE", "EVOLUTIONARY_PARAM_SPACE"):
+                            declared = self.harness.declared_space(variant, name, namespace)[key]
+                            actual = namespace[name][key]
+                            if name == "GRID_PARAM_SPACE":
+                                self.assertEqual(actual, declared)
+                            elif name == "BAYESIAN_PARAM_SPACE":
+                                self.harness.assert_same_bayesian_values(actual, declared)
+                            else:
+                                self.harness.assert_same_evolutionary_values(actual, declared)
+                        continue
                     if "PRETRAINING_PARAM_SPACE" in namespace:
                         self.assertEqual(namespace["PRETRAINING_PARAM_SPACE"][key], choices)
                     self.assert_compiled_choices(namespace, key, choices)
@@ -266,8 +275,11 @@ PRETRAINING_PARAM_SPACE.update({
                                       space[PREFIX + "epochs"].high), (4, 15))
                     self.assertEqual((space[PREFIX + "learning_rate"].low,
                                       space[PREFIX + "learning_rate"].high), (1e-6, 1e-3))
-                self.assertEqual(namespace["BEST_PARAMS"][PREFIX + "epochs"], 7)
-                self.assertEqual(namespace["BEST_PARAMS"][PREFIX + "learning_rate"], 2e-5)
+                if variant == "model1":
+                    self.assertEqual(namespace["BEST_PARAMS"], baseline["BEST_PARAMS"])
+                else:
+                    self.assertEqual(namespace["BEST_PARAMS"][PREFIX + "epochs"], 7)
+                    self.assertEqual(namespace["BEST_PARAMS"][PREFIX + "learning_rate"], 2e-5)
 
     def test_model1_search_cells_keep_edits_and_nested_choices_independent(self):
         names = ("GRID_PARAM_SPACE", "BAYESIAN_PARAM_SPACE", "EVOLUTIONARY_PARAM_SPACE")
@@ -285,7 +297,7 @@ PRETRAINING_PARAM_SPACE.update({
                     if index == 3:
                         mode = {"GRID_PARAM_SPACE": "grid", "BAYESIAN_PARAM_SPACE": "bayes",
                                 "EVOLUTIONARY_PARAM_SPACE": "evo"}[edited_name]
-                        return source + f"\nsearch_mode = {mode!r}\n"
+                        return source + f"\nsearch_mode = {mode!r}\nsingle_noop_experiment = False\n"
                     if large.literal_assignments(source, edited_name):
                         value = "ECat([7, 13])" if edited_name == "EVOLUTIONARY_PARAM_SPACE" else "[7, 13]"
                         return insert_after_assignment(source, edited_name,

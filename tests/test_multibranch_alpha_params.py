@@ -557,7 +557,8 @@ class KerasParameterConstructionTests(unittest.TestCase):
                     min_lr=1e-6,
                     warmup_epochs=1,
                     cosine_t_max=2,
+                    early_stopping_patience=2,
                 )
-                callbacks = classifier._build_callbacks()
+                callbacks = classifier._build_callbacks(has_validation_data=True)
                 self.assertGreaterEqual(len(callbacks), 2)
                 self.assertTrue(all(isinstance(callback, mba.callbacks.Callback) for callback in callbacks))

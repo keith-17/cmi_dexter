@@ -1,73 +1,64 @@
-# NOOP V2 validation record (2 November 2026)
+# NOOP validation: original pretraining notebook
 
-The change is on `multibranch/v2/develop`, based on
-`4a87762f80634a251dbcbf8586d8ed4fd4449101`. Source files in the synced ChatGPT
-project were not modified.
+The change lives on multibranch/v2/develop. The active notebook is
+notebooks/multibranch_pretraining.ipynb. V2 refers only to the branch.
 
-## Checks completed before the matched GPU submissions
+## Numerical and model verification
 
-- New NOOP tests: 48 discovered, 43 passed, 5 neural tests skipped in the
-  lightweight Python environment. Log: `kaggle_build/noop_preflight/noop_unittest.log`.
-- A separate working TensorFlow environment passed 68 focused checks, including
-  actual supervised fitting, validation, prediction, all four temporal model
-  paths, supervised pretraining, masked SSL and trained-network importance.
-  Log: `tmp/noop_integration_regressions.log`.
-- Final search checks passed 18 tests, including nested option replacement,
-  conditional Bayesian/evolutionary reuse and a grid whose untouched model
-  axes contain 10^24 combinations. Log: `tmp/noop_search_final.log`.
-- A 1,200-row sample from the real CMI CSV produced exact parent/child output
-  equality with NOOP off, and finite aligned feature/support values with all
-  selected methods enabled. Record:
-  `kaggle_build/noop_preflight/real_data_extraction.json`.
-- The full real-data preparation reproduced the historical checksum and every
-  saved train/holdout sequence ID: 8,151 input sequences, 50 excluded for wholly
-  invalid quaternions, 4,050 outer train and 4,051 holdout sequences; 2,539
-  Target holdout sequences. Record:
-  `kaggle_build/noop_preflight/data_verification.json`.
-- The new notebook's code cells compile and its schema/search wiring is checked.
-  Existing non-NOOP search ranges and original notebooks are preserved.
+- 48 focused tests were discovered in the lightweight runtime: 43 passed and
+  5 neural checks were skipped there. Those paths were tested in the working
+  TensorFlow runtime. See kaggle_build/noop_preflight/native_noop_tests.log.
+- 68 focused checks passed in the working TensorFlow runtime, including real
+  fitting, validation, prediction, all four temporal backbones, supervised
+  pretraining, masked SSL and actual-network permutation importance.
+  See tmp/noop_integration_regressions.log.
+- Final search-helper checks passed 18 tests, including object replacement,
+  inactive-setting reuse and a 10^24-combination model-grid scalability case.
+  See tmp/noop_search_final.log. These counts overlap.
+- A 1,200-row real-data probe verified exact parent/child tensors with NOOP off
+  and finite aligned summaries/support values with the generous options on.
+  See kaggle_build/noop_preflight/real_data_extraction.json.
 
-The checks above overlap; their counts should not be added together.
+Disabled-mode tests also compare architecture, learned weights and predictions
+under the same seed. Missing-data, padding, timing, PSD scaling, quaternion
+units, harmonic ambiguity, cropping and augmentation alignment are checked.
 
-## Existing broad-suite failures
+## Broad-suite verification and corrected expectations
 
-The starting commit was extracted into an isolated directory and tested with
-the same lightweight interpreter. Its broad suite already reports 2 failures
-and 29 errors: stale expectations about older notebook cells and unavailable
-local TensorFlow functionality. Logs are
-`kaggle_build/noop_preflight/original_full_unittest.log` and
-`kaggle_build/noop_preflight/full_unittest_final.log`. The final modified suite
-ran 405 tests; the original ran 357. Their failing test names are identical:
-there are no additional failures or errors. These results are not described
-as a passing full suite. Actual neural checks use the separate working
-TensorFlow environment.
+The full working-TensorFlow run exercised 411 tests. It found seven outdated
+expectations about notebook configuration, independent search spaces and
+callback validation data. Those test expectations were corrected; all 27
+selected regression tests then passed, including every initially failing case.
+The neural implementation did not require further changes. This is a full
+suite followed by targeted rechecks, not a claim of one clean full-suite run.
 
-Invoking the Conda interpreter directly also required its `Library/bin` on
-process PATH: without it, an independent `scipy.linalg.lstsq` call aborted
-before Python could raise an exception. Setting the correct process PATH
-resolved that environment issue; no numerical algorithm was changed for it.
+Logs: kaggle_build/noop_preflight/native_full_tensorflow_tests.log and
+kaggle_build/noop_preflight/native_corrected_regressions.log. The coverage audit
+is kaggle_build/noop_preflight/native_final_test_audit.json.
 
-## Corrected notebook runs
+The Conda interpreter needs its own Library/bin on process PATH for LAPACK.
+Without it, an independent scipy.linalg.lstsq call aborted; setting the proper
+process PATH resolved that environment issue.
 
-The active notebook is `notebooks/multibranch_pretraining.ipynb`. V2 is only the
-branch name. The initial wrapper runs were superseded and cancellation was
-acknowledged; their receipts remain an audit trail, not comparison results.
+## Native notebook experiment checks
 
-The original notebook now contains the complete discussed BEST_PARAMS baseline,
-optional NOOP controls in all three searches, a one-candidate NOOP Grid preset,
-and the final internal-validation importance section. The corrected native
-NOOP checks discovered 48 tests: 43 passed and 5 actual neural tests skipped in
-the lightweight runtime. The working TensorFlow checks above verify those
-neural paths separately. Updated legacy notebook tests select cells by meaning
-rather than obsolete cell numbers.
+BEST_PARAMS contains the 215 discussed winning settings and NOOP-off defaults.
+It is no longer overwritten by first Grid choices. The one-candidate preset
+preserves those baseline settings and adds only NOOP controls. Ordinary Grid,
+Bayesian and evolutionary ranges retain their editable declarations.
 
-The experiment packager reuses scripts/kaggle_experiment.py and preserves actual
-notebook cells, adding only its existing source bootstrap. Baseline uses best
-params; enhanced changes only search_mode to grid, enabling the visible single
-candidate preset. Both retain native CV/refit/holdout evaluation. Live epoch
-observations distinguish CV from refit and never mix their histories.
+The existing scripts/kaggle_experiment.py packager is reused. Baseline retains
+all 31 notebook cells exactly plus the source-loading bootstrap. Enhanced
+changes only the search_mode assignment to grid. Both execute native
+GridSearchCV, CV, refit and holdout evaluation; no alternate classifier factory
+or fit interception is used. Source, version, private T4 shape and pinned image
+are verified through the API. Live plots distinguish CV from refit.
 
-Source hashes, private T4 configuration and notebook versions are verified
-through the Kaggle API. Collection checks the native one-candidate CSV/summary,
-final 2,000-epoch refit and saved permutation importance. No monitor resubmits
-training.
+The initial wrapper runs were superseded, and Kaggle acknowledged cancellation.
+Their receipts are an audit trail, not results of the corrected comparison.
+Corrected receipts are in experiments/noop_candidate21/submitted_notebook_20261102.json.
+
+Permutation importance is the final notebook section and uses only saved
+internal-validation sequences in the fitted final-task domain. Final scores
+remain sequence-disjoint rather than participant-disjoint. The configured
+100 Hz and chosen frequency bands remain explicit analysis assumptions.
