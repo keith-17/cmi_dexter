@@ -236,7 +236,6 @@ class OpenSourceStackAndExtractorTests(unittest.TestCase):
         self.assertGreater(k_str, 0.7)
         self.assertGreater(k_conc, 0.0)
 
-    @unittest.skipUnless(TSFEL_AVAILABLE, "tsfel not installed")
     def test_tsfel_static_backend_extracts_rate_adapted_features(self):
         subset = self.df[self.df["sequence_id"].isin(self.df["sequence_id"].unique()[:3])].copy()
         ext = MultiModalSequenceExtractor(
@@ -250,7 +249,6 @@ class OpenSourceStackAndExtractorTests(unittest.TestCase):
         self.assertGreater(len(tsfel_cols), 5)
         self.assertTrue(np.isfinite(chunks["static"]).all())
 
-    @unittest.skipUnless(TSFRESH_AVAILABLE, "tsfresh not installed")
     def test_tsfresh_static_backend_extracts_rate_adapted_features(self):
         subset = self.df[self.df["sequence_id"].isin(self.df["sequence_id"].unique()[:3])].copy()
         ext = MultiModalSequenceExtractor(
@@ -264,9 +262,69 @@ class OpenSourceStackAndExtractorTests(unittest.TestCase):
         self.assertGreater(len(tsfresh_cols), 5)
         self.assertTrue(np.isfinite(chunks["static"]).all())
 
+    def test_find_data_root_prefers_train_csv_over_sample_csv(self):
+        with TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            local_sample_only = base / "local_data"
+            local_sample_only.mkdir(parents=True)
+            (local_sample_only / "sample.csv").write_text("sequence_id\ns1\n", encoding="utf-8")
+
+            kaggle_root = base / "kaggle_input"
+            comp_dir = kaggle_root / "competitions" / "cmi-detect-behavior-with-sensor-data"
+            comp_dir.mkdir(parents=True)
+            (comp_dir / "train.csv").write_text("sequence_id\ns1\n", encoding="utf-8")
+
+            with redirect_stdout(StringIO()):
+                resolved = find_data_root(local_dir=str(local_sample_only), kaggle_root=str(kaggle_root))
+            self.assertEqual(resolved.resolve(), comp_dir.resolve())
+            self.assertTrue((resolved / "train.csv").is_file())
+
+    def test_all_alias_supported_across_all_extractor_and_noop_mode_parameters(self):
+        subset = self.df[self.df["sequence_id"].isin(self.df["sequence_id"].unique()[:3])].copy()
+        ext = MultiModalSequenceExtractor(
+            window_seconds=1.0,
+            acc_modes="all",
+            rotation_modes="all",
+            thm_modes="all",
+            tof_modes="all",
+            static_backend="tsfel",
+            static_channels="all",
+            tsfel_domains="all",
+            noop=NoopOptions(
+                motion_stats="all",
+                periodicity="acf_kimmitch",
+                spectral_stats="all",
+                quality="features",
+                power_branches="all",
+            ),
+        )
+        chunks = ext.fit(subset).transform_chunks(subset)
+        self.assertTrue(np.isfinite(chunks["static"]).all())
+        for name in ("imu", "thm", "tof"):
+            self.assertIn(name, chunks["branches"])
+            self.assertTrue(np.isfinite(chunks["branches"][name]).all())
+
+        # Also verify thm_modes=None / tof_modes=None does not conflict with noop__power_branches='imu|thm|tof'
+        ext_imu_only = MultiModalSequenceExtractor(
+            window_seconds=1.0,
+            acc_modes="all",
+            rotation_modes="all",
+            thm_modes=None,
+            tof_modes=None,
+            static_backend="none",
+            noop=NoopOptions(
+                motion_stats="all",
+                periodicity="acf_kimmitch",
+                spectral_stats="all",
+                power_branches="imu|thm|tof",
+            ),
+        )
+        chunks_imu = ext_imu_only.fit(subset).transform_chunks(subset)
+        self.assertEqual(list(chunks_imu["branches"].keys()), ["imu"])
+        self.assertTrue(np.isfinite(chunks_imu["static"]).all())
+
 
 class TSAugmentorTests(unittest.TestCase):
-    @unittest.skipUnless(TSAUG_AVAILABLE, "tsaug not installed")
     def test_all_tsaug_operations_and_modality_dropout(self):
         df = make_synthetic_cmi_df(n_subjects=2, sequences_per_subject=2, n_timesteps=50, random_state=7)
         ext = MultiModalSequenceExtractor(window_seconds=1.0, static_backend="none")
@@ -537,7 +595,7 @@ class NotebookAndUnifiedSearchSpaceTests(unittest.TestCase):
 
         all_pipe_params = pipeline.get_params(deep=True)
         containers = {
-            "steps", "memory", "verbose", "estimator",
+            "steps", "memory", "verbose", "transform_input", "estimator",
             "estimator__extractor", "estimator__extractor__noop",
             "estimator__augmentor", "estimator__candidate_failure_log",
         }
