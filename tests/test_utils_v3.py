@@ -467,6 +467,33 @@ class TSAINetworkAndEstimatorTests(unittest.TestCase):
         self.assertLessEqual(score, 1.0)
 
 
+class StaticTopKSelectionTests(unittest.TestCase):
+    def test_static_top_k_selects_features_and_applies_to_predict(self):
+        df = make_synthetic_cmi_df(n_subjects=4, sequences_per_subject=4, n_timesteps=60, random_state=42)
+        ext = MultiModalSequenceExtractor(
+            window_seconds=0.5,
+            static_backend="none",
+            noop=NoopOptions(motion_stats="basic", periodicity="acf_cadence", min_samples=8),
+        )
+        labels = df[["sequence_id", "subject", "is_target", "gesture", "bfrb"]].copy()
+        common = dict(
+            extractor=ext, arch="Conv1d", branch_filters=8, branch_depth=1, branch_units=8,
+            fusion_units=8, dense_units=8, epochs=1, batch_size=8, validation_split=0.25, random_state=42,
+        )
+        full = MultiBranchTSAIClassifier(**common).fit(df, labels)
+        topk = MultiBranchTSAIClassifier(static_top_k=3, **common).fit(df, labels)
+
+        self.assertFalse(topk.fit_failed_)
+        names = topk.extractor_.static_names_
+        self.assertEqual(len([n for n in names if not n.startswith("present_")]), 3)
+        self.assertEqual(len([n for n in names if n.startswith("present_")]), 3)
+        self.assertLess(len(names), len(full.static_feature_names_))
+        preds = topk.predict(df)
+        self.assertEqual(len(preds), df["sequence_id"].nunique())
+        with self.assertRaises(InvalidParams):
+            MultiBranchTSAIClassifier(static_top_k=0, **common).validate()
+
+
 class CompetitionScorerAndHiddenTestSimulationTests(unittest.TestCase):
     def test_competition_score_exact_binary_and_macro_average(self):
         y_true = pd.Series(["g1", "g1", "g2", "g2", "non_bfrb", "non_bfrb"], index=[f"s{i}" for i in range(6)])

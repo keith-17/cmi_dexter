@@ -2069,6 +2069,34 @@ class MultiModalSequenceExtractor(BaseEstimator):
         out["static"] = static.astype(np.float32)
         return out
 
+    def select_static_top_k(self, scaled_chunks: Dict[str, Any], y_windows: np.ndarray, k: Optional[int]):
+        """Keep the ``k`` static features with the highest ANOVA F-score against the labels.
+
+        Must be called right after ``fit_scalers`` on TRAINING data only. It narrows
+        ``static_names_`` and ``static_scaler_`` so every later ``featurize`` / ``scale`` /
+        ``transform_chunks`` call (augmentation, validation, predict, importance) emits the
+        same reduced column set. ``present_*`` flags are always kept and do not count toward ``k``.
+        Returns ``(keep_idx, scores)`` where ``keep_idx`` indexes the pre-selection columns.
+        """
+        names = list(self.static_names_)
+        protected = [j for j, n in enumerate(names) if n.startswith("present_")]
+        candidates = [j for j in range(len(names)) if j not in set(protected)]
+        y_windows = np.asarray(y_windows)
+        if k is None or int(k) >= len(candidates) or len(np.unique(y_windows)) < 2:
+            return np.arange(len(names)), None
+        from sklearn.feature_selection import f_classif
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            f_vals, _ = f_classif(np.asarray(scaled_chunks["static"])[:, candidates], y_windows)
+        f_vals = np.nan_to_num(np.asarray(f_vals, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+        order = np.argsort(-f_vals, kind="stable")[: int(k)]
+        keep = np.array(sorted(set(protected) | {candidates[i] for i in order}), dtype=int)
+        mean, std = self.static_scaler_
+        self.static_scaler_ = (mean[keep], std[keep])
+        self.static_names_ = [names[j] for j in keep]
+        scores = {names[candidates[i]]: float(f_vals[i]) for i in range(len(candidates))}
+        return keep, scores
+
     def select_finetuning_sequences(self, X: pd.DataFrame, y: Optional[pd.DataFrame] = None) -> pd.DataFrame:
         """Return the valid sequence dataframe for holdout/internal-validation evaluation."""
         return X.copy()
@@ -2936,6 +2964,7 @@ class MultiBranchTSAIClassifier(BaseEstimator, ClassifierMixin):
         static_units: int = 64,
         static_layers: int = 2,
         static_dropout: float = 0.1,
+        static_top_k: Optional[int] = None,
         fusion_type: str = "attention",
         fusion_units: int = 128,
         fusion_dropout: float = 0.1,
@@ -2999,6 +3028,7 @@ class MultiBranchTSAIClassifier(BaseEstimator, ClassifierMixin):
         self.static_units = static_units
         self.static_layers = static_layers
         self.static_dropout = static_dropout
+        self.static_top_k = static_top_k
         self.fusion_type = fusion_type
         self.fusion_units = fusion_units
         self.fusion_dropout = fusion_dropout
@@ -3098,6 +3128,8 @@ class MultiBranchTSAIClassifier(BaseEstimator, ClassifierMixin):
             raise InvalidParams("class_weight_mode must be None, 'none', or 'balanced'")
         if int(self.epochs) < 1 or int(self.batch_size) < 1:
             raise InvalidParams("epochs and batch_size must be >= 1")
+        if self.static_top_k is not None and int(self.static_top_k) < 1:
+            raise InvalidParams("static_top_k must be None or >= 1")
         if float(self.learning_rate) <= 0 or not np.isfinite(float(self.learning_rate)):
             raise InvalidParams("learning_rate must be positive and finite")
         if float(self.weight_decay) < 0:
@@ -3241,6 +3273,23 @@ class MultiBranchTSAIClassifier(BaseEstimator, ClassifierMixin):
         feat_fit = self.extractor_.featurize(raw_fit)
         self.extractor_.fit_scalers(feat_fit)
         train_chunks = self.extractor_.scale(feat_fit)
+
+        # Optional supervised top-k selection of static features (training windows only)
+        self.static_feature_scores_ = None
+        if self.static_top_k is not None:
+            win_labels = self.le_.transform(
+                pd.Series(train_chunks["sequence_ids"].astype(str)).map(y_fit_seq).to_numpy()
+            )
+            keep, self.static_feature_scores_ = self.extractor_.select_static_top_k(
+                train_chunks, win_labels, int(self.static_top_k),
+            )
+            if len(keep) != train_chunks["static"].shape[1]:
+                feat_fit = dict(feat_fit)
+                feat_fit["static"] = feat_fit["static"][:, keep]
+                feat_fit["static_names"] = list(self.extractor_.static_names_)
+                train_chunks = self.extractor_.scale(feat_fit)
+            if self.verbose and int(self.verbose) > 0:
+                print(f"  [feature selection] kept {len(keep)} static features (top_k={self.static_top_k})", flush=True)
         self.noop_feature_names_ = list(self.extractor_.noop_feature_names_)
         self.static_feature_names_ = list(self.extractor_.static_names_)
 
@@ -3399,6 +3448,13 @@ class MultiBranchTSAIClassifier(BaseEstimator, ClassifierMixin):
             self.history_["val_loss"].append(float(val_loss))
             self.history_["accuracy"].append(float(train_acc))
             self.history_["val_accuracy"].append(float(val_acc))
+
+            if self.verbose and int(self.verbose) > 0:
+                print(
+                    f"  [epoch {epoch}/{total_epochs}] loss={train_loss:.4f} acc={train_acc:.4f} | "
+                    f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}",
+                    flush=True,
+                )
 
             if sched_type == "cosine" and scheduler is not None and epoch > int(self.warmup_epochs):
                 scheduler.step()
