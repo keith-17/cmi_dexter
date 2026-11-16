@@ -494,6 +494,77 @@ class StaticTopKSelectionTests(unittest.TestCase):
             MultiBranchTSAIClassifier(static_top_k=0, **common).validate()
 
 
+class TsaiSpecificParamsTests(unittest.TestCase):
+    def test_validation_rejects_invalid_tsai_params(self):
+        base = dict(arch="Conv1d", branch_filters=8, branch_depth=1, branch_units=8, fusion_units=8, dense_units=8)
+        MultiBranchTSAIClassifier(**base).validate()
+        for bad in (
+            dict(branch_se=0),
+            dict(xcm_window_perc=0.0),
+            dict(xcm_window_perc=1.5),
+            dict(tst_d_ff_mult=0.0),
+            dict(tst_attn_dropout=1.0),
+            dict(tst_pe="invalid"),
+        ):
+            with self.assertRaises(InvalidParams):
+                MultiBranchTSAIClassifier(**{**base, **bad}).validate()
+
+    def test_inactive_parameters_by_arch(self):
+        resnet_inactive = inactive_parameters_for_candidate({"estimator__arch": "ResNetPlus"})
+        for k in ("estimator__branch_depth", "estimator__branch_kernel_size", "estimator__conv_dropout",
+                  "estimator__inception_bottleneck", "estimator__fcn_separable",
+                  "estimator__xcm_window_perc", "estimator__tst_pe", "estimator__rnn_bidirectional"):
+            self.assertIn(k, resnet_inactive)
+        for k in ("estimator__conv_coord", "estimator__branch_sa", "estimator__branch_se"):
+            self.assertNotIn(k, resnet_inactive)
+
+        tst_inactive = inactive_parameters_for_candidate({"estimator__arch": "TSTPlus"})
+        self.assertIn("estimator__branch_kernel_size", tst_inactive)
+        for k in ("estimator__branch_depth", "estimator__conv_dropout", "estimator__tst_d_ff_mult",
+                  "estimator__tst_attn_dropout", "estimator__tst_res_attention", "estimator__tst_pre_norm", "estimator__tst_pe"):
+            self.assertNotIn(k, tst_inactive)
+
+    def test_build_tsai_backbone_forwards_specific_kwargs(self):
+        from unittest.mock import patch
+        recorded = {}
+
+        def make_stub(name):
+            class _Stub(torch.nn.Module):
+                def __init__(self, *args, **kwargs):
+                    super().__init__()
+                    recorded[name] = (args, kwargs)
+                def forward(self, x):
+                    return torch.zeros(x.shape[0], args[1])
+            return _Stub
+
+        stubs = {n: make_stub(n) for n in ("InceptionTimePlus", "ResNetPlus", "FCNPlus", "TCN", "TSTPlus", "GRUPlus", "LSTMPlus", "XCMPlus")}
+        with patch.object(u3, "TSAI_AVAILABLE", True), patch.object(u3, "_get_tsai_classes", return_value=stubs):
+            build_tsai_backbone("InceptionTimePlus", 6, 16, 40, inception_bottleneck=False, inception_residual=False, conv_coord=True, branch_sa=True, branch_se=16)
+            self.assertFalse(recorded["InceptionTimePlus"][1]["bottleneck"])
+            self.assertFalse(recorded["InceptionTimePlus"][1]["residual"])
+            self.assertTrue(recorded["InceptionTimePlus"][1]["coord"])
+            self.assertTrue(recorded["InceptionTimePlus"][1]["sa"])
+            self.assertEqual(recorded["InceptionTimePlus"][1]["se"], 16)
+
+            build_tsai_backbone("FCNPlus", 6, 16, 40, fcn_separable=True, fcn_residual=False, conv_coord=True)
+            self.assertTrue(recorded["FCNPlus"][1]["separable"])
+            self.assertFalse(recorded["FCNPlus"][1]["residual"])
+            self.assertTrue(recorded["FCNPlus"][1]["coord"])
+
+            build_tsai_backbone("XCMPlus", 6, 16, 40, xcm_window_perc=0.5)
+            self.assertEqual(recorded["XCMPlus"][1]["window_perc"], 0.5)
+
+            build_tsai_backbone("TSTPlus", 6, 16, 40, filters=32, num_heads=4, tst_d_ff_mult=3.0, tst_attn_dropout=0.2, tst_res_attention=False, tst_pre_norm=True, tst_pe="sincos")
+            self.assertEqual(recorded["TSTPlus"][1]["d_ff"], 96)
+            self.assertEqual(recorded["TSTPlus"][1]["attn_dropout"], 0.2)
+            self.assertFalse(recorded["TSTPlus"][1]["res_attention"])
+            self.assertTrue(recorded["TSTPlus"][1]["pre_norm"])
+            self.assertEqual(recorded["TSTPlus"][1]["pe"], "sincos")
+
+            build_tsai_backbone("GRUPlus", 6, 16, 40, rnn_bidirectional=False)
+            self.assertFalse(recorded["GRUPlus"][1]["bidirectional"])
+
+
 class CompetitionScorerAndHiddenTestSimulationTests(unittest.TestCase):
     def test_competition_score_exact_binary_and_macro_average(self):
         y_true = pd.Series(["g1", "g1", "g2", "g2", "non_bfrb", "non_bfrb"], index=[f"s{i}" for i in range(6)])

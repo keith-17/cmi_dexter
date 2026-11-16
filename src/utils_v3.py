@@ -2456,16 +2456,18 @@ def _get_tsai_classes() -> Dict[str, Any]:
     return _TSAI_MODEL_CACHE
 
 
+_ACT_CLASSES: Dict[str, type] = {
+    "relu": nn.ReLU,
+    "gelu": nn.GELU,
+    "silu": nn.SiLU,
+    "elu": nn.ELU,
+}
+
+
 def _make_activation(name: str) -> nn.Module:
     key = str(name).lower()
-    if key == "relu":
-        return nn.ReLU()
-    if key == "gelu":
-        return nn.GELU()
-    if key == "silu":
-        return nn.SiLU()
-    if key == "elu":
-        return nn.ELU()
+    if key in _ACT_CLASSES:
+        return _ACT_CLASSES[key]()
     raise InvalidParams(f"activation must be one of {ACTIVATIONS}, got {name!r}")
 
 
@@ -2517,6 +2519,14 @@ def build_tsai_backbone(
     dropout: float = 0.1, conv_dropout: float = 0.0,
     num_heads: int = 4, use_batchnorm: bool = True,
     pooling_mode: str = "default", activation: str = "gelu",
+    inception_bottleneck: bool = True, inception_residual: bool = True,
+    conv_coord: bool = False, branch_sa: bool = False, branch_se: Optional[int] = None,
+    fcn_separable: bool = False, fcn_residual: bool = True,
+    xcm_window_perc: float = 1.0,
+    tst_d_ff_mult: float = 2.0, tst_attn_dropout: float = 0.0,
+    tst_res_attention: bool = True, tst_pre_norm: bool = False,
+    tst_pe: Optional[str] = "zeros",
+    rnn_bidirectional: bool = True,
 ) -> nn.Module:
     """Instantiate a ``tsai`` temporal backbone that maps ``(B, C_in, T) -> (B, C_out)``."""
     if arch not in TSAI_ARCHS:
@@ -2530,6 +2540,10 @@ def build_tsai_backbone(
     fc_drop = float(dropout)
     c_drop = float(conv_dropout)
     concat_pool = (pooling_mode == "concat_pool")
+    act_key = str(activation).lower()
+    if act_key not in _ACT_CLASSES:
+        raise InvalidParams(f"activation must be one of {ACTIVATIONS}, got {activation!r}")
+    act_cls = _ACT_CLASSES[act_key]
 
     if arch == "Conv1d" or not TSAI_AVAILABLE:
         if arch != "Conv1d":
@@ -2542,15 +2556,19 @@ def build_tsai_backbone(
 
     classes = _get_tsai_classes()
     cls = classes[arch]
+    se_val = int(branch_se) if branch_se is not None else None
     if arch == "InceptionTimePlus":
         return cls(
             c_in, c_out, seq_len=seq_len, nf=nf, depth=depth, ks=ks,
+            bottleneck=bool(inception_bottleneck), residual=bool(inception_residual),
+            coord=bool(conv_coord), sa=bool(branch_sa), se=se_val, act=act_cls,
             conv_dropout=c_drop, fc_dropout=fc_drop, bn=bool(use_batchnorm),
             concat_pool=concat_pool,
         )
     if arch == "ResNetPlus":
         return cls(
             c_in, c_out, seq_len=seq_len, nf=nf,
+            coord=bool(conv_coord), sa=bool(branch_sa), se=se_val, act=act_cls,
             fc_dropout=fc_drop, concat_pool=concat_pool,
         )
     if arch == "FCNPlus":
@@ -2558,7 +2576,9 @@ def build_tsai_backbone(
         kss = [max(3, (ks - 2 * i) | 1) for i in range(3)]
         return cls(
             c_in, c_out, layers=layers, kss=kss,
-            use_bn=bool(use_batchnorm), fc_dropout=fc_drop, residual=True,
+            coord=bool(conv_coord), separable=bool(fcn_separable),
+            use_bn=bool(use_batchnorm), fc_dropout=fc_drop,
+            act=act_cls, residual=bool(fcn_residual),
         )
     if arch == "TCN":
         layers = [nf] * depth
@@ -2566,21 +2586,26 @@ def build_tsai_backbone(
     if arch == "TSTPlus":
         heads = max(1, int(num_heads))
         d_model = max(heads * 2, (nf // heads) * heads)
+        d_ff = max(8, int(round(d_model * float(tst_d_ff_mult))))
         return cls(
             c_in, c_out, seq_len=seq_len, max_seq_len=max(seq_len, 512),
-            n_layers=depth, d_model=d_model, n_heads=heads, d_ff=d_model * 2,
-            dropout=c_drop, fc_dropout=fc_drop, bn=bool(use_batchnorm),
+            n_layers=depth, d_model=d_model, n_heads=heads, d_ff=d_ff,
+            attn_dropout=float(tst_attn_dropout), dropout=c_drop, act=act_key,
+            res_attention=bool(tst_res_attention), pre_norm=bool(tst_pre_norm),
+            pe=tst_pe, fc_dropout=fc_drop, bn=bool(use_batchnorm),
             concat_pool=concat_pool,
         )
     if arch in {"GRUPlus", "LSTMPlus"}:
         return cls(
             c_in, c_out, seq_len=seq_len, hidden_size=nf, n_layers=depth,
-            rnn_dropout=c_drop if depth > 1 else 0.0, bidirectional=True,
+            rnn_dropout=c_drop if depth > 1 else 0.0,
+            bidirectional=bool(rnn_bidirectional),
             fc_dropout=fc_drop, bn=bool(use_batchnorm),
         )
     if arch == "XCMPlus":
         return cls(
             c_in, c_out, seq_len=seq_len, nf=nf,
+            window_perc=float(xcm_window_perc),
             fc_dropout=fc_drop, bn=bool(use_batchnorm), concat_pool=concat_pool,
         )
     raise InvalidParams(f"Unsupported architecture {arch!r}")
@@ -2666,6 +2691,14 @@ class ModalityBranch(nn.Module):
         attention_units: int = 64, tof_spatial_mode: str = "auto",
         tof_spatial_filters: int = 32, tof_spatial_kernel: int = 3,
         activation: str = "gelu",
+        inception_bottleneck: bool = True, inception_residual: bool = True,
+        conv_coord: bool = False, branch_sa: bool = False, branch_se: Optional[int] = None,
+        fcn_separable: bool = False, fcn_residual: bool = True,
+        xcm_window_perc: float = 1.0,
+        tst_d_ff_mult: float = 2.0, tst_attn_dropout: float = 0.0,
+        tst_res_attention: bool = True, tst_pre_norm: bool = False,
+        tst_pe: Optional[str] = "zeros",
+        rnn_bidirectional: bool = True,
     ):
         super().__init__()
         self.name = name
@@ -2693,6 +2726,13 @@ class ModalityBranch(nn.Module):
             filters=filters, depth=depth, kernel_size=kernel_size,
             dropout=dropout, conv_dropout=conv_dropout, num_heads=num_heads,
             use_batchnorm=use_batchnorm, pooling_mode=pooling_mode, activation=activation,
+            inception_bottleneck=inception_bottleneck, inception_residual=inception_residual,
+            conv_coord=conv_coord, branch_sa=branch_sa, branch_se=branch_se,
+            fcn_separable=fcn_separable, fcn_residual=fcn_residual,
+            xcm_window_perc=xcm_window_perc,
+            tst_d_ff_mult=tst_d_ff_mult, tst_attn_dropout=tst_attn_dropout,
+            tst_res_attention=tst_res_attention, tst_pre_norm=tst_pre_norm,
+            tst_pe=tst_pe, rnn_bidirectional=rnn_bidirectional,
         )
         self.attn_pool: Optional[TemporalAttentionPool] = None
         if pooling_mode == "attention":
@@ -2728,6 +2768,14 @@ class MultiBranchTSAINet(nn.Module):
         fusion_type: str = "attention", fusion_units: int = 128, fusion_dropout: float = 0.1,
         attention_heads: int = 4, dense_units: int = 128, dense_layers: int = 2,
         dropout: float = 0.2, activation: str = "gelu", use_batchnorm: bool = True,
+        inception_bottleneck: bool = True, inception_residual: bool = True,
+        conv_coord: bool = False, branch_sa: bool = False, branch_se: Optional[int] = None,
+        fcn_separable: bool = False, fcn_residual: bool = True,
+        xcm_window_perc: float = 1.0,
+        tst_d_ff_mult: float = 2.0, tst_attn_dropout: float = 0.0,
+        tst_res_attention: bool = True, tst_pre_norm: bool = False,
+        tst_pe: Optional[str] = "zeros",
+        rnn_bidirectional: bool = True,
     ):
         super().__init__()
         self.branch_order = [name for name in MODALITIES if name in branch_specs]
@@ -2749,6 +2797,13 @@ class MultiBranchTSAINet(nn.Module):
                 attention_units=attention_units, tof_spatial_mode=tof_spatial_mode,
                 tof_spatial_filters=tof_spatial_filters, tof_spatial_kernel=tof_spatial_kernel,
                 activation=activation,
+                inception_bottleneck=inception_bottleneck, inception_residual=inception_residual,
+                conv_coord=conv_coord, branch_sa=branch_sa, branch_se=branch_se,
+                fcn_separable=fcn_separable, fcn_residual=fcn_residual,
+                xcm_window_perc=xcm_window_perc,
+                tst_d_ff_mult=tst_d_ff_mult, tst_attn_dropout=tst_attn_dropout,
+                tst_res_attention=tst_res_attention, tst_pre_norm=tst_pre_norm,
+                tst_pe=tst_pe, rnn_bidirectional=rnn_bidirectional,
             )
 
         self.static_dim = int(static_dim)
@@ -2960,6 +3015,21 @@ class MultiBranchTSAIClassifier(BaseEstimator, ClassifierMixin):
         tof_spatial_mode: str = "auto",
         tof_spatial_filters: int = 32,
         tof_spatial_kernel: int = 3,
+        # --- tsai backbone-specific knobs ---
+        inception_bottleneck: bool = True,
+        inception_residual: bool = True,
+        conv_coord: bool = False,
+        branch_sa: bool = False,
+        branch_se: Optional[int] = None,
+        fcn_separable: bool = False,
+        fcn_residual: bool = True,
+        xcm_window_perc: float = 1.0,
+        tst_d_ff_mult: float = 2.0,
+        tst_attn_dropout: float = 0.0,
+        tst_res_attention: bool = True,
+        tst_pre_norm: bool = False,
+        tst_pe: Optional[str] = "zeros",
+        rnn_bidirectional: bool = True,
         # --- static branch & multimodal fusion ---
         static_units: int = 64,
         static_layers: int = 2,
@@ -3025,6 +3095,20 @@ class MultiBranchTSAIClassifier(BaseEstimator, ClassifierMixin):
         self.tof_spatial_mode = tof_spatial_mode
         self.tof_spatial_filters = tof_spatial_filters
         self.tof_spatial_kernel = tof_spatial_kernel
+        self.inception_bottleneck = inception_bottleneck
+        self.inception_residual = inception_residual
+        self.conv_coord = conv_coord
+        self.branch_sa = branch_sa
+        self.branch_se = branch_se
+        self.fcn_separable = fcn_separable
+        self.fcn_residual = fcn_residual
+        self.xcm_window_perc = xcm_window_perc
+        self.tst_d_ff_mult = tst_d_ff_mult
+        self.tst_attn_dropout = tst_attn_dropout
+        self.tst_res_attention = tst_res_attention
+        self.tst_pre_norm = tst_pre_norm
+        self.tst_pe = tst_pe
+        self.rnn_bidirectional = rnn_bidirectional
         self.static_units = static_units
         self.static_layers = static_layers
         self.static_dropout = static_dropout
@@ -3134,10 +3218,18 @@ class MultiBranchTSAIClassifier(BaseEstimator, ClassifierMixin):
             raise InvalidParams("learning_rate must be positive and finite")
         if float(self.weight_decay) < 0:
             raise InvalidParams("weight_decay must be >= 0")
-        for drop_name in ("branch_dropout", "conv_dropout", "static_dropout", "fusion_dropout", "dropout"):
+        for drop_name in ("branch_dropout", "conv_dropout", "static_dropout", "fusion_dropout", "dropout", "tst_attn_dropout"):
             val = float(getattr(self, drop_name))
             if not 0.0 <= val < 1.0:
                 raise InvalidParams(f"{drop_name} must be in [0, 1)")
+        if self.branch_se is not None and int(self.branch_se) < 1:
+            raise InvalidParams("branch_se must be None or >= 1")
+        if not 0.0 < float(self.xcm_window_perc) <= 1.0:
+            raise InvalidParams("xcm_window_perc must be in (0, 1]")
+        if float(self.tst_d_ff_mult) <= 0.0:
+            raise InvalidParams("tst_d_ff_mult must be > 0")
+        if self.tst_pe not in {None, "zeros", "normal", "sincos"}:
+            raise InvalidParams("tst_pe must be None, 'zeros', 'normal', or 'sincos'")
         if not 0.0 <= float(self.label_smoothing) < 1.0:
             raise InvalidParams("label_smoothing must be in [0, 1)")
         if not 0.0 <= float(self.validation_split) < 0.9:
@@ -3333,6 +3425,13 @@ class MultiBranchTSAIClassifier(BaseEstimator, ClassifierMixin):
             fusion_dropout=self.fusion_dropout, attention_heads=self.attention_heads,
             dense_units=self.dense_units, dense_layers=self.dense_layers,
             dropout=self.dropout, activation=self.activation, use_batchnorm=self.use_batchnorm,
+            inception_bottleneck=self.inception_bottleneck, inception_residual=self.inception_residual,
+            conv_coord=self.conv_coord, branch_sa=self.branch_sa, branch_se=self.branch_se,
+            fcn_separable=self.fcn_separable, fcn_residual=self.fcn_residual,
+            xcm_window_perc=self.xcm_window_perc,
+            tst_d_ff_mult=self.tst_d_ff_mult, tst_attn_dropout=self.tst_attn_dropout,
+            tst_res_attention=self.tst_res_attention, tst_pre_norm=self.tst_pre_norm,
+            tst_pe=self.tst_pe, rnn_bidirectional=self.rnn_bidirectional,
         ).to(self.device_)
 
         class_weights_t: Optional[torch.Tensor] = None
@@ -4236,6 +4335,38 @@ def inactive_parameters_for_candidate(params: Mapping[str, Any]) -> set:
             inactive.add(f"{prefix}{name}")
     if int(p.get("early_stopping_patience", 10) or 0) <= 0:
         inactive.add(f"{prefix}restore_best_weights")
+
+    # 6. Architecture-specific tsai backbone knobs
+    base_arch = p.get("arch", "InceptionTimePlus")
+    active_archs = {p.get("imu_arch") or base_arch}
+    if p.get("extractor__thm_modes", "centered_diff") is not None:
+        active_archs.add(p.get("thm_arch") or base_arch)
+    if p.get("extractor__tof_modes", "pooled_stats|sensor_stats") is not None:
+        active_archs.add(p.get("tof_arch") or base_arch)
+
+    if not (active_archs & {"Conv1d", "InceptionTimePlus", "TCN", "TSTPlus", "GRUPlus", "LSTMPlus"}):
+        inactive.add(f"{prefix}branch_depth")
+        inactive.add(f"{prefix}conv_dropout")
+    if not (active_archs & {"Conv1d", "InceptionTimePlus", "FCNPlus", "TCN"}):
+        inactive.add(f"{prefix}branch_kernel_size")
+    if "InceptionTimePlus" not in active_archs:
+        inactive.add(f"{prefix}inception_bottleneck")
+        inactive.add(f"{prefix}inception_residual")
+    if not (active_archs & {"InceptionTimePlus", "ResNetPlus", "FCNPlus"}):
+        inactive.add(f"{prefix}conv_coord")
+    if not (active_archs & {"InceptionTimePlus", "ResNetPlus"}):
+        inactive.add(f"{prefix}branch_sa")
+        inactive.add(f"{prefix}branch_se")
+    if "FCNPlus" not in active_archs:
+        inactive.add(f"{prefix}fcn_separable")
+        inactive.add(f"{prefix}fcn_residual")
+    if "XCMPlus" not in active_archs:
+        inactive.add(f"{prefix}xcm_window_perc")
+    if "TSTPlus" not in active_archs:
+        for name in ("tst_d_ff_mult", "tst_attn_dropout", "tst_res_attention", "tst_pre_norm", "tst_pe"):
+            inactive.add(f"{prefix}{name}")
+    if not (active_archs & {"GRUPlus", "LSTMPlus"}):
+        inactive.add(f"{prefix}rnn_bidirectional")
 
     return inactive
 
