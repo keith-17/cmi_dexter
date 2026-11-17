@@ -67,7 +67,6 @@ from utils_v3 import (
     make_synthetic_cmi_df,
     noop_imu_window,
     noop_power_window,
-    refit_valid_candidate,
     run_validation_searches,
     simulate_hidden_test_nullification,
     split_validation_protocol,
@@ -654,9 +653,9 @@ class NotebookAndUnifiedSearchSpaceTests(unittest.TestCase):
 
     def test_separate_grid_bayes_and_evo_spaces_cover_all_leaves_and_constraints(self):
         namespace = {"__name__": "__main__"}
-        space_cells = {"BEST_PARAMS": 0, "GRID_PARAM_SPACE": 0, "BAYESIAN_PARAM_SPACE": 0, "EVOLUTIONARY_PARAM_SPACE": 0}
+        space_cells = {"GRID_PARAM_SPACE": 0, "BAYESIAN_PARAM_SPACE": 0, "EVOLUTIONARY_PARAM_SPACE": 0}
         with TemporaryDirectory() as tmpdir, redirect_stdout(StringIO()):
-            # Execute Imports, Config, Best Params, Pipeline Setup, and the separate Grid/Bayes/Evo cells
+            # Execute Imports, Config, Pipeline Setup, and the separate Grid/Bayes/Evo cells
             for cell in self.notebook["cells"]:
                 if cell["cell_type"] != "code":
                     continue
@@ -669,7 +668,6 @@ class NotebookAndUnifiedSearchSpaceTests(unittest.TestCase):
                     for marker in (
                         "from utils_v3 import",
                         "experiment_name =",
-                        "BEST_PARAMS =",
                         "pipeline = Pipeline(",
                         "GRID_PARAM_SPACE =",
                         "BAYESIAN_PARAM_SPACE =",
@@ -679,13 +677,12 @@ class NotebookAndUnifiedSearchSpaceTests(unittest.TestCase):
                     src = src.replace("workspace_root = current_dir", f"workspace_root = {tmpdir!r}")
                     exec(compile(src, "notebook-cell", "exec"), namespace)
 
-        # Verify BEST_PARAMS, GRID_PARAM_SPACE, BAYESIAN_PARAM_SPACE, and EVOLUTIONARY_PARAM_SPACE are in separate cells
-        self.assertEqual(space_cells["BEST_PARAMS"], 1)
+        # Verify GRID_PARAM_SPACE, BAYESIAN_PARAM_SPACE, and EVOLUTIONARY_PARAM_SPACE are in separate cells
+        self.assertNotIn("BEST_PARAMS", namespace)
         self.assertEqual(space_cells["GRID_PARAM_SPACE"], 1)
         self.assertEqual(space_cells["BAYESIAN_PARAM_SPACE"], 1)
         self.assertEqual(space_cells["EVOLUTIONARY_PARAM_SPACE"], 1)
 
-        best_params = namespace["BEST_PARAMS"]
         grid_space = namespace["GRID_PARAM_SPACE"]
         bayes_space = namespace["BAYESIAN_PARAM_SPACE"]
         evo_space = namespace["EVOLUTIONARY_PARAM_SPACE"]
@@ -699,7 +696,6 @@ class NotebookAndUnifiedSearchSpaceTests(unittest.TestCase):
         }
         expected_leaves = {k for k in all_pipe_params if k not in containers}
 
-        self.assertEqual(set(best_params.keys()), expected_leaves)
         self.assertEqual(set(grid_space.keys()), expected_leaves)
         self.assertEqual(set(evo_space.keys()), expected_leaves)
         if SKOPT_AVAILABLE:
@@ -750,10 +746,6 @@ class NotebookAndUnifiedSearchSpaceTests(unittest.TestCase):
                 self.assertEqual(len(cats), 2)
                 self.assertEqual(cats[0], 0.0)
 
-        # Verify clone(pipeline).set_params(**BEST_PARAMS) succeeds and validates
-        cloned = clone(pipeline).set_params(**best_params)
-        cloned.named_steps["estimator"].validate()
-
     def test_importance_cell_uses_internal_validation_and_never_holdout(self):
         imp_cell = next(
             "".join(c["source"])
@@ -766,6 +758,24 @@ class NotebookAndUnifiedSearchSpaceTests(unittest.TestCase):
         self.assertNotIn("y_test", names)
         self.assertIn("validation_sequence_ids_", imp_cell)
         self.assertIn("require_internal_validation=True", imp_cell)
+
+    def test_notebook_and_utils_do_not_use_refit_valid_candidate(self):
+        self.assertFalse(hasattr(u3, "refit_valid_candidate"))
+        for cell in self.notebook["cells"]:
+            src = "".join(cell.get("source", []))
+            self.assertNotIn("refit_valid_candidate", src)
+        train_cell = next(
+            "".join(c["source"])
+            for c in self.notebook["cells"]
+            if c["cell_type"] == "code" and "run_validation_searches(" in "".join(c["source"])
+        )
+        self.assertIn("refit=refit", train_cell)
+        config_cell = next(
+            "".join(c["source"])
+            for c in self.notebook["cells"]
+            if c["cell_type"] == "code" and "experiment_name =" in "".join(c["source"])
+        )
+        self.assertIn("refit = True", config_cell)
 
 
 class EndToEndSearchAndImportanceIntegrationTests(unittest.TestCase):
@@ -812,7 +822,7 @@ class EndToEndSearchAndImportanceIntegrationTests(unittest.TestCase):
             param_space=evo_space,
             population_size=2,
             generations=1,
-            refit=refit_valid_candidate,
+            refit=True,
             random_state=42,
         )
         with TemporaryDirectory() as tmpdir:
@@ -905,7 +915,7 @@ class EndToEndSearchAndImportanceIntegrationTests(unittest.TestCase):
             search_spaces=bayes_space,
             n_iter=2,
             cv=GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=42),
-            refit=refit_valid_candidate,
+            refit=True,
             random_state=42,
         )
         labels = self.df[["sequence_id", "subject", "is_target", "gesture", "bfrb"]].copy()
@@ -919,6 +929,60 @@ class EndToEndSearchAndImportanceIntegrationTests(unittest.TestCase):
         self.assertEqual(first_cand["estimator__weight_decay"], 0.0)
         self.assertEqual(first_cand["estimator__label_smoothing"], 0.0)
         self.assertIsInstance(search.best_params_["estimator__extractor__noop__cadence_band"], (tuple, list))
+
+    def test_grid_search_with_refit_true_sets_finite_best_score_and_handles_failed_candidates(self):
+        pipe = self._fast_pipeline()
+        mixed_search = GridSearchCV(
+            estimator=pipe,
+            param_grid={"estimator__epochs": [0, 2]},
+            scoring=candidate_score,
+            refit=True,
+            error_score=-1.0,
+        )
+        all_fail_search = GridSearchCV(
+            estimator=pipe,
+            param_grid={"estimator__epochs": [0]},
+            scoring=candidate_score,
+            refit=True,
+            error_score=-1.0,
+        )
+        with TemporaryDirectory() as tmpdir:
+            mixed_runs = run_validation_searches(
+                search=mixed_search,
+                experiment_df=self.df,
+                target_col="bfrb",
+                validation_space={"validation_mode": ["sequence"]},
+                train_size=0.75,
+                n_splits=1,
+                random_state=42,
+                results_dir=tmpdir,
+                experiment_name="test_grid_mixed",
+                search_mode="grid",
+                simulate_hidden_test=False,
+            )
+            primary = mixed_runs["runs"][0]
+            self.assertTrue(primary["experiment_succeeded"])
+            self.assertTrue(np.isfinite(primary["best_score"]))
+            self.assertGreaterEqual(primary["best_score"], 0.0)
+            self.assertEqual(primary["best_params"]["estimator__epochs"], 2)
+            self.assertIn("competition_score", primary["holdout_results"])
+
+            fail_runs = run_validation_searches(
+                search=all_fail_search,
+                experiment_df=self.df,
+                target_col="bfrb",
+                validation_space={"validation_mode": ["sequence"]},
+                train_size=0.75,
+                n_splits=1,
+                random_state=42,
+                results_dir=tmpdir,
+                experiment_name="test_grid_fail",
+                search_mode="grid",
+                simulate_hidden_test=False,
+            )
+            failed = fail_runs["runs"][0]
+            self.assertFalse(failed["experiment_succeeded"])
+            self.assertEqual(failed["holdout_results"], {})
 
 
 if __name__ == "__main__":

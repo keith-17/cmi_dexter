@@ -4439,46 +4439,44 @@ def deduplicate_param_grid(
 # 9. Search Drivers, Validation Runner, Permutation Importance, Synthetic Data
 # ---------------------------------------------------------------------------
 
-def refit_valid_candidate(cv_results: Any, X: Optional[pd.DataFrame] = None, y: Optional[Any] = None) -> Any:
-    """Select the best candidate index whose mean_test_score is finite and above -1.
+def _finalize_search_results(
+    search: Any,
+    all_params: List[Dict[str, Any]],
+    all_fold_scores: List[List[float]],
+    all_times: List[float],
+    X: pd.DataFrame,
+    y: Any,
+):
+    """Populate ``cv_results_``, select the best candidate index/score/params, and refit if requested."""
+    mean_scores = np.array([float(np.mean(s)) for s in all_fold_scores], dtype=float)
+    std_scores = np.array([float(np.std(s)) for s in all_fold_scores], dtype=float)
+    ranks = (len(mean_scores) - np.argsort(np.argsort(mean_scores))).astype(int)
+    n_splits = len(all_fold_scores[0]) if all_fold_scores else 1
+    search.cv_results_ = {
+        "params": all_params,
+        "mean_test_score": mean_scores,
+        "std_test_score": std_scores,
+        "rank_test_score": ranks,
+        "mean_fit_time": np.array(all_times, dtype=float),
+    }
+    for split_i in range(n_splits):
+        search.cv_results_[f"split{split_i}_test_score"] = np.array(
+            [s[split_i] for s in all_fold_scores], dtype=float,
+        )
 
-    When called as ``refit_valid_candidate(cv_results)`` (e.g. ``GridSearchCV(refit=refit_valid_candidate)``),
-    returns the integer candidate index. When called as ``refit_valid_candidate(search, X, y)``,
-    refits ``search.best_estimator_`` on ``(X, y)`` and returns ``True`` if a valid candidate succeeded.
-    """
-    if X is not None and hasattr(cv_results, "cv_results_"):
-        search = cv_results
-        res = search.cv_results_
-        scores = np.asarray(res["mean_test_score"], dtype=float)
-        valid = np.flatnonzero(np.isfinite(scores) & (scores > -1.0 + 1e-9))
-        search.refit_errors_ = []
-        for idx in sorted(valid, key=lambda i: scores[i], reverse=True):
-            cand_params = res["params"][int(idx)]
-            try:
-                t0 = time.time()
-                model = clone(search.estimator).set_params(**cand_params)
-                model.fit(X, y)
-                est = model.named_steps["estimator"] if hasattr(model, "named_steps") else model
-                if getattr(est, "fit_failed_", False):
-                    raise RuntimeError(getattr(est, "fit_error_", "fit failed"))
-                search.best_index_ = int(idx)
-                search.best_params_ = dict(cand_params)
-                search.best_score_ = float(scores[int(idx)])
-                search.best_estimator_ = model
-                search.refit_time_ = time.time() - t0
-                return True
-            except Exception as exc:
-                search.refit_errors_.append({"candidate": int(idx), "error": f"{type(exc).__name__}: {exc}"})
-        return False
+    if callable(search.refit):
+        best_idx = int(search.refit(search.cv_results_))
+    else:
+        finite = np.flatnonzero(np.isfinite(mean_scores))
+        best_idx = int(finite[int(np.argmax(mean_scores[finite]))]) if len(finite) else 0
+    search.best_index_ = int(best_idx)
+    search.best_params_ = dict(all_params[search.best_index_])
+    search.best_score_ = float(mean_scores[search.best_index_])
 
-    scores = np.asarray(cv_results["mean_test_score"], dtype=float)
-    valid = np.flatnonzero(np.isfinite(scores) & (scores > -1.0 + 1e-9))
-    if len(valid):
-        return int(valid[int(np.argmax(scores[valid]))])
-    finite = np.flatnonzero(np.isfinite(scores))
-    if len(finite):
-        return int(finite[int(np.argmax(scores[finite]))])
-    return 0
+    if search.refit:
+        search.best_estimator_ = clone(search.estimator).set_params(**search.best_params_)
+        search.best_estimator_.fit(X, y)
+    return search
 
 
 def _evaluate_candidate_cv(
@@ -4645,31 +4643,7 @@ class GASearchCV(BaseEstimator):
             population = next_pop
             fitness = evaluate_pop(population, gen_i)
 
-        mean_scores = np.array([float(np.mean(s)) for s in all_fold_scores], dtype=float)
-        std_scores = np.array([float(np.std(s)) for s in all_fold_scores], dtype=float)
-        ranks = (len(mean_scores) - np.argsort(np.argsort(mean_scores))).astype(int)
-        n_splits = len(all_fold_scores[0]) if all_fold_scores else 1
-        self.cv_results_: Dict[str, Any] = {
-            "params": all_params,
-            "mean_test_score": mean_scores,
-            "std_test_score": std_scores,
-            "rank_test_score": ranks,
-            "mean_fit_time": np.array(all_times, dtype=float),
-        }
-        for split_i in range(n_splits):
-            self.cv_results_[f"split{split_i}_test_score"] = np.array(
-                [s[split_i] for s in all_fold_scores], dtype=float,
-            )
-
-        best_idx = refit_valid_candidate(self.cv_results_) if callable(self.refit) else int(np.argmax(mean_scores))
-        self.best_index_ = int(best_idx)
-        self.best_params_ = dict(all_params[self.best_index_])
-        self.best_score_ = float(mean_scores[self.best_index_])
-
-        if self.refit:
-            self.best_estimator_ = clone(self.estimator).set_params(**self.best_params_)
-            self.best_estimator_.fit(X, y)
-        return self
+        return _finalize_search_results(self, all_params, all_fold_scores, all_times, X, y)
 
     def predict(self, X: pd.DataFrame):
         return self.best_estimator_.predict(X)
@@ -4822,31 +4796,7 @@ class HierarchicalBayesSearchCV(BaseEstimator):
                     flush=True,
                 )
 
-        mean_scores = np.array([float(np.mean(s)) for s in all_fold_scores], dtype=float)
-        std_scores = np.array([float(np.std(s)) for s in all_fold_scores], dtype=float)
-        ranks = (len(mean_scores) - np.argsort(np.argsort(mean_scores))).astype(int)
-        n_splits = len(all_fold_scores[0]) if all_fold_scores else 1
-        self.cv_results_: Dict[str, Any] = {
-            "params": all_params,
-            "mean_test_score": mean_scores,
-            "std_test_score": std_scores,
-            "rank_test_score": ranks,
-            "mean_fit_time": np.array(all_times, dtype=float),
-        }
-        for split_i in range(n_splits):
-            self.cv_results_[f"split{split_i}_test_score"] = np.array(
-                [s[split_i] for s in all_fold_scores], dtype=float,
-            )
-
-        best_idx = refit_valid_candidate(self.cv_results_) if callable(self.refit) else int(np.argmax(mean_scores))
-        self.best_index_ = int(best_idx)
-        self.best_params_ = dict(all_params[self.best_index_])
-        self.best_score_ = float(mean_scores[self.best_index_])
-
-        if self.refit:
-            self.best_estimator_ = clone(self.estimator).set_params(**self.best_params_)
-            self.best_estimator_.fit(X, y)
-        return self
+        return _finalize_search_results(self, all_params, all_fold_scores, all_times, X, y)
 
     def predict(self, X: pd.DataFrame):
         return self.best_estimator_.predict(X)
@@ -5073,24 +5023,33 @@ def run_validation_searches(
             est.set_params(validation_group_column=g_col, primary_target=target_col)
 
         run_search.fit(X_train, y_train, groups=groups)
-        if getattr(run_search, "best_estimator_", None) is None:
-            refit_valid_candidate(run_search, X_train, y_train)
         best_model = getattr(run_search, "best_estimator_", None)
-        best_score = float(getattr(run_search, "best_score_", np.nan))
+        best_score = getattr(run_search, "best_score_", np.nan)
+        if not np.isfinite(best_score) and getattr(run_search, "best_index_", None) is not None:
+            mean_scores = getattr(run_search, "cv_results_", {}).get("mean_test_score")
+            if mean_scores is not None:
+                best_score = float(mean_scores[int(run_search.best_index_)])
+        best_score = float(best_score)
         best_params = dict(getattr(run_search, "best_params_", {}))
 
+        best_est = (
+            best_model.named_steps["estimator"]
+            if best_model is not None and hasattr(best_model, "named_steps")
+            else best_model
+        )
+        best_fit_ok = best_model is not None and not getattr(best_est, "fit_failed_", False)
+        succeeded = best_fit_ok and np.isfinite(best_score) and best_score > -1.0
+
         eval_res: Dict[str, Any] = {}
-        if best_model is not None and len(X_test):
-            best_est = best_model.named_steps["estimator"] if hasattr(best_model, "named_steps") else best_model
-            if not getattr(best_est, "fit_failed_", False):
-                y_pred = best_model.predict(X_test)
-                eval_res = evaluate_holdout(
-                    y_test, y_pred, target_col=target_col, verbose=True,
-                    model=best_model, X_test=X_test,
-                    simulate_hidden_test=simulate_hidden_test,
-                    null_fraction=hidden_test_null_fraction,
-                    random_state=random_state,
-                )
+        if succeeded and len(X_test):
+            y_pred = best_model.predict(X_test)
+            eval_res = evaluate_holdout(
+                y_test, y_pred, target_col=target_col, verbose=True,
+                model=best_model, X_test=X_test,
+                simulate_hidden_test=simulate_hidden_test,
+                null_fraction=hidden_test_null_fraction,
+                random_state=random_state,
+            )
 
         cv_df = pd.DataFrame(run_search.cv_results_)
         cv_df["validation_mode"] = v_mode
@@ -5129,7 +5088,7 @@ def run_validation_searches(
             "best_params": best_params,
             "eval_results": eval_res,
             "holdout_results": eval_res,
-            "experiment_succeeded": best_model is not None and np.isfinite(best_score) and best_score > -1.0,
+            "experiment_succeeded": succeeded,
         }
         runs.append(run_entry)
         last_run = dict(run_entry)
