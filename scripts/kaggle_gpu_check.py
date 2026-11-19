@@ -12,7 +12,7 @@ def code_cell(cell_id, source):
 
 
 def main():
-    metadata = workflow.prepare(notebook_name='multibranch_v1.ipynb')
+    metadata = workflow.prepare(notebook_name='multibranch.ipynb')
     path = workflow.BUILD / metadata['code_file']
     notebook = json.loads(path.read_text(encoding='utf-8'))
     # Sample only after validating the complete input and recording exclusions.
@@ -28,7 +28,8 @@ print('Validation subset sequences:', train_df['sequence_id'].nunique())
 del _sequence_labels, _shuffled_labels, _selected_ids
 '''))
     train_index = next(i for i, cell in enumerate(notebook['cells'])
-                       if 'search.fit(X_train' in ''.join(cell.get('source', [])))
+                       if ('search.fit(X_train' in ''.join(cell.get('source', []))
+                           or 'run_validation_searches(' in ''.join(cell.get('source', []))))
     notebook['cells'].insert(train_index, code_cell('gpu-check-budget', '''
 population_size = 2
 generations = 0

@@ -41,6 +41,7 @@ kaggle.json
 .env
 results_*/
 !requirements-kaggle.txt
+!requirements-features.txt
 !.vscode/
 .vscode/*
 !.vscode/tasks.json

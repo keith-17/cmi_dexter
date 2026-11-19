@@ -58,10 +58,10 @@ The account must have accepted the CMI competition rules and have GPU quota.
 
 `push` always rebuilds from the saved local files. Avoid concurrent submissions
 from other machines to the same kernel. `prepare` rejects the wrong Git branch.
-Use `--notebook multibranch_v1.ipynb` to package the V1 configuration. The default
+Use `--notebook multibranch.ipynb` (or `multibranch_ensemble.ipynb`) to package the PyTorch v4/v4.1 configuration. The default
 source mode embeds the exact local canonical modules. `--attached-source` is
 only appropriate when the configured source dataset already contains
-`base_utils.py` and `multibranch_utils.py`.
+`base_utils.py`, `utils.py`, `pretraining_ssl_utils.py`, and `multibranch_utils.py`.
 
 The generated notebook lives in `kaggle_build/multibranch_attention/`. Its first
 cell reconstructs `src/*.py` in `/kaggle/working/src`; notebook imports prefer this

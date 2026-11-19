@@ -27,10 +27,10 @@ class WorkflowTests(unittest.TestCase):
             self.assertTrue((root / 'results' / 'multibranch_v1_cv.csv').exists())
 
     def test_attached_source_uses_dataset_without_injecting_local_modules(self):
-        original = json.loads((ROOT / 'notebooks/multibranch_v1.ipynb').read_text(encoding='utf-8'))
+        original = json.loads((ROOT / 'notebooks/multibranch.ipynb').read_text(encoding='utf-8'))
         with tempfile.TemporaryDirectory() as temporary:
             with patch.object(workflow, 'BUILD', Path(temporary)):
-                metadata = workflow.prepare(notebook_name='multibranch_v1.ipynb', use_attached_source=True)
+                metadata = workflow.prepare(notebook_name='multibranch.ipynb', use_attached_source=True)
                 packaged = json.loads((Path(temporary) / metadata['code_file']).read_text())
                 manifest = json.loads((Path(temporary) / 'submission.json').read_text())
             self.assertEqual([c['source'] for c in packaged['cells']], [c['source'] for c in original['cells']])
@@ -38,11 +38,11 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn('keithmarange/eliaslongagain', metadata['dataset_sources'])
 
     def test_v1_packages_exact_local_modules_without_editing_local_notebook(self):
-        path = ROOT / 'notebooks/multibranch_v1.ipynb'
+        path = ROOT / 'notebooks/multibranch.ipynb'
         original_bytes = path.read_bytes()
         with tempfile.TemporaryDirectory() as temporary:
             with patch.object(workflow, 'BUILD', Path(temporary)):
-                metadata = workflow.prepare(notebook_name='multibranch_v1.ipynb')
+                metadata = workflow.prepare(notebook_name='multibranch.ipynb')
                 packaged = json.loads((Path(temporary) / metadata['code_file']).read_text())
             original = json.loads(original_bytes)
             self.assertEqual(packaged['cells'][0]['id'], 'kaggle-source-bootstrap')

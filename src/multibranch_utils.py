@@ -1611,16 +1611,7 @@ class MultiBranchSequenceClassifier(BaseEstimator, ClassifierMixin):
         if not isinstance(augmentor, SensorAugmentor):
             return False
         extractor = getattr(self, "extractor_", None)
-        if type(extractor) is not SequenceExtractor:
-            # This child explicitly preserves the native augmentation hook;
-            # unrelated custom extractors keep their existing raw-input path.
-            if __package__:
-                from .noop_sequence_extractor import NoopSequenceExtractor
-            else:
-                from noop_sequence_extractor import NoopSequenceExtractor
-            if not isinstance(extractor, NoopSequenceExtractor):
-                return False
-        return True
+        return type(extractor) is SequenceExtractor
 
     @contextmanager
     def _training_feature_augmentation(self, augmentor=None):
@@ -2395,10 +2386,10 @@ def _extractor_settings(settings):
 
 def _noop_search_helpers():
     if __package__:
-        from .noop_sequence_extractor import inactive_noop_parameters, validate_noop_settings
+        from .base_utils import inactive_descriptor_parameters, options_from_settings
     else:
-        from noop_sequence_extractor import inactive_noop_parameters, validate_noop_settings
-    return inactive_noop_parameters, validate_noop_settings
+        from base_utils import inactive_descriptor_parameters, options_from_settings
+    return inactive_descriptor_parameters, (lambda settings: options_from_settings(settings).validate())
 
 
 def effective_candidate_signature(params, base_params=None):

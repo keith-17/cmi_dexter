@@ -12,8 +12,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 LEGACY = ('notebooks/multibranch_alpha.ipynb',
           'archive/notebooks/multibranch-gesture-action-reguarlise.ipynb')
-MODERN = ('notebooks/multibranch_v1.ipynb',
-          'archive/notebooks/multibranch_v1_bayes_gpu.ipynb',
+MODERN = ('archive/notebooks/multibranch_v1_bayes_gpu.ipynb',
           'archive/notebooks/multibranch_v1_evo_gpu.ipynb')
 
 

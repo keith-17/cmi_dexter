@@ -65,8 +65,12 @@ def prepare(iterations=None, notebook_name=None, use_attached_source=False):
         if count != 1:
             raise RuntimeError('Iteration override must change exactly one assignment.')
         configuration['source'] = config_source.splitlines(keepends=True)
-    modules = sorted((ROOT / 'src').glob('*.py'))
-    if not {'base_utils.py', 'multibranch_utils.py'} <= {p.name for p in modules}:
+    src_root = ROOT / 'src'
+    modules = sorted(
+        p for p in src_root.rglob('*.py')
+        if '__pycache__' not in p.parts
+    )
+    if not {'base_utils.py', 'multibranch_utils.py'} <= {p.relative_to(src_root).as_posix() for p in modules}:
         raise RuntimeError('Required Python utility modules are missing from src/.')
     for original in notebook['cells']:
         if original['cell_type'] == 'code':
@@ -79,7 +83,7 @@ def prepare(iterations=None, notebook_name=None, use_attached_source=False):
         archive = io.BytesIO()
         with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED) as zipped:
             for module in modules:
-                zipped.writestr(module.name, module.read_bytes())
+                zipped.writestr(module.relative_to(src_root).as_posix(), module.read_bytes())
         payload = base64.b64encode(archive.getvalue()).decode('ascii')
         bootstrap = (
             '# Install the exact local source snapshot for this Kaggle run.\n'

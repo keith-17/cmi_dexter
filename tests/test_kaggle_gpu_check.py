@@ -17,7 +17,7 @@ import kaggle_gpu_check as gpu_check
 
 class GPUCheckTests(unittest.TestCase):
     def test_validation_budget_is_valid_and_local_notebook_stays_unchanged(self):
-        local = ROOT / 'notebooks/multibranch_v1.ipynb'
+        local = ROOT / 'notebooks/multibranch.ipynb'
         original = local.read_bytes()
         with tempfile.TemporaryDirectory() as temporary:
             build = Path(temporary)
@@ -51,7 +51,7 @@ class GPUCheckTests(unittest.TestCase):
             manifest = json.loads((build / 'submitted.json').read_text())
             self.assertEqual(manifest['run_stage'], 'gpu_validation')
             self.assertEqual(manifest['submitted_source_sha256'], gpu_check.workflow.source_hash(notebook))
-            self.assertEqual(manifest['csv_names'], ['multibranch_v1_cv.csv'])
+            self.assertEqual(manifest['csv_names'], ['multibranch_bfrb_cv.csv', 'multibranch_bfrb_best.csv', 'multibranch_bfrb_holdout.csv'])
         self.assertEqual(local.read_bytes(), original)
 
 

@@ -1,0 +1,22 @@
+# Pinned open-source feature extraction & time-series dependencies
+# Verified in Python 3.10.20 (ds_kaggle environment)
+#
+# Install order (tsflex must be installed with --no-deps to preserve environment pins):
+#   pip install --no-deps tsflex==0.4.1
+#   pip install tsaug==0.2.1 tsfel==0.2.0 tsfresh==0.21.2 pycatch22==1.0.2 seglearn==1.2.5 sktime==0.40.1 scikit-optimize==0.10.2 PyWavelets==1.8.0
+
+numpy==2.2.6
+pandas==2.3.3
+scipy==1.15.2
+scikit-learn==1.7.2
+torch==2.14.1
+tsai==1.0.1
+tsflex==0.4.1
+tsaug==0.2.1
+tsfel==0.2.0
+tsfresh==0.21.2
+pycatch22==1.0.2
+seglearn==1.2.5
+sktime==0.40.1
+scikit-optimize==0.10.2
+PyWavelets==1.8.0

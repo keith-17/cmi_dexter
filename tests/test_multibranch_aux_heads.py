@@ -12,7 +12,8 @@ from sklearn.base import BaseEstimator, clone
 from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
 
-from test_multibranch_utils_params import mba, ECat
+import multibranch_utils as mba
+from base_utils import ECat
 from multibranch_utils import candidate_score, refit_valid_candidate
 
 

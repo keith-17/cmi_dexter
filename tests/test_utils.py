@@ -1,4 +1,4 @@
-"""Comprehensive test suite for src/utils_v3.py and notebooks/multi-branch_version_3.ipynb."""
+"""Comprehensive test suite for src/utils.py and notebooks/multi-branch_version_3.ipynb."""
 from __future__ import annotations
 
 import ast
@@ -21,8 +21,8 @@ from sklearn.pipeline import Pipeline
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-import utils_v3 as u3
-from utils_v3 import (
+import utils as u3
+from utils import (
     AUGMENTATIONS,
     ECat,
     EFloat,
@@ -615,7 +615,7 @@ class CompetitionScorerAndHiddenTestSimulationTests(unittest.TestCase):
 class NotebookAndUnifiedSearchSpaceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.nb_path = ROOT / "notebooks" / "multi-branch_version_3.ipynb"
+        cls.nb_path = ROOT / "notebooks" / "multibranch.ipynb"
         cls.notebook = json.loads(cls.nb_path.read_text(encoding="utf-8"))
 
     def test_notebook_parses_cleanly_has_required_sections_and_zero_updates(self):
@@ -666,7 +666,7 @@ class NotebookAndUnifiedSearchSpaceTests(unittest.TestCase):
                 if any(
                     marker in src
                     for marker in (
-                        "from utils_v3 import",
+                        "from utils import",
                         "experiment_name =",
                         "pipeline = Pipeline(",
                         "GRID_PARAM_SPACE =",
